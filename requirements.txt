@@ -1,0 +1,18 @@
+# Core CV + tracking stack for the World Cup demos.
+# trackers is installed from the local checkout (see README): pip install -e ../trackers
+supervision>=0.25.0
+numpy>=1.26
+opencv-python>=4.9
+pandas>=2.0
+
+# Detection (v2 "from raw pixels" pipeline only).
+rfdetr>=1.0.0
+
+# Pitch homography + team classification building blocks vendored from roboflow/sports.
+# Needed only for the radar / metric-speed (v2) variants.
+torch>=2.2
+transformers>=4.40
+umap-learn>=0.5
+scikit-learn>=1.3
+ultralytics>=8.0
+gdown>=5.0

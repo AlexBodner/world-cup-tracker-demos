@@ -1,0 +1,273 @@
+Metadata-Version: 2.4
+Name: world-cup-tracker-demos
+Version: 0.1.0
+Summary: SoccerNet-based football analytics demos (pass lanes, speed, radar) using Roboflow trackers
+License: Apache-2.0
+Project-URL: Homepage, https://github.com/roboflow/world-cup-tracker-demos
+Project-URL: Repository, https://github.com/roboflow/world-cup-tracker-demos
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: supervision>=0.25.0
+Requires-Dist: numpy>=1.26
+Requires-Dist: opencv-python>=4.9
+Requires-Dist: pandas>=2.0
+Provides-Extra: full
+Requires-Dist: rfdetr>=1.0.0; extra == "full"
+Requires-Dist: torch>=2.2; extra == "full"
+Requires-Dist: transformers>=4.40; extra == "full"
+Requires-Dist: umap-learn>=0.5; extra == "full"
+Requires-Dist: scikit-learn>=1.3; extra == "full"
+Requires-Dist: ultralytics>=8.0; extra == "full"
+Requires-Dist: gdown>=5.0; extra == "full"
+Provides-Extra: dev
+Requires-Dist: jupyter>=1.0; extra == "dev"
+Requires-Dist: ipykernel>=6.0; extra == "dev"
+Dynamic: license-file
+
+# World Cup Tracker Demos
+
+**Single canonical copy:** `world_cup_projects/` (in the Roboflow monorepo or as its own
+git root for publication). The duplicate export folder `world-cup-tracker-demos/` was
+removed.
+
+Two shareable football-analytics demos that promote the Roboflow
+[`trackers`](https://github.com/roboflow/trackers) library, riding the World Cup hype.
+Both reuse what we already built at Roboflow (`trackers`, RF-DETR,
+[`roboflow/sports`](https://github.com/roboflow/sports)) and run on the **SoccerNet**
+dataset to avoid FIFA copyright-strike risk on real broadcast footage.
+
+1. **Pass Alternatives** - freeze the frame when a player has the ball and overlay the 3
+   best passing lanes, scored by openness / forward-progress / receiver-space.
+2. **Player Speed & Distance** - per-player speed (m/s) + total distance covered, shown as
+   on-pitch labels, an end-of-clip leaderboard, and (v2) a top-down radar minimap.
+
+Status: **both demos are built and produce rendered MP4s.** v1 (no weights) and v2
+(RF-DETR + ByteTrack + pitch homography) both run end-to-end.
+
+## Quick start
+
+**Inside the Roboflow monorepo** (data auto-detected under `trackers metrics/...`):
+
+```bash
+pip install -r world_cup_projects/requirements.txt
+pip install -e trackers
+PYTHONPATH=. python -m world_cup_projects.pass_alternatives.run --sequence SNMOT-194
+```
+
+**Standalone** (clone or publish this folder as the repo root):
+
+```bash
+cd world_cup_projects   # or rename the repo root to match your remote
+python -m venv .venv && source .venv/bin/activate
+pip install -e ".[full]"
+pip install git+https://github.com/roboflow/trackers.git
+
+export SOCCERNET_TRACKING_ROOT=/path/to/soccernet/tracking
+# or: ln -s /your/path data/soccernet/tracking
+
+python -m world_cup_projects.pass_alternatives.run --sequence SNMOT-194 --metric --carrier-max-m 0.7
+python -m world_cup_projects.player_stats.run --sequence SNMOT-197 --mode homography
+python -m world_cup_projects.player_stats.analyze_velocities --sequence SNMOT-197
+```
+
+v2 extras: `rfdetr`, `ultralytics`, `gdown` (included in `[full]`).
+
+Monorepo commands (same demos, `PYTHONPATH=.` from repo root):
+
+```bash
+# Demo 1 - pass alternatives (auto-picks the best clip, renders MP4 + JSON manifest)
+PYTHONPATH=. python -m world_cup_projects.pass_alternatives.run --sequence SNMOT-194
+
+# rank clips only (no render)
+PYTHONPATH=. python -m world_cup_projects.pass_alternatives.run --rank-only
+
+# Demo 2 - speed & distance, metric (pitch homography + radar)
+PYTHONPATH=. python -m world_cup_projects.player_stats.run --sequence SNMOT-194 --mode homography
+
+# Demo 2 - weight-free fallback (bbox-height calibration)
+PYTHONPATH=. python -m world_cup_projects.player_stats.run --sequence SNMOT-194 --mode height
+
+# Homography debug: pitch keypoints + confidence on video (green = used for H)
+PYTHONPATH=. python -m world_cup_projects.player_stats.run --sequence SNMOT-194 --mode homography --debug-pitch-keypoints --max-frames 150
+PYTHONPATH=. python -m world_cup_projects.pass_alternatives.run --sequence SNMOT-194 --metric --debug-pitch-keypoints
+
+# v2 "from raw pixels" source (RF-DETR + ByteTrack instead of GT)
+RF_HOME=world_cup_projects/weights/rfdetr PYTHONPATH=. \
+    python -m world_cup_projects.player_stats.run --sequence SNMOT-194 --source rfdetr --max-frames 150
+```
+
+There is also a walkthrough notebook: [`world_cup_demos.ipynb`](world_cup_demos.ipynb)
+(SoccerNet-notebook style; previews stills inline and renders both demos).
+
+## Rendered outputs (in `assets/`, gitignored)
+
+| File | Demo | Source / calibration |
+|------|------|----------------------|
+| `player_stats_gt_homography_SNMOT-194.mp4` | Speed/distance + radar (hero) | GT + pitch homography |
+| `pass_alternatives_gt_metric_SNMOT-194.mp4` | Top-3 passing lanes, metric | GT + pitch homography |
+| `pass_alternatives_gt_SNMOT-194.mp4` | Top-3 passing lanes, pixel space | GT (no weights) |
+
+Each MP4 ships a matching `.json` manifest (freeze events / leaderboard) and is
+re-encoded to h264 (`ffmpeg -c:v libx264 -crf 23 -pix_fmt yuv420p`) so it stays small and
+broadly playable.
+
+## Visual style (Roboflow Football-AI look)
+
+Both demos share `common/visual.py`, which mirrors Roboflow's Football-AI / blog aesthetic
+using `supervision` annotators:
+
+- **Players**: `sv.EllipseAnnotator` at the feet, team-colored via a `ColorPalette` +
+  `ColorLookup.CLASS`.
+- **Labels**: `sv.LabelAnnotator` rounded chips (`border_radius`, `BOTTOM_CENTER`) — e.g.
+  `#9  3.3 m/s` in the speed demo.
+- **Ball**: `sv.TriangleAnnotator` (gold downward triangle).
+- **Radar**: bottom-center pitch minimap over a semi-transparent dark panel, team-colored
+  dots with black edges plus a white ball dot (`draw_pitch` / `draw_points_on_pitch`).
+- **HUD / branding**: alpha-blended title bar with a Roboflow-purple (`#8315F9`) drop-shadow
+  title and a `powered by trackers` tag.
+- **Pass freeze**: dimmed background, thick faux-glow ranked arrows (green → yellow →
+  orange), an emphasized ring on the best receiver, and rounded score chips.
+
+## Which clip and why
+
+`common.clips.rank_clips` scores every SoccerNet **test** sequence by possession density
+(ball glued to a player's feet), player count, and both-teams-present. Top picks:
+
+| Rank | Clip | Why |
+|------|------|-----|
+| 1 | **SNMOT-194** | ball visible 735/750, clear possession 604 frames, ~18 players, both teams |
+| 2 | SNMOT-197 | ball 750/750, possession 549, ~16 players |
+| 3 | SNMOT-189 | ball 750/750, possession 546, ~15 players |
+| 4 | SNMOT-132 | ball 750/750, possession 542, ~13 players |
+| 5 | SNMOT-200 | ball 707/750, possession 529, ~14 players |
+
+We use **SNMOT-194** as the default. All 49 test clips have the ball present, so any of the
+top-5 work; `--sequence` overrides, and omitting it auto-picks rank 1.
+
+## Why SoccerNet
+
+SoccerNet game-state clips (under `SOCCERNET_TRACKING_ROOT`, or the monorepo mirror at
+`trackers metrics/soccernet/soccernet_data/tracking` when present) ship **ground-truth
+tracks with role / team / jersey labels** (parsed from `gameinfo.ini`),
+so v1 runs with zero model weights.
+
+- 30s clips, `1920x1080`, 25 fps, 750 frames each (`seqinfo.ini`).
+- `gt/gt.txt` is standard MOT: `frame,track_id,x,y,w,h,conf,-1,-1,-1`.
+- `gameinfo.ini` maps each `track_id` to `player team left|right` / `goalkeeper` /
+  `referee` / `ball` + jersey number. Parsed by [`common/soccernet.py`](common/soccernet.py).
+
+## Architecture
+
+```mermaid
+flowchart LR
+    subgraph source [Frame source]
+        snImg[SoccerNet img1 frames]
+    end
+    subgraph detect [Detection + tracking]
+        gt[GT tracks + roles<br/>v1: gameinfo.ini]
+        rfdetr[RF-DETR detector]
+        bytetrack[trackers.ByteTrackTracker]
+        rfdetr --> bytetrack
+    end
+    subgraph understand [Scene understanding]
+        team[Team assignment]
+        pitch[Pitch keypoints + homography<br/>ViewTransformer]
+    end
+    subgraph demos [Demos]
+        passd[Pass alternatives:<br/>freeze + 3 best lanes]
+        speed[Speed + distance:<br/>m/s, meters, radar]
+    end
+    snImg --> gt
+    snImg --> rfdetr
+    gt --> team
+    bytetrack --> team
+    team --> passd
+    team --> speed
+    pitch --> speed
+    snImg --> pitch
+```
+
+### Two tiers
+
+| Tier | Detection / tracking | Calibration | What it shows |
+|------|----------------------|-------------|---------------|
+| **v1** | SoccerNet GT tracks | image space / bbox-height | Pass lanes + approximate m/s - no weights |
+| **v2** | RF-DETR + `trackers.ByteTrackTracker` | pitch keypoint homography -> `ViewTransformer` | True meters / m/s + top-down radar |
+
+## Folder layout
+
+```
+world_cup_projects/
+  README.md
+  requirements.txt
+  world_cup_demos.ipynb        # walkthrough notebook
+  common/
+    soccernet.py               # GT loader (roles/teams/jersey -> sv.Detections)
+    possession.py              # ball-carrier detection
+    clips.py                   # auto-pick best clips
+    geometry.py                # point-to-segment distance etc.
+    pitch.py                   # vendored ViewTransformer + pitch config + radar + PitchHomography
+    teams.py                   # team assignment (Siglip TeamClassifier + GK resolution)
+    detect.py                  # RF-DETR + ByteTrack pipeline (v2)
+  pass_alternatives/
+    pass_options.py            # lane scoring (openness / forward / space)
+    render.py                  # freeze-frame overlay video
+    run.py                     # CLI
+  player_stats/
+    speed_distance.py          # per-track speed + cumulative distance
+    render.py                  # speed labels + leaderboard + radar
+    run.py                     # CLI
+  weights/rfdetr/              # RF-DETR checkpoint cache (RF_HOME)
+  .cache/models/               # pitch keypoint model
+  assets/                      # rendered mp4s / json / stills (gitignored)
+```
+
+## Demo 1 - Pass Alternatives
+
+1. **Find the carrier** - ball nearest a player's feet (`BOTTOM_CENTER` anchor); carrier's
+   team comes from the GT `team` field (or the color/Siglip classifier in v2).
+2. **Candidate receivers** - teammates other than the carrier.
+3. **Score each lane** carrier -> receiver (`pass_options.score_pass_options`):
+   - *openness*: min distance to the pass segment of the nearest opponent **or teammate**
+     on the lane (interception / blocked corridor),
+   - *forward progress*: gain toward the attacking direction,
+   - *receiver space*: distance from the receiver to the nearest opponent,
+   - minus a range penalty for too-short/too-long passes.
+4. **Pick top 3**, draw ranked arrows (green=best -> yellow -> orange) with scores, dim the
+   background, hold the freeze ~1.5s. `plan_events` spreads freeze moments across the clip.
+
+In v1 the attacking direction is an image-space proxy (carrier-team centroid ->
+opponent-team centroid); v2 uses the pitch homography for a true direction-to-goal.
+
+## Demo 2 - Player Speed & Distance
+
+1. Track every player (GT in v1, RF-DETR + `ByteTrackTracker` in v2); accumulate the
+   `BOTTOM_CENTER` feet position per frame.
+2. Convert pixel motion to meters:
+   - **height** (default, no weights): each player's bbox height (~1.8 m) gives a local
+     meters-per-pixel scale that adapts to perspective.
+   - **homography**: per-frame `ViewTransformer` from the pitch-keypoint model maps feet to
+     true pitch meters (camera-angle independent).
+3. Multi-lag mean speed (default K=15) with per-step `H_{i-1}` / `H_i` warps; median-smooth
+   for display; distance excludes steps >10.5 m/s (spikes do not zero the on-screen label).
+4. Render per-player m/s labels (team-colored), an end-card leaderboard (top distance + top
+   sprint), and a top-down **radar** minimap in homography mode.
+
+## Weights
+
+- **RF-DETR**: auto-downloads on first use. The cache dir defaults to `~/.roboflow`; set
+  `RF_HOME=world_cup_projects/weights/rfdetr` to keep it in-repo. Force `device="cpu"` on
+  pre-macOS-14 machines (MPS otherwise errors).
+- **Pitch keypoint model** (`football-pitch-detection.pt`, ~140 MB, from `roboflow/sports`):
+  `common.pitch.ensure_pitch_model()` downloads it from Google Drive into
+  `.cache/models/`. Some sandboxed/CI networks block Google Drive (HTTP 403) - if so, fetch
+  it on an open network or drop the `.pt` in `.cache/models/`. When absent, the speed demo
+  **falls back to height calibration automatically**.
+
+## Credits
+
+Built on [`trackers`](https://github.com/roboflow/trackers),
+[RF-DETR](https://github.com/roboflow/rf-detr), `supervision`, and utilities vendored from
+[`roboflow/sports`](https://github.com/roboflow/sports) (Apache-2.0): `ViewTransformer`,
+`SoccerPitchConfiguration`, pitch annotators, and `TeamClassifier`.
