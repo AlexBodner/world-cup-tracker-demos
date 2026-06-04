@@ -2,3 +2,6 @@ assets/
 *.mp4
 __pycache__/
 *.pyc
+.cache/
+weights/rfdetr/*.pth
+weights/rfdetr/*.pt
