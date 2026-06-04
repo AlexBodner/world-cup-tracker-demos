@@ -175,17 +175,24 @@ def draw_radar_minimap(
     *,
     scale_frac: float = 0.33,
     position: str = "bottom_right",
+    pitch_confidence: float = 0.5,
     use_ransac: bool = False,
     ransac_thresh: float = HOMOGRAPHY_RANSAC_REPROJ_THRESH,
     transformer: ViewTransformer | None = None,
 ) -> np.ndarray:
-    """Sports-style radar minimap (prefer smoothed ``transformer`` when provided)."""
+    """Sports-style radar minimap from per-frame model keypoints."""
     if transformer is not None:
         radar = render_radar_from_transformer(dets, transformer)
-    else:
+    elif keypoints is not None:
         radar = render_radar_sports(
-            dets, keypoints, use_ransac=use_ransac, ransac_thresh=ransac_thresh
+            dets,
+            keypoints,
+            confidence=pitch_confidence,
+            use_ransac=use_ransac,
+            ransac_thresh=ransac_thresh,
         )
+    else:
+        return frame
     if radar is None:
         return frame
 
@@ -390,21 +397,17 @@ def draw_homography_feet_debug(
     dets: sv.Detections,
     keypoints: sv.KeyPoints | None,
     *,
+    confidence_threshold: float = 0.5,
     reproj_thresh_px: float = 25.0,
 ) -> np.ndarray:
-    """Feet warp check using the same sports ``H`` as the radar."""
-    from world_cup_projects.common.pitch import ViewTransformer
+    """Feet warp check using the same confidence-filtered H as the radar."""
+    from world_cup_projects.common.pitch import view_transformer_from_keypoints
 
-    if keypoints is None or keypoints.xy.shape[0] == 0:
-        return frame
-    mask = (keypoints.xy[0][:, 0] > 1) & (keypoints.xy[0][:, 1] > 1)
-    if int(mask.sum()) < 4:
-        return frame
-    transformer = ViewTransformer(
-        source=keypoints.xy[0][mask].astype(np.float32),
-        target=np.array(PITCH_CONFIG.vertices, dtype=np.float32)[mask],
-        use_ransac=False,
+    transformer = view_transformer_from_keypoints(
+        keypoints, confidence=confidence_threshold, use_ransac=False
     )
+    if transformer is None:
+        return frame
 
     pmask = player_mask(dets)
     if not pmask.any():

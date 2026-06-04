@@ -207,15 +207,14 @@ def _annotate_live(
     dets: sv.Detections,
     *,
     transformer=None,
-    radar_transformer: ViewTransformer | None = None,
     keypoints: sv.KeyPoints | None = None,
     pitch_confidence: float = 0.5,
 ) -> np.ndarray:
     frame = annotate_players(frame, dets)
     frame = annotate_ball(frame, dets)
-    if radar_transformer is not None or keypoints is not None:
+    if keypoints is not None:
         frame = draw_radar_minimap(
-            frame, dets, keypoints, transformer=radar_transformer
+            frame, dets, keypoints, pitch_confidence=pitch_confidence
         )
     if keypoints is not None:
         frame = draw_pitch_keypoints_debug(
@@ -325,12 +324,10 @@ def render_demo(
             image = np.full((sequence.height, sequence.width, 3), 30, np.uint8)
         transformer = transforms.get(frame_idx) if transforms else None
         kps = frame_keypoints.get(frame_idx) if frame_keypoints is not None else None
-        radar_t = frame_radar_transforms.get(frame_idx)
         live = _annotate_live(
             image,
             dets,
             transformer=transformer,
-            radar_transformer=radar_t,
             keypoints=kps,
             pitch_confidence=pitch_confidence,
         )

@@ -225,10 +225,9 @@ opponent-team centroid); v2 uses the pitch homography for a true direction-to-go
 3. Multi-lag **median** speed (default K=15) with per-step `H_{i-1}` / `H_i` warps;
    median-smooth for display. Homography glitch steps excluded adaptively.
 
-**Radar:** temporally smoothed pitch keypoints (rolling mean per vertex in **image** space,
-so camera pans stay consistent) → plain `findHomography` on **all** visible points
-(sports mask `x,y > 1`, no RANSAC) → feet warp → minimap at ~33% width, bottom-right.
-**Speed/distance** still uses the same tracker’s confidence-filtered correspondences with
+**Radar:** per-frame model keypoints (confidence > threshold, `x,y > 1`) → plain
+homography (no RANSAC) → feet warp → minimap at ~33% width, bottom-right, with goal
+mouths tinted by defending team. **Speed/distance** uses the same keypoint filter with
 RANSAC and a reprojection gate.
 4. Render per-player km/h labels (team-colored), an end-card leaderboard (top distance + top
    sprint), and a top-down **radar** minimap in homography mode.

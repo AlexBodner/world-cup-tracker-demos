@@ -17,7 +17,6 @@ import json
 from pathlib import Path
 
 import cv2
-import numpy as np
 import supervision as sv
 
 from world_cup_projects import DEFAULT_ASSETS_DIR
@@ -67,12 +66,6 @@ def main() -> None:
         help="RANSAC reprojection threshold in pixels for pitch homography.",
     )
     parser.add_argument(
-        "--pitch-smooth-window",
-        type=int,
-        default=31,
-        help="Rolling window for pitch keypoint smoothing before fitting H.",
-    )
-    parser.add_argument(
         "--max-reproj-px",
         type=float,
         default=8.0,
@@ -114,29 +107,21 @@ def main() -> None:
         frames = list(iter_gt_detections(sequence, end=end))
 
     frame_transforms: dict[int, object | None] = {}
-    frame_radar_transforms: dict[int, object | None] = {}
     frame_keypoints: dict[int, sv.KeyPoints | None] = {}
-    frame_radar_smooth_xy: dict[int, np.ndarray | None] = {}
-    frame_speed_smooth_xy: dict[int, np.ndarray | None] = {}
     need_pitch_pass = args.mode == "homography" or args.debug_pitch_keypoints
     if need_pitch_pass:
-        for idx, t_speed, t_radar, kps, radar_xy, speed_xy in iter_pitch_transformers(
+        for idx, t_speed, _t_radar, kps in iter_pitch_transformers(
             sequence,
             device=args.device,
             end=end,
             ransac_thresh=args.ransac_thresh,
-            smooth_window=args.pitch_smooth_window,
             max_reproj_px=args.max_reproj_px,
             confidence=args.pitch_confidence,
             yield_keypoints=True,
-            yield_smoothed_keypoints=True,
         ):
             frame_keypoints[idx] = kps
-            frame_radar_smooth_xy[idx] = radar_xy
-            frame_speed_smooth_xy[idx] = speed_xy
             if args.mode == "homography":
                 frame_transforms[idx] = t_speed
-                frame_radar_transforms[idx] = t_radar
 
     tracks = collect_tracks(iter(frames))
     compute_kinematics(
@@ -168,17 +153,8 @@ def main() -> None:
         frame_loader=lambda fi: cv2.imread(str(sequence.frame_path(fi))),
         calibration=calibration,
         frame_transforms=frame_transforms if args.mode == "homography" else None,
-        frame_radar_transforms=(
-            frame_radar_transforms if args.mode == "homography" else None
-        ),
         show_radar=not args.no_radar and args.mode == "homography",
         frame_keypoints=frame_keypoints if need_pitch_pass else None,
-        frame_radar_smooth_xy=(
-            frame_radar_smooth_xy if args.mode == "homography" else None
-        ),
-        frame_speed_smooth_xy=(
-            frame_speed_smooth_xy if args.mode == "homography" else None
-        ),
         pitch_kp_debug=args.debug_pitch_keypoints,
         pitch_confidence=args.pitch_confidence,
     )

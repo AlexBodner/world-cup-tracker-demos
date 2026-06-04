@@ -13,7 +13,6 @@ live on Google Drive; see the README "weights" note if the auto-download is bloc
 
 from __future__ import annotations
 
-from collections import deque
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
@@ -296,7 +295,7 @@ def render_radar_from_transformer(
     *,
     config: SoccerPitchConfiguration = PITCH_CONFIG,
 ) -> np.ndarray | None:
-    """Warp player feet with a precomputed homography (e.g. temporally smoothed)."""
+    """Warp player feet with a precomputed homography."""
     from world_cup_projects.common.possession import player_mask
 
     from world_cup_projects.common.soccernet import TEAM_LEFT, TEAM_RIGHT
@@ -345,24 +344,20 @@ def render_radar_sports(
     keypoints: sv.KeyPoints | None,
     *,
     config: SoccerPitchConfiguration = PITCH_CONFIG,
+    confidence: float = 0.5,
     use_ransac: bool = False,
     ransac_thresh: float = HOMOGRAPHY_RANSAC_REPROJ_THRESH,
 ) -> np.ndarray | None:
-    """Build minimap like ``roboflow/sports`` ``render_radar`` (plain H, all visible KPs)."""
-    if keypoints is None or keypoints.xy.shape[0] == 0:
-        return None
-
-    mask = (keypoints.xy[0][:, 0] > 1) & (keypoints.xy[0][:, 1] > 1)
-    if int(mask.sum()) < 4:
-        return None
-
-    transformer = ViewTransformer(
-        source=keypoints.xy[0][mask].astype(np.float32),
-        target=np.array(config.vertices, dtype=np.float32)[mask],
+    """Build minimap from per-frame model keypoints (confidence-filtered)."""
+    transformer = view_transformer_from_keypoints(
+        keypoints,
+        config=config,
+        confidence=confidence,
         use_ransac=use_ransac,
         ransac_thresh=ransac_thresh,
     )
-
+    if transformer is None:
+        return None
     return render_radar_from_transformer(detections, transformer, config=config)
 
 
@@ -430,11 +425,15 @@ def pitch_keypoint_accept_mask(
 
 
 def view_transformer_from_keypoints(
-    keypoints: sv.KeyPoints,
+    keypoints: sv.KeyPoints | None,
     config: SoccerPitchConfiguration = PITCH_CONFIG,
     confidence: float = 0.5,
+    *,
+    use_ransac: bool = True,
+    ransac_thresh: float = HOMOGRAPHY_RANSAC_REPROJ_THRESH,
 ) -> ViewTransformer | None:
-    if keypoints is None or len(keypoints) == 0:
+    """Per-frame H from model keypoints with low-confidence vertices dropped."""
+    if keypoints is None or keypoints.xy.shape[0] == 0:
         return None
     xy = keypoints.xy[0]
     conf = pitch_keypoint_confidence(keypoints, n_vertices=len(xy))
@@ -445,7 +444,8 @@ def view_transformer_from_keypoints(
     return ViewTransformer(
         source=xy[mask].astype(np.float32),
         target=target,
-        ransac_thresh=HOMOGRAPHY_RANSAC_REPROJ_THRESH,
+        use_ransac=use_ransac,
+        ransac_thresh=ransac_thresh,
     )
 
 
@@ -510,57 +510,26 @@ def pitch_attack_direction(
 
 
 class PitchHomographyTracker:
-    """Per-frame homography with temporal keypoint smoothing.
+    """Per-frame homography from raw model keypoints (confidence-filtered).
 
-    The pitch-keypoint model is noisy frame-to-frame. We keep rolling buffers of each
-    vertex's **image** position (valid under camera motion), then fit homographies.
-
-    * **Speed / metrics** — confidence-filtered buffers, RANSAC, reprojection gate.
-    * **Radar** — all visible keypoints (sports ``x,y > 1`` mask), same temporal smooth,
-      plain ``findHomography`` on every correspondence (no RANSAC subset jumps).
+    * **Speed / metrics** — same mask as ``PitchHomography``, RANSAC, reprojection gate.
+    * **Radar** — same mask, plain homography (no RANSAC).
     """
 
     def __init__(
         self,
         homography: PitchHomography,
-        smooth_window: int = 31,
         confidence: float = 0.5,
         ransac_thresh: float = HOMOGRAPHY_RANSAC_REPROJ_THRESH,
         max_reproj_px: float = 8.0,
     ) -> None:
         self.homography = homography
         self.config = homography.config
-        self.smooth_window = smooth_window
         self.confidence = confidence
         self.ransac_thresh = ransac_thresh
         self.max_reproj_px = max_reproj_px
         self._targets = np.array(self.config.vertices, dtype=np.float32)
-        n = len(self._targets)
-        self._buffers: list[deque] = [deque(maxlen=smooth_window) for _ in range(n)]
-        self._radar_buffers: list[deque] = [deque(maxlen=smooth_window) for _ in range(n)]
         self._last: ViewTransformer | None = None
-        self._radar_last: ViewTransformer | None = None
-
-    def _append_observations(self, xy: np.ndarray, conf: np.ndarray) -> None:
-        for i in range(len(self._targets)):
-            if i >= len(xy) or xy[i, 0] <= 1 or xy[i, 1] <= 1:
-                continue
-            self._radar_buffers[i].append(xy[i])
-            if conf[i] > self.confidence:
-                self._buffers[i].append(xy[i])
-
-    @staticmethod
-    def _correspondences(
-        buffers: list[deque], targets: np.ndarray
-    ) -> tuple[np.ndarray, np.ndarray] | None:
-        src, dst = [], []
-        for i, buf in enumerate(buffers):
-            if buf:
-                src.append(np.mean(buf, axis=0))
-                dst.append(targets[i])
-        if len(src) < 4:
-            return None
-        return np.asarray(src, np.float32), np.asarray(dst, np.float32)
 
     def update(
         self, frame: np.ndarray, keypoints: sv.KeyPoints | None = None
@@ -568,55 +537,39 @@ class PitchHomographyTracker:
         """Return ``(speed_transformer, radar_transformer)`` for this frame."""
         if keypoints is None:
             keypoints = detect_pitch_keypoints(frame, self.homography)
-        kps = keypoints
-        if kps.xy.shape[0] == 0:
-            return self._last, self._radar_last
+        if keypoints.xy.shape[0] == 0:
+            return self._last, None
 
-        xy = kps.xy[0]
-        conf = pitch_keypoint_confidence(kps, n_vertices=len(self._targets))
-        self._append_observations(xy, conf)
+        radar_t = view_transformer_from_keypoints(
+            keypoints,
+            self.config,
+            self.confidence,
+            use_ransac=False,
+            ransac_thresh=self.ransac_thresh,
+        )
 
-        speed_pair = self._correspondences(self._buffers, self._targets)
-        if speed_pair is not None:
-            src_arr, dst_arr = speed_pair
-            try:
-                candidate = ViewTransformer(
-                    source=src_arr,
-                    target=dst_arr,
-                    use_ransac=True,
-                    ransac_thresh=self.ransac_thresh,
-                )
-            except ValueError:
-                pass
+        candidate = view_transformer_from_keypoints(
+            keypoints,
+            self.config,
+            self.confidence,
+            use_ransac=True,
+            ransac_thresh=self.ransac_thresh,
+        )
+        if candidate is not None:
+            xy = keypoints.xy[0]
+            conf = pitch_keypoint_confidence(keypoints, n_vertices=len(self._targets))
+            mask = pitch_keypoint_accept_mask(xy, conf, confidence=self.confidence)
+            src_arr = xy[mask].astype(np.float32)
+            dst_arr = self._targets[mask]
+            if self._last is None:
+                self._last = candidate
             else:
-                if self._last is None:
+                reproj = candidate.transform_points(src_arr)
+                err = float(np.linalg.norm(reproj - dst_arr, axis=1).mean())
+                if err <= self.max_reproj_px:
                     self._last = candidate
-                else:
-                    reproj = candidate.transform_points(src_arr)
-                    err = float(np.linalg.norm(reproj - dst_arr, axis=1).mean())
-                    if err <= self.max_reproj_px:
-                        self._last = candidate
 
-        radar_pair = self._correspondences(self._radar_buffers, self._targets)
-        if radar_pair is not None:
-            src_arr, dst_arr = radar_pair
-            try:
-                self._radar_last = ViewTransformer(
-                    source=src_arr, target=dst_arr, use_ransac=False
-                )
-            except ValueError:
-                pass
-
-        return self._last, self._radar_last
-
-    def smoothed_xy(self, *, for_radar: bool = True) -> np.ndarray:
-        """Per-vertex rolling-mean positions in image space; NaN where buffer is empty."""
-        buffers = self._radar_buffers if for_radar else self._buffers
-        out = np.full((len(self._targets), 2), np.nan, dtype=np.float32)
-        for i, buf in enumerate(buffers):
-            if buf:
-                out[i] = np.mean(buf, axis=0)
-        return out
+        return self._last, radar_t
 
 
 def iter_pitch_transformers(
@@ -625,23 +578,18 @@ def iter_pitch_transformers(
     device: str = "cpu",
     start: int = 1,
     end: int | None = None,
-    smooth_window: int = 31,
     ransac_thresh: float = HOMOGRAPHY_RANSAC_REPROJ_THRESH,
     max_reproj_px: float = 8.0,
     confidence: float = 0.5,
     yield_keypoints: bool = False,
-    yield_smoothed_keypoints: bool = False,
 ):
     """Yield homographies for every frame in a SoccerNet sequence.
 
-    Each item is ``(frame_idx, speed_transformer, radar_transformer)``. Radar uses
-    temporally smoothed keypoints and plain homography (no RANSAC). Speed keeps RANSAC
-    and a reprojection gate for metric coordinates.
+    Each item is ``(frame_idx, speed_transformer, radar_transformer)`` from per-frame
+    model keypoints (confidence > threshold, ``x,y > 1``). Speed uses RANSAC + a
+    reprojection gate; radar uses plain homography.
 
-    With ``yield_keypoints=True``, each item ends with ``raw_keypoints | None`` and, if
-    ``yield_smoothed_keypoints=True``, ``radar_smooth_xy`` and ``speed_smooth_xy`` arrays
-    (shape ``(n_vertices, 2)``, NaN where not buffered). Smoothed points are what H is
-    fit from — not display-only.
+    With ``yield_keypoints=True``, append ``keypoints | None``.
     """
     import cv2
 
@@ -650,7 +598,6 @@ def iter_pitch_transformers(
     homography.confidence = confidence
     tracker = PitchHomographyTracker(
         homography,
-        smooth_window=smooth_window,
         confidence=confidence,
         ransac_thresh=ransac_thresh,
         max_reproj_px=max_reproj_px,
@@ -660,25 +607,14 @@ def iter_pitch_transformers(
     for frame_idx in range(start, last + 1):
         frame = cv2.imread(str(sequence.frame_path(frame_idx)))
         if frame is None:
-            if yield_keypoints and yield_smoothed_keypoints:
-                yield frame_idx, None, None, None, None, None
-            elif yield_keypoints:
+            if yield_keypoints:
                 yield frame_idx, None, None, None
             else:
                 yield frame_idx, None, None
             continue
         kps = detect_pitch_keypoints(frame, homography)
         speed_t, radar_t = tracker.update(frame, kps)
-        if yield_keypoints and yield_smoothed_keypoints:
-            yield (
-                frame_idx,
-                speed_t,
-                radar_t,
-                kps,
-                tracker.smoothed_xy(for_radar=True),
-                tracker.smoothed_xy(for_radar=False),
-            )
-        elif yield_keypoints:
+        if yield_keypoints:
             yield frame_idx, speed_t, radar_t, kps
         else:
             yield frame_idx, speed_t, radar_t

@@ -3,7 +3,7 @@
 Two calibration modes turn pixel motion into meters:
 
 * **height** - bbox-height local scale (no pitch model).
-* **homography** - temporally smoothed pitch keypoints + RANSAC H per frame.
+* **homography** - per-frame pitch keypoints (confidence-filtered) + RANSAC H.
 
 **Homography / warp model (no matrix chain):** we do *not* multiply
 ``H_j @ H_{j-1}^{-1}`` across frames. Each frame has its own image→pitch map

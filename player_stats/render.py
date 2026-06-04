@@ -21,7 +21,6 @@ from world_cup_projects.common.visual import (
     draw_branding_tag,
     draw_hud_bar,
     draw_homography_feet_debug,
-    draw_pitch_keypoints_compare,
     draw_pitch_keypoints_debug,
     draw_radar_minimap,
     draw_text_shadow,
@@ -104,11 +103,8 @@ def render_demo(
     calibration: str = "height",
     leaderboard_seconds: float = 4.0,
     frame_transforms: dict | None = None,
-    frame_radar_transforms: dict | None = None,
     show_radar: bool = True,
     frame_keypoints: dict | None = None,
-    frame_radar_smooth_xy: dict | None = None,
-    frame_speed_smooth_xy: dict | None = None,
     pitch_kp_debug: bool = False,
     pitch_confidence: float = 0.5,
 ) -> dict:
@@ -126,32 +122,9 @@ def render_demo(
         image = annotate_players(image, dets, labels=labels)
         image = annotate_ball(image, dets)
         kps = frame_keypoints.get(frame_idx) if frame_keypoints is not None else None
-        radar_t = (
-            frame_radar_transforms.get(frame_idx)
-            if frame_radar_transforms is not None
-            else None
-        )
-        if show_radar and (radar_t is not None or kps is not None):
+        if show_radar and kps is not None:
             image = draw_radar_minimap(
-                image, dets, kps, transformer=radar_t
-            )
-        if frame_keypoints is not None and (
-            frame_radar_smooth_xy is not None or frame_speed_smooth_xy is not None
-        ):
-            image = draw_pitch_keypoints_compare(
-                image,
-                kps,
-                radar_smooth_xy=(
-                    frame_radar_smooth_xy.get(frame_idx)
-                    if frame_radar_smooth_xy is not None
-                    else None
-                ),
-                speed_smooth_xy=(
-                    frame_speed_smooth_xy.get(frame_idx)
-                    if frame_speed_smooth_xy is not None
-                    else None
-                ),
-                confidence_threshold=pitch_confidence,
+                image, dets, kps, pitch_confidence=pitch_confidence
             )
         if pitch_kp_debug and frame_keypoints is not None:
             image = draw_pitch_keypoints_debug(
@@ -159,7 +132,9 @@ def render_demo(
                 kps,
                 confidence_threshold=pitch_confidence,
             )
-            image = draw_homography_feet_debug(image, dets, kps)
+            image = draw_homography_feet_debug(
+                image, dets, kps, confidence_threshold=pitch_confidence
+            )
         title = (
             "PLAYER SPEED & DISTANCE  ·  PITCH DEBUG"
             if pitch_kp_debug
