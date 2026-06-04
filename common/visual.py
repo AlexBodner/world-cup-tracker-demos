@@ -2,19 +2,22 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-
 import cv2
 import numpy as np
 import supervision as sv
 
 from world_cup_projects.common.pitch import (
+    HOMOGRAPHY_RANSAC_REPROJ_THRESH,
     PITCH_CONFIG,
+    ViewTransformer,
     draw_pitch,
     draw_points_on_pitch,
     image_to_pitch_cm,
+    pitch_cm_to_image,
     pitch_keypoint_accept_mask,
     pitch_keypoint_confidence,
+    render_radar_from_transformer,
+    render_radar_sports,
 )
 from world_cup_projects.common.possession import ball_xy, feet_xy, player_mask
 
@@ -165,119 +168,43 @@ def _valid_pitch_cm(
     )
 
 
-# Hard-reset radar EMA when H flips and a dot jumps across the pitch (~25 m).
-RADAR_JUMP_RESET_CM = 2500.0
-
-
-@dataclass
-class RadarSmoother:
-    """EMA-smooth pitch (cm) positions per ``tracker_id`` for stable minimap dots."""
-
-    alpha: float = 0.38
-    _pos: dict[int, np.ndarray] = field(default_factory=dict)
-
-    def reset(self) -> None:
-        self._pos.clear()
-
-    def update(self, track_id: int, pitch_cm: np.ndarray, *, valid: bool) -> np.ndarray | None:
-        if not valid:
-            return self._pos.get(track_id)
-        pt = pitch_cm.astype(np.float64)
-        prev = self._pos.get(track_id)
-        if prev is not None:
-            if float(np.linalg.norm(pt - prev)) > RADAR_JUMP_RESET_CM:
-                self._pos[track_id] = pt
-                return pt
-        if prev is None:
-            self._pos[track_id] = pt
-        else:
-            a = self.alpha
-            self._pos[track_id] = (1.0 - a) * prev + a * pt
-        return self._pos[track_id]
-
-
 def draw_radar_minimap(
     frame: np.ndarray,
     dets: sv.Detections,
-    transformer,
+    keypoints: sv.KeyPoints | None = None,
     *,
     scale_frac: float = 0.33,
     position: str = "bottom_right",
-    smoother: RadarSmoother | None = None,
+    use_ransac: bool = False,
+    ransac_thresh: float = HOMOGRAPHY_RANSAC_REPROJ_THRESH,
+    transformer: ViewTransformer | None = None,
 ) -> np.ndarray:
-    if transformer is None:
-        return frame
-    pmask = player_mask(dets)
-    if not pmask.any():
-        return frame
-
-    feet = feet_xy(dets)
-    teams = dets.data.get("team", np.zeros(len(dets)))
-    pitch_xy = image_to_pitch_cm(feet[pmask], transformer)
-    if pitch_xy is None:
+    """Sports-style radar minimap (prefer smoothed ``transformer`` when provided)."""
+    if transformer is not None:
+        radar = render_radar_from_transformer(dets, transformer)
+    else:
+        radar = render_radar_sports(
+            dets, keypoints, use_ransac=use_ransac, ransac_thresh=ransac_thresh
+        )
+    if radar is None:
         return frame
 
-    tids = dets.tracker_id[pmask] if dets.tracker_id is not None else np.arange(len(pitch_xy))
-    teams_p = teams[pmask]
-    valid = _valid_pitch_cm(pitch_xy)
-    smooth = smoother or RadarSmoother()
-
-    radar = draw_pitch(config=PITCH_CONFIG)
-    for team_id, color in enumerate(TEAM_COLORS[:2]):
-        team_pts: list[np.ndarray] = []
-        for pt, tid, ok, team in zip(pitch_xy, tids, valid, teams_p):
-            if team != team_id:
-                continue
-            tid_i = int(tid) if tid is not None and int(tid) >= 0 else 10_000 + len(team_pts)
-            smoothed = smooth.update(tid_i, pt, valid=bool(ok))
-            if smoothed is not None:
-                team_pts.append(smoothed)
-        if team_pts:
-            radar = draw_points_on_pitch(
-                config=PITCH_CONFIG,
-                xy=np.asarray(team_pts, dtype=np.float32),
-                face_color=color,
-                edge_color=sv.Color.BLACK,
-                radius=10,
-                thickness=2,
-                pitch=radar,
-            )
-
-    ball = ball_xy(dets)
-    if ball is not None:
-        ball_cm = image_to_pitch_cm(np.array([ball], dtype=np.float32), transformer)
-        if ball_cm is not None and _valid_pitch_cm(ball_cm).all():
-            radar = draw_points_on_pitch(
-                config=PITCH_CONFIG,
-                xy=ball_cm,
-                face_color=sv.Color.WHITE,
-                edge_color=sv.Color.BLACK,
-                radius=8,
-                pitch=radar,
-            )
-
-    h, w = frame.shape[:2]
-    rw = int(w * scale_frac)
+    h, w, _ = frame.shape
+    rw = max(int(w * scale_frac), 120)
     rh = int(radar.shape[0] * (rw / radar.shape[1]))
     radar = sv.resize_image(radar, (rw, rh))
     margin = 14
-    brand_clearance = 52  # keep clear of "powered by trackers" (bottom-right)
+    brand_clearance = 52
     if position == "bottom_left":
         x, y = margin, h - rh - margin
     elif position == "bottom_center":
         x, y = (w - rw) // 2, h - rh - margin
-    else:  # bottom_right (default — out of the way of play + branding)
+    else:
         x, y = w - rw - margin, h - rh - margin - brand_clearance
-    panel = frame.copy()
-    cv2.rectangle(panel, (x - 10, y - 10), (x + rw + 10, y + rh + 10), (18, 18, 22), -1)
-    frame[:] = cv2.addWeighted(panel, 0.45, frame, 0.55, 0)
-    roi = frame[y : y + rh, x : x + rw]
-    frame[y : y + rh, x : x + rw] = cv2.addWeighted(radar, 0.92, roi, 0.08, 0)
-    cv2.rectangle(frame, (x - 2, y - 2), (x + rw + 2, y + rh + 2), (255, 255, 255), 1)
-    return frame
+    rect = sv.Rect(x=x, y=y, width=rw, height=rh)
+    return sv.draw_image(frame, radar, opacity=0.5, rect=rect)
 
 
-# Back-compat alias
 draw_radar_bottom_center = draw_radar_minimap
 
 
@@ -285,6 +212,93 @@ _KP_USED_BGR = (80, 220, 80)
 _KP_LOW_CONF_BGR = (80, 80, 255)
 _KP_INVALID_BGR = (140, 140, 140)
 _KP_EDGE_BGR = (70, 70, 90)
+_KP_RAW_BGR = (255, 220, 80)
+_KP_RADAR_SMOOTH_BGR = (220, 80, 255)
+_KP_SPEED_SMOOTH_BGR = (80, 200, 255)
+
+
+def draw_pitch_keypoints_compare(
+    frame: np.ndarray,
+    keypoints: sv.KeyPoints | None,
+    *,
+    radar_smooth_xy: np.ndarray | None = None,
+    speed_smooth_xy: np.ndarray | None = None,
+    confidence_threshold: float = 0.5,
+) -> np.ndarray:
+    """Overlay raw detections vs temporally smoothed points used to fit homography."""
+    margin = 14
+    legend_y = 52
+
+    if keypoints is None or keypoints.xy.shape[0] == 0:
+        draw_text_shadow(
+            frame,
+            "pitch kp: none",
+            (margin, legend_y),
+            font_scale=0.5,
+            color_bgr=(180, 180, 180),
+            thickness=1,
+        )
+        return frame
+
+    xy = keypoints.xy[0]
+    n = len(PITCH_CONFIG.vertices)
+    conf = pitch_keypoint_confidence(keypoints, n_vertices=n)
+
+    def _valid_pt(x: float, y: float) -> bool:
+        return x > 1 and y > 1 and np.isfinite(x) and np.isfinite(y)
+
+    def _draw_smooth(
+        smooth: np.ndarray | None, color: tuple[int, int, int], radius: int
+    ) -> int:
+        if smooth is None:
+            return 0
+        count = 0
+        for i in range(min(len(smooth), n)):
+            x, y = float(smooth[i, 0]), float(smooth[i, 1])
+            if not _valid_pt(x, y):
+                continue
+            px, py = int(x), int(y)
+            cv2.circle(frame, (px, py), radius, color, -1, cv2.LINE_AA)
+            cv2.circle(frame, (px, py), radius, (255, 255, 255), 1, cv2.LINE_AA)
+            count += 1
+        return count
+
+    n_radar = _draw_smooth(radar_smooth_xy, _KP_RADAR_SMOOTH_BGR, 7)
+    n_speed = _draw_smooth(speed_smooth_xy, _KP_SPEED_SMOOTH_BGR, 5)
+
+    n_raw = 0
+    for i in range(min(len(xy), n)):
+        x, y = float(xy[i, 0]), float(xy[i, 1])
+        if not _valid_pt(x, y):
+            continue
+        px, py = int(x), int(y)
+        cv2.circle(frame, (px, py), 4, _KP_RAW_BGR, 1, cv2.LINE_AA)
+        n_raw += 1
+        if radar_smooth_xy is not None and i < len(radar_smooth_xy):
+            sx, sy = float(radar_smooth_xy[i, 0]), float(radar_smooth_xy[i, 1])
+            if _valid_pt(sx, sy):
+                cv2.line(
+                    frame,
+                    (px, py),
+                    (int(sx), int(sy)),
+                    _KP_RADAR_SMOOTH_BGR,
+                    1,
+                    cv2.LINE_AA,
+                )
+
+    summary = f"pitch kp raw {n_raw}  |  smooth radar {n_radar}  speed {n_speed}"
+    draw_text_shadow(
+        frame, summary, (margin, legend_y), font_scale=0.5, color_bgr=(230, 230, 230), thickness=1
+    )
+    for dy, text, color in (
+        (20, "cyan ring = raw model (this frame)", _KP_RAW_BGR),
+        (38, "magenta = smoothed -> radar H", _KP_RADAR_SMOOTH_BGR),
+        (56, "yellow = smoothed -> speed H (conf filter)", _KP_SPEED_SMOOTH_BGR),
+    ):
+        draw_text_shadow(
+            frame, text, (margin, legend_y + dy), font_scale=0.42, color_bgr=color, thickness=1
+        )
+    return frame
 
 
 def draw_pitch_keypoints_debug(
@@ -300,9 +314,8 @@ def draw_pitch_keypoints_debug(
     Skeleton edges only connect keypoints that pass the confidence filter (model is
     trained on broadcast football; SoccerNet angles may still look sparse or wrong).
     """
-    h, w = frame.shape[:2]
     margin = 14
-    legend_y = h - margin - 88
+    legend_y = 52  # below HUD bar; avoids overlapping bottom-right radar
 
     if keypoints is None or keypoints.xy.shape[0] == 0:
         draw_text_shadow(
@@ -361,14 +374,69 @@ def draw_pitch_keypoints_debug(
         frame, summary, (margin, legend_y), font_scale=0.52, color_bgr=(230, 230, 230), thickness=1
     )
     for dy, text, color in (
-        (22, "green = used for H", _KP_USED_BGR),
+        (22, "green = used for H (tracker upgrade path)", _KP_USED_BGR),
         (40, "red = low confidence", _KP_LOW_CONF_BGR),
         (58, "gray = invalid / missing", _KP_INVALID_BGR),
-        (76, "lines = pitch topology (confident kps only)", _KP_EDGE_BGR),
+        (76, "see compare overlay for smoothed H inputs", _KP_EDGE_BGR),
     ):
         draw_text_shadow(
             frame, text, (margin, legend_y + dy), font_scale=0.42, color_bgr=color, thickness=1
         )
+    return frame
+
+
+def draw_homography_feet_debug(
+    frame: np.ndarray,
+    dets: sv.Detections,
+    keypoints: sv.KeyPoints | None,
+    *,
+    reproj_thresh_px: float = 25.0,
+) -> np.ndarray:
+    """Feet warp check using the same sports ``H`` as the radar."""
+    from world_cup_projects.common.pitch import ViewTransformer
+
+    if keypoints is None or keypoints.xy.shape[0] == 0:
+        return frame
+    mask = (keypoints.xy[0][:, 0] > 1) & (keypoints.xy[0][:, 1] > 1)
+    if int(mask.sum()) < 4:
+        return frame
+    transformer = ViewTransformer(
+        source=keypoints.xy[0][mask].astype(np.float32),
+        target=np.array(PITCH_CONFIG.vertices, dtype=np.float32)[mask],
+        use_ransac=False,
+    )
+
+    pmask = player_mask(dets)
+    if not pmask.any():
+        return frame
+    feet = feet_xy(dets)[pmask]
+    pitch_cm = image_to_pitch_cm(feet, transformer)
+    if pitch_cm is None:
+        return frame
+    back = pitch_cm_to_image(pitch_cm, transformer)
+    if back is None:
+        return frame
+    valid = _valid_pitch_cm(pitch_cm)
+    for foot, reproj, ok in zip(feet, back, valid):
+        fx, fy = int(foot[0]), int(foot[1])
+        if not ok:
+            cv2.circle(frame, (fx, fy), 6, (80, 80, 255), 2, cv2.LINE_AA)
+            continue
+        rx, ry = int(reproj[0]), int(reproj[1])
+        err = float(np.hypot(reproj[0] - foot[0], reproj[1] - foot[1]))
+        color = (80, 220, 80) if err <= reproj_thresh_px else (80, 80, 255)
+        cv2.circle(frame, (fx, fy), 5, color, -1, cv2.LINE_AA)
+        if err > 4.0:
+            cv2.line(frame, (fx, fy), (rx, ry), (255, 220, 80), 1, cv2.LINE_AA)
+            cv2.circle(frame, (rx, ry), 4, (255, 220, 80), 1, cv2.LINE_AA)
+    draw_text_shadow(
+        frame,
+        "feet: green=on-pitch  orange=H warp error  red=off-pitch (sports H)",
+        (14, 118),
+        font_scale=0.42,
+        color_bgr=(200, 200, 200),
+        thickness=1,
+    )
     return frame
 
 

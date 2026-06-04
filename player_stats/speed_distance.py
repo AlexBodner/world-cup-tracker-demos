@@ -14,12 +14,12 @@ Two calibration modes turn pixel motion into meters:
 * instantaneous speed on that step: ``‖p_i - p_{i-1}‖ / Δt`` with the same
   per-step warp (each endpoint in its frame's metric)
 
-Displayed speed at frame ``j`` is the **mean** of ``K`` multi-scale velocities:
+Displayed speed at frame ``j`` is the **median** of ``K`` multi-scale velocities:
 ``v_{j,j-1}, v_{j,j-2}, …, v_{j,j-K}`` where each ``v_{j,j-l} = ‖H_j(xy_j) -
 H_{j-l}(xy_{j-l})‖ / Δt_{j-l→j}`` (per-step warps, not an H chain). Longer lags
 damp 1-frame homography noise; short lags keep responsiveness. Light image-space
-feet smoothing first; optional soft cap per lag before averaging.
-Outlier rejection applies to **distance** steps only, not speed labels.
+feet smoothing first, then median aggregation. Homography glitch steps are
+**excluded** via per-track adaptive thresholds (not a display speed cap).
 """
 
 from __future__ import annotations
@@ -33,13 +33,11 @@ from world_cup_projects.common.possession import feet_xy, player_mask
 from world_cup_projects.common.soccernet import TEAM_NONE
 
 PLAYER_HEIGHT_M = 1.8
-# Reject non-physical spikes (~38 km/h; elite sprint is ~36 km/h).
-MAX_OUTLIER_STEP_MS = 10.5
-# Soft cap on each 1-frame homography speed before K-window median (not a display zero).
-SOFT_INST_SPEED_CAP_MS = 11.0
 DEFAULT_SPEED_K_FRAMES = 15
 HOMOGRAPHY_XY_SMOOTH = 5  # image feet, speed path only
 HOMOGRAPHY_SPEED_SMOOTH = 11
+# ~45 km/h — only excludes non-physical homography spikes, not normal sprint peaks.
+MAX_PHYSICAL_STEP_MS = 12.5
 
 
 @dataclass
@@ -180,8 +178,9 @@ def _speed_multi_lag_mean_homography(
     k: int,
     *,
     transform=None,
+    max_step_ms: float | None = None,
 ) -> np.ndarray:
-    """At frame ``j``, mean of ``v_{j,j-1} … v_{j,j-K}`` (multi-scale robust estimate)."""
+    """At frame ``j``, median of ``v_{j,j-1} … v_{j,j-K}`` (multi-scale robust estimate)."""
     n = len(frames)
     speed = np.zeros(n, dtype=np.float64)
     if n < 2 or k < 1:
@@ -192,10 +191,13 @@ def _speed_multi_lag_mean_homography(
             v = _lag_speed_homography(
                 xy, frames, frame_transforms, j, lag, fps, transform=transform
             )
-            if v is not None:
-                lags.append(min(v, SOFT_INST_SPEED_CAP_MS))
+            if v is None:
+                continue
+            if max_step_ms is not None and v > max_step_ms:
+                continue
+            lags.append(v)
         if lags:
-            speed[j] = float(np.mean(lags))
+            speed[j] = float(np.median(lags))
     return speed
 
 
@@ -227,8 +229,10 @@ def _speed_multi_lag_mean(
     frames: np.ndarray,
     fps: float,
     k: int,
+    *,
+    max_step_ms: float | None = None,
 ) -> np.ndarray:
-    """Mean of ``v_{j,j-1} … v_{j,j-K}`` in metric space (height mode)."""
+    """Median of ``v_{j,j-1} … v_{j,j-K}`` in metric space (height mode)."""
     n = len(frames)
     speed = np.zeros(n, dtype=np.float64)
     if n < 2 or k < 1:
@@ -242,10 +246,23 @@ def _speed_multi_lag_mean(
             dt = (int(frames[j]) - int(frames[j0])) / fps
             if dt <= 0:
                 continue
-            lags.append(float(np.linalg.norm(positions[j] - positions[j0]) / dt))
+            v = float(np.linalg.norm(positions[j] - positions[j0]) / dt)
+            if max_step_ms is not None and v > max_step_ms:
+                continue
+            lags.append(v)
         if lags:
-            speed[j] = float(np.mean(lags))
+            speed[j] = float(np.median(lags))
     return speed
+
+
+def _credible_speed_threshold_ms(inst_speed: np.ndarray) -> float:
+    """Upper bound for plausible step speeds on this track (adaptive + physical ceiling)."""
+    v = inst_speed[np.isfinite(inst_speed) & (inst_speed > 0.05)]
+    if len(v) < 5:
+        return MAX_PHYSICAL_STEP_MS
+    med = float(np.median(v))
+    mad = float(np.median(np.abs(v - med)))
+    return max(MAX_PHYSICAL_STEP_MS, med + max(3.5 * mad, 3.0))
 
 
 def _height_positions_m(xy: np.ndarray, box_h: np.ndarray) -> np.ndarray:
@@ -279,6 +296,13 @@ def compute_kinematics(
             step_m = _homography_step_lengths_per_frame_h(
                 xy_h, frames, transforms, transform=transform
             )
+            dt = np.clip(np.diff(frames), 1, None) / fps
+            inst_speed = np.divide(
+                step_m, dt, out=np.zeros_like(step_m), where=dt > 0
+            )
+            step_thresh = _credible_speed_threshold_ms(inst_speed)
+            credible = inst_speed <= step_thresh
+            step_m = np.where(credible, step_m, 0.0)
             speed = _speed_multi_lag_mean_homography(
                 xy_h,
                 frames,
@@ -286,6 +310,7 @@ def compute_kinematics(
                 fps,
                 speed_k_frames,
                 transform=transform,
+                max_step_ms=step_thresh,
             )
             speed_smooth = max(smooth_window, HOMOGRAPHY_SPEED_SMOOTH)
         else:
@@ -293,19 +318,24 @@ def compute_kinematics(
             step_px = np.linalg.norm(np.diff(xy, axis=0), axis=1)
             step_mpp = (mpp[:-1] + mpp[1:]) / 2.0
             step_m = step_px * step_mpp
+            dt = np.clip(np.diff(frames), 1, None) / fps
+            inst_speed = np.divide(
+                step_m, dt, out=np.zeros_like(step_m), where=dt > 0
+            )
+            step_thresh = _credible_speed_threshold_ms(inst_speed)
+            credible = inst_speed <= step_thresh
+            step_m = np.where(credible, step_m, 0.0)
             speed_pos = _height_positions_m(xy, box_h)
-            speed = _speed_multi_lag_mean(speed_pos, frames, fps, speed_k_frames)
+            speed = _speed_multi_lag_mean(
+                speed_pos, frames, fps, speed_k_frames, max_step_ms=step_thresh
+            )
             speed_smooth = smooth_window
-
-        dt = np.clip(np.diff(frames), 1, None) / fps
-        inst_speed = np.divide(step_m, dt, out=np.zeros_like(step_m), where=dt > 0)
-        good = inst_speed <= MAX_OUTLIER_STEP_MS
 
         speed = np.clip(speed, 0, None)
         speed = _smooth(speed, speed_smooth)
 
         track.speed_ms = speed
-        track.distance_m = float(np.sum(step_m[good]))
+        track.distance_m = float(np.sum(step_m))
         positive = speed[speed > 0.3]
         track.top_speed_ms = (
             float(np.percentile(positive, 90)) if len(positive) >= 5 else float(np.max(speed))
@@ -319,6 +349,14 @@ def speed_at_frame(track: PlayerTrack, frame_idx: int) -> float | None:
     return float(track.speed_ms[track.frames.index(frame_idx)])
 
 
+MS_TO_KMH = 3.6
+
+
+def format_speed_kmh(ms: float, *, decimals: int = 1) -> str:
+    """User-facing speed label (``ms`` is meters per second; displays km/h)."""
+    return f"{ms * MS_TO_KMH:.{decimals}f} km/h"
+
+
 def format_speed_ms(ms: float, *, decimals: int = 1) -> str:
-    """User-facing speed label (internal values stay in m/s)."""
-    return f"{ms:.{decimals}f} m/s"
+    """Alias for :func:`format_speed_kmh` (internal kinematics stay in m/s)."""
+    return format_speed_kmh(ms, decimals=decimals)

@@ -15,19 +15,21 @@ from world_cup_projects.common.possession import player_mask
 from world_cup_projects.common.soccernet import SoccerNetSequence
 from world_cup_projects.common.visual import (
     ROBOFLOW_PURPLE_BGR,
-    RadarSmoother,
     TEAM_COLORS,
     annotate_ball,
     annotate_players,
     draw_branding_tag,
     draw_hud_bar,
+    draw_homography_feet_debug,
+    draw_pitch_keypoints_compare,
     draw_pitch_keypoints_debug,
     draw_radar_minimap,
     draw_text_shadow,
 )
 from world_cup_projects.player_stats.speed_distance import (
+    MS_TO_KMH,
     PlayerTrack,
-    format_speed_ms,
+    format_speed_kmh,
     speed_at_frame,
 )
 
@@ -52,7 +54,7 @@ def _player_labels(
         if speed is None:
             labels.append(f"#{tid}")
         else:
-            labels.append(f"#{tid}  {format_speed_ms(speed)}")
+            labels.append(f"#{tid}  {format_speed_kmh(speed)}")
     return labels
 
 
@@ -77,7 +79,7 @@ def _leaderboard_card(
         color = _team_color(t.team)
         line = (
             f"{rank:2d}.  #{t.track_id:<4d} {t.distance_m:6.1f} m"
-            f"   peak {format_speed_ms(t.top_speed_ms)}"
+            f"   peak {format_speed_kmh(t.top_speed_ms)}"
         )
         draw_text_shadow(card, line, (44, y + rank * 40),
                          font_scale=0.68, color_bgr=color, thickness=2)
@@ -86,7 +88,7 @@ def _leaderboard_card(
     if fastest is not None:
         draw_text_shadow(
             card,
-            f"FASTEST SPRINT:  #{fastest.track_id}  {format_speed_ms(fastest.top_speed_ms)}",
+            f"FASTEST SPRINT:  #{fastest.track_id}  {format_speed_kmh(fastest.top_speed_ms)}",
             (44, y + 9 * 40 + 30), font_scale=0.8, color_bgr=(40, 220, 240), thickness=2,
         )
     return draw_branding_tag(card)
@@ -102,8 +104,12 @@ def render_demo(
     calibration: str = "height",
     leaderboard_seconds: float = 4.0,
     frame_transforms: dict | None = None,
+    frame_radar_transforms: dict | None = None,
     show_radar: bool = True,
     frame_keypoints: dict | None = None,
+    frame_radar_smooth_xy: dict | None = None,
+    frame_speed_smooth_xy: dict | None = None,
+    pitch_kp_debug: bool = False,
     pitch_confidence: float = 0.5,
 ) -> dict:
     """Render the speed/distance MP4. ``frame_loader(frame_idx) -> bgr image``."""
@@ -111,9 +117,6 @@ def render_demo(
     writer = cv2.VideoWriter(
         out_path, fourcc, sequence.frame_rate, (sequence.width, sequence.height)
     )
-    radar_smoother = RadarSmoother()
-    radar_smoother.reset()
-
     for frame_idx, dets in detections_iter:
         image = frame_loader(frame_idx)
         if image is None:
@@ -122,22 +125,47 @@ def render_demo(
         labels = _player_labels(dets, tracks, frame_idx)
         image = annotate_players(image, dets, labels=labels)
         image = annotate_ball(image, dets)
-        if show_radar and frame_transforms is not None:
+        kps = frame_keypoints.get(frame_idx) if frame_keypoints is not None else None
+        radar_t = (
+            frame_radar_transforms.get(frame_idx)
+            if frame_radar_transforms is not None
+            else None
+        )
+        if show_radar and (radar_t is not None or kps is not None):
             image = draw_radar_minimap(
-                image,
-                dets,
-                frame_transforms.get(frame_idx),
-                scale_frac=0.33,
-                position="bottom_right",
-                smoother=radar_smoother,
+                image, dets, kps, transformer=radar_t
             )
-        if frame_keypoints is not None:
-            image = draw_pitch_keypoints_debug(
+        if frame_keypoints is not None and (
+            frame_radar_smooth_xy is not None or frame_speed_smooth_xy is not None
+        ):
+            image = draw_pitch_keypoints_compare(
                 image,
-                frame_keypoints.get(frame_idx),
+                kps,
+                radar_smooth_xy=(
+                    frame_radar_smooth_xy.get(frame_idx)
+                    if frame_radar_smooth_xy is not None
+                    else None
+                ),
+                speed_smooth_xy=(
+                    frame_speed_smooth_xy.get(frame_idx)
+                    if frame_speed_smooth_xy is not None
+                    else None
+                ),
                 confidence_threshold=pitch_confidence,
             )
-        image = draw_hud_bar(image, "PLAYER SPEED & DISTANCE")
+        if pitch_kp_debug and frame_keypoints is not None:
+            image = draw_pitch_keypoints_debug(
+                image,
+                kps,
+                confidence_threshold=pitch_confidence,
+            )
+            image = draw_homography_feet_debug(image, dets, kps)
+        title = (
+            "PLAYER SPEED & DISTANCE  ·  PITCH DEBUG"
+            if pitch_kp_debug
+            else "PLAYER SPEED & DISTANCE"
+        )
+        image = draw_hud_bar(image, title)
         image = draw_branding_tag(image)
         writer.write(image)
 
@@ -155,8 +183,12 @@ def render_demo(
         "calibration": calibration,
         "n_tracks": len(tracks),
         "top_distance": [
-            {"id": t.track_id, "distance_m": round(t.distance_m, 1),
-             "top_speed_ms": round(t.top_speed_ms, 1)}
+            {
+                "id": t.track_id,
+                "distance_m": round(t.distance_m, 1),
+                "top_speed_kmh": round(t.top_speed_ms * MS_TO_KMH, 1),
+                "top_speed_ms": round(t.top_speed_ms, 2),
+            }
             for t in ranked
         ],
     }

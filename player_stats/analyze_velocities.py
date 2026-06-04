@@ -28,7 +28,6 @@ from world_cup_projects.common.soccernet import (
 )
 from world_cup_projects.player_stats.speed_distance import (
     DEFAULT_SPEED_K_FRAMES,
-    SOFT_INST_SPEED_CAP_MS,
     PlayerTrack,
     _instantaneous_speed_homography,
     _smooth_xy,
@@ -77,18 +76,16 @@ def _collect_inst_speeds(
     track: PlayerTrack,
     frame_transforms: dict,
     fps: float,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> np.ndarray:
     xy = _smooth_xy(np.asarray(track.xy, dtype=np.float64), HOMOGRAPHY_XY_SMOOTH)
     frames = np.asarray(track.frames)
     raw: list[float] = []
-    capped: list[float] = []
     for i in range(1, len(frames)):
         v = _instantaneous_speed_homography(xy, frames, frame_transforms, i, fps)
         if v is None:
             continue
         raw.append(v)
-        capped.append(min(v, SOFT_INST_SPEED_CAP_MS))
-    return np.asarray(raw, dtype=np.float64), np.asarray(capped, dtype=np.float64)
+    return np.asarray(raw, dtype=np.float64)
 
 
 def analyze_sequence(
@@ -110,16 +107,14 @@ def analyze_sequence(
     players = []
     all_display: list[float] = []
     all_inst_raw: list[float] = []
-    all_inst_capped: list[float] = []
 
     for track in sorted(tracks.values(), key=lambda t: t.track_id):
         if track.speed_ms is None or len(track.frames) < 10:
             continue
         display = track.speed_ms[track.speed_ms > 0.05]
-        inst_raw, inst_capped = _collect_inst_speeds(track, frame_transforms, sequence.frame_rate)
+        inst_raw = _collect_inst_speeds(track, frame_transforms, sequence.frame_rate)
         all_display.extend(display.tolist())
         all_inst_raw.extend(inst_raw.tolist())
-        all_inst_capped.extend(inst_capped.tolist())
 
         players.append(
             {
@@ -129,9 +124,8 @@ def analyze_sequence(
                 "top_speed_ms": round(track.top_speed_ms, 2),
                 "display_speed": _percentiles(display),
                 "display_zones": _zone_fractions(display),
-                "inst_1frame_raw": _percentiles(inst_raw[inst_raw <= 15.0]),
-                "inst_1frame_capped": _percentiles(inst_capped),
-                "inst_zones_capped": _zone_fractions(inst_capped),
+                "inst_1frame": _percentiles(inst_raw[inst_raw <= 15.0]),
+                "inst_zones": _zone_fractions(inst_raw),
                 "pct_display_zero": round(
                     float((track.speed_ms < 0.1).mean()) * 100, 1
                 ),
@@ -145,7 +139,7 @@ def analyze_sequence(
         "speed_model": {
             "k_frames": speed_k_frames,
             "warp": "per-step H_{i-1}(xy_{i-1}), H_i(xy_i); no H matrix chain",
-            "display": f"mean(v_{{j,j-1}}..v_{{j,j-K}}), soft cap {SOFT_INST_SPEED_CAP_MS} m/s per lag",
+            "display": "median(v_{j,j-1}..v_{j,j-K}) per lag; no speed caps",
             "post_smooth_frames": 11,
         },
         "reference_bands_ms": {
@@ -167,7 +161,7 @@ def analyze_sequence(
                 np.asarray([v for v in all_inst_raw if v <= 15.0])
             ),
             "inst_1frame_glitch_steps": int(sum(1 for v in all_inst_raw if v > 15.0)),
-            "inst_1frame_capped": _percentiles(np.asarray(all_inst_capped)),
+            "inst_1frame": _percentiles(np.asarray([v for v in all_inst_raw if v <= 15.0])),
             "tracks_peak_over_7ms": int(
                 sum(1 for p in players if p["top_speed_ms"] >= 7.0)
             ),
@@ -197,8 +191,8 @@ def main() -> None:
 
     print(f"Loading homography for {sequence.name} ...", flush=True)
     frame_transforms = {
-        idx: t
-        for idx, t in iter_pitch_transformers(
+        idx: t_speed
+        for idx, t_speed, _t_radar in iter_pitch_transformers(
             sequence, device=args.device, end=end
         )
     }
@@ -222,7 +216,7 @@ def main() -> None:
     print(f"Display zones: {s['display_zones']}")
     print(f"1-frame inst (sane <=15 m/s): {s.get('inst_1frame_raw_sane', {})}")
     print(f"1-frame homography glitches (>15 m/s): {s.get('inst_1frame_glitch_steps', 0)} steps")
-    print(f"1-frame inst (capped @ {SOFT_INST_SPEED_CAP_MS} m/s): {s['inst_1frame_capped']}")
+    print(f"1-frame inst: {s.get('inst_1frame', {})}")
     print(f"Peaks >= 7 m/s: {s['tracks_peak_over_7ms']} tracks, >= 9 m/s: {s['tracks_peak_over_9ms']}")
     print(f"\nWrote {json_path}")
 

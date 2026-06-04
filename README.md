@@ -12,7 +12,7 @@ dataset to avoid FIFA copyright-strike risk on real broadcast footage.
 
 1. **Pass Alternatives** - freeze the frame when a player has the ball and overlay the 3
    best passing lanes, scored by openness / forward-progress / receiver-space.
-2. **Player Speed & Distance** - per-player speed (m/s) + total distance covered, shown as
+2. **Player Speed & Distance** - per-player speed (km/h) + total distance covered, shown as
    on-pitch labels, an end-of-clip leaderboard, and (v2) a top-down radar minimap.
 
 Status: **both demos are built and produce rendered MP4s.** v1 (no weights) and v2
@@ -61,8 +61,8 @@ PYTHONPATH=. python -m world_cup_projects.player_stats.run --sequence SNMOT-194 
 # Demo 2 - weight-free fallback (bbox-height calibration)
 PYTHONPATH=. python -m world_cup_projects.player_stats.run --sequence SNMOT-194 --mode height
 
-# Homography debug: pitch keypoints + confidence on video (green = used for H)
-PYTHONPATH=. python -m world_cup_projects.player_stats.run --sequence SNMOT-194 --mode homography --debug-pitch-keypoints --max-frames 150
+# Homography debug: pitch keypoints, skeleton, feet warp check (orange line = bad H)
+PYTHONPATH=. python -m world_cup_projects.player_stats.run --sequence SNMOT-197 --mode homography --debug-pitch-keypoints
 PYTHONPATH=. python -m world_cup_projects.pass_alternatives.run --sequence SNMOT-194 --metric --debug-pitch-keypoints
 
 # v2 "from raw pixels" source (RF-DETR + ByteTrack instead of GT)
@@ -93,7 +93,7 @@ using `supervision` annotators:
 - **Players**: `sv.EllipseAnnotator` at the feet, team-colored via a `ColorPalette` +
   `ColorLookup.CLASS`.
 - **Labels**: `sv.LabelAnnotator` rounded chips (`border_radius`, `BOTTOM_CENTER`) — e.g.
-  `#9  3.3 m/s` in the speed demo.
+  `#9  12.0 km/h` in the speed demo.
 - **Ball**: `sv.TriangleAnnotator` (gold downward triangle).
 - **Radar**: bottom-center pitch minimap over a semi-transparent dark panel, team-colored
   dots with black edges plus a white ball dot (`draw_pitch` / `draw_points_on_pitch`).
@@ -222,9 +222,15 @@ opponent-team centroid); v2 uses the pitch homography for a true direction-to-go
      meters-per-pixel scale that adapts to perspective.
    - **homography**: per-frame `ViewTransformer` from the pitch-keypoint model maps feet to
      true pitch meters (camera-angle independent).
-3. Multi-lag mean speed (default K=15) with per-step `H_{i-1}` / `H_i` warps; median-smooth
-   for display; distance excludes steps >10.5 m/s (spikes do not zero the on-screen label).
-4. Render per-player m/s labels (team-colored), an end-card leaderboard (top distance + top
+3. Multi-lag **median** speed (default K=15) with per-step `H_{i-1}` / `H_i` warps;
+   median-smooth for display. Homography glitch steps excluded adaptively.
+
+**Radar:** temporally smoothed pitch keypoints (rolling mean per vertex in **image** space,
+so camera pans stay consistent) → plain `findHomography` on **all** visible points
+(sports mask `x,y > 1`, no RANSAC) → feet warp → minimap at ~33% width, bottom-right.
+**Speed/distance** still uses the same tracker’s confidence-filtered correspondences with
+RANSAC and a reprojection gate.
+4. Render per-player km/h labels (team-colored), an end-card leaderboard (top distance + top
    sprint), and a top-down **radar** minimap in homography mode.
 
 ## Weights

@@ -71,10 +71,6 @@ class SoccerPitchConfiguration:
 # --------------------------------------------------------------------------- #
 # RANSAC reprojection threshold in image pixels; rejects mis-detected pitch keypoints.
 HOMOGRAPHY_RANSAC_REPROJ_THRESH = 5.0
-# Reject (or keep previous H) when anchor keypoints jump more than ~half the pitch (cm).
-HOMOGRAPHY_ORIENTATION_JUMP_CM = 3500.0
-
-
 def _find_homography_matrix(
     source: npt.NDArray,
     target: npt.NDArray,
@@ -120,55 +116,6 @@ class ViewTransformer:
             return points
         reshaped = points.reshape(-1, 1, 2).astype(np.float32)
         return cv2.perspectiveTransform(reshaped, self.m).reshape(-1, 2).astype(np.float32)
-
-
-def _mirror_homography_matrix(
-    matrix: npt.NDArray,
-    config: SoccerPitchConfiguration,
-    *,
-    flip_x: bool,
-    flip_y: bool,
-) -> npt.NDArray:
-    """Reflect pitch coordinates (cm) about touchlines / goallines: ``p' = R @ H @ x``."""
-    out = np.array(matrix, dtype=np.float64, copy=True)
-    if flip_x:
-        rx = np.array(
-            [[-1.0, 0.0, float(config.length)], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
-            dtype=np.float64,
-        )
-        out = rx @ out
-    if flip_y:
-        ry = np.array(
-            [[1.0, 0.0, 0.0], [0.0, -1.0, float(config.width)], [0.0, 0.0, 1.0]],
-            dtype=np.float64,
-        )
-        out = ry @ out
-    return out
-
-
-def _canonicalize_homography(
-    candidate: ViewTransformer,
-    reference: ViewTransformer,
-    anchors_image: npt.NDArray,
-    config: SoccerPitchConfiguration,
-) -> tuple[ViewTransformer, float]:
-    """Resolve pitch left/right flips by matching anchor motion to the previous H."""
-    ref_pitch = reference.transform_points(anchors_image.astype(np.float32))
-    variants = [candidate.m]
-    variants.append(_mirror_homography_matrix(candidate.m, config, flip_x=True, flip_y=False))
-    variants.append(_mirror_homography_matrix(candidate.m, config, flip_x=False, flip_y=True))
-    variants.append(_mirror_homography_matrix(candidate.m, config, flip_x=True, flip_y=True))
-
-    best_m = candidate.m
-    best_err = float("inf")
-    for m in variants:
-        alt = ViewTransformer(matrix=m)
-        pitch = alt.transform_points(anchors_image.astype(np.float32))
-        err = float(np.median(np.linalg.norm(pitch - ref_pitch, axis=1)))
-        if err < best_err:
-            best_err = err
-            best_m = m
-    return ViewTransformer(matrix=best_m), best_err
 
 
 # --------------------------------------------------------------------------- #
@@ -270,6 +217,155 @@ class PitchHomography:
 
 PITCH_CONFIG = SoccerPitchConfiguration()
 
+
+def infer_goal_defenders(
+    pitch_xy_cm: np.ndarray, teams: np.ndarray
+) -> tuple[int, int]:
+    """Return ``(left_goal_team, right_goal_team)`` from feet on the pitch (cm)."""
+    if len(pitch_xy_cm) == 0:
+        from world_cup_projects.common.soccernet import TEAM_LEFT, TEAM_RIGHT
+
+        return TEAM_LEFT, TEAM_RIGHT
+    medians: list[float] = []
+    for team_id in (0, 1):
+        mask = teams == team_id
+        medians.append(
+            float(pitch_xy_cm[mask, 0].mean()) if mask.any() else float("inf")
+        )
+    if medians[0] <= medians[1]:
+        return 0, 1
+    return 1, 0
+
+
+def draw_goals_on_pitch(
+    config: SoccerPitchConfiguration,
+    *,
+    left_defender_team: int,
+    right_defender_team: int,
+    team_colors: list[sv.Color] | None = None,
+    padding: int = 50,
+    scale: float = 0.1,
+    pitch: np.ndarray | None = None,
+    fill_alpha: float = 0.38,
+) -> np.ndarray:
+    """Highlight each goal mouth in the defending team's color (radar debug)."""
+    if team_colors is None:
+        team_colors = [
+            sv.Color.from_hex("#00BFFF"),
+            sv.Color.from_hex("#FF1493"),
+        ]
+    if pitch is None:
+        pitch = draw_pitch(config=config, padding=padding, scale=scale)
+
+    w = config.width
+    length = config.length
+    gbw, gbl = config.goal_box_width, config.goal_box_length
+    y0, y1 = (w - gbw) / 2, (w + gbw) / 2
+
+    def _goal_patch(goal_x_cm: float, defender: int, depth_cm: float) -> None:
+        nonlocal pitch
+        color = team_colors[defender % len(team_colors)].as_bgr()
+        mouth_x = int(goal_x_cm * scale) + padding
+        py0 = int(y0 * scale) + padding
+        py1 = int(y1 * scale) + padding
+        inner_x = int((goal_x_cm + depth_cm) * scale) + padding
+        x_lo, x_hi = sorted((mouth_x, inner_x))
+        overlay = pitch.copy()
+        cv2.rectangle(overlay, (x_lo, py0), (x_hi, py1), color, -1)
+        cv2.addWeighted(overlay, fill_alpha, pitch, 1.0 - fill_alpha, 0, pitch)
+        cv2.line(pitch, (mouth_x, py0), (mouth_x, py1), color, 5, cv2.LINE_AA)
+        cv2.line(pitch, (mouth_x, py0), (mouth_x, py1), (255, 255, 255), 1, cv2.LINE_AA)
+
+    _goal_patch(0.0, left_defender_team, gbl)
+    _goal_patch(float(length), right_defender_team, -gbl)
+    return pitch
+
+
+# --------------------------------------------------------------------------- #
+# Radar (vendored from sports/examples/soccer/main.py ``render_radar``)
+# --------------------------------------------------------------------------- #
+_SPORTS_RADAR_COLORS = [
+    sv.Color.from_hex("#00BFFF"),
+    sv.Color.from_hex("#FF1493"),
+]
+
+
+def render_radar_from_transformer(
+    detections: sv.Detections,
+    transformer: ViewTransformer,
+    *,
+    config: SoccerPitchConfiguration = PITCH_CONFIG,
+) -> np.ndarray | None:
+    """Warp player feet with a precomputed homography (e.g. temporally smoothed)."""
+    from world_cup_projects.common.possession import player_mask
+
+    from world_cup_projects.common.soccernet import TEAM_LEFT, TEAM_RIGHT
+
+    pmask = player_mask(detections)
+    radar = draw_pitch(config=config)
+
+    if pmask.any():
+        players = detections[pmask]
+        xy = players.get_anchors_coordinates(anchor=sv.Position.BOTTOM_CENTER)
+        transformed_xy = transformer.transform_points(points=xy.astype(np.float32))
+        teams = players.data.get("team", np.zeros(len(players), dtype=int))
+        left_team, right_team = infer_goal_defenders(transformed_xy, teams)
+    else:
+        left_team, right_team = TEAM_LEFT, TEAM_RIGHT
+        transformed_xy = None
+        teams = None
+
+    radar = draw_goals_on_pitch(
+        config,
+        left_defender_team=left_team,
+        right_defender_team=right_team,
+        team_colors=_SPORTS_RADAR_COLORS,
+        pitch=radar,
+    )
+    if transformed_xy is None:
+        return radar
+
+    for team_id, color in enumerate(_SPORTS_RADAR_COLORS[:2]):
+        team_mask = teams == team_id
+        if not team_mask.any():
+            continue
+        radar = draw_points_on_pitch(
+            config=config,
+            xy=transformed_xy[team_mask],
+            face_color=color,
+            edge_color=sv.Color.BLACK,
+            radius=20,
+            pitch=radar,
+        )
+    return radar
+
+
+def render_radar_sports(
+    detections: sv.Detections,
+    keypoints: sv.KeyPoints | None,
+    *,
+    config: SoccerPitchConfiguration = PITCH_CONFIG,
+    use_ransac: bool = False,
+    ransac_thresh: float = HOMOGRAPHY_RANSAC_REPROJ_THRESH,
+) -> np.ndarray | None:
+    """Build minimap like ``roboflow/sports`` ``render_radar`` (plain H, all visible KPs)."""
+    if keypoints is None or keypoints.xy.shape[0] == 0:
+        return None
+
+    mask = (keypoints.xy[0][:, 0] > 1) & (keypoints.xy[0][:, 1] > 1)
+    if int(mask.sum()) < 4:
+        return None
+
+    transformer = ViewTransformer(
+        source=keypoints.xy[0][mask].astype(np.float32),
+        target=np.array(config.vertices, dtype=np.float32)[mask],
+        use_ransac=use_ransac,
+        ransac_thresh=ransac_thresh,
+    )
+
+    return render_radar_from_transformer(detections, transformer, config=config)
+
+
 _MODEL_DIR = __import__("pathlib").Path(__file__).resolve().parent.parent / ".cache" / "models"
 _PITCH_MODEL_PATH = _MODEL_DIR / "football-pitch-detection.pt"
 _PITCH_MODEL_GDRIVE_ID = "1Ma5Kt86tgpdjCTKfum79YMgNnSjcoOyf"
@@ -361,6 +457,20 @@ def image_to_pitch_cm(
     return transformer.transform_points(points_xy.astype(np.float32))
 
 
+def pitch_cm_to_image(
+    points_cm: np.ndarray, transformer: ViewTransformer | None
+) -> np.ndarray | None:
+    """Map pitch points (cm) back to image pixels via ``H^{-1}`` (homography sanity check)."""
+    if transformer is None or points_cm.size == 0:
+        return None
+    pts = points_cm.reshape(-1, 1, 2).astype(np.float32)
+    try:
+        inv = np.linalg.inv(transformer.m)
+    except np.linalg.LinAlgError:
+        return None
+    return cv2.perspectiveTransform(pts, inv).reshape(-1, 2)
+
+
 def image_to_pitch_m(
     points_xy: np.ndarray, transformer: ViewTransformer | None
 ) -> np.ndarray | None:
@@ -402,10 +512,12 @@ def pitch_attack_direction(
 class PitchHomographyTracker:
     """Per-frame homography with temporal keypoint smoothing.
 
-    The pitch-keypoint model is noisy frame-to-frame. We keep a long rolling buffer of
-    each vertex's image position, fit H with RANSAC, and **reject** updates whose mean
-    reprojection error is worse than the previous H (matrix EMA is avoided — it is not
-    a valid homography blend and blows up metric coordinates).
+    The pitch-keypoint model is noisy frame-to-frame. We keep rolling buffers of each
+    vertex's **image** position (valid under camera motion), then fit homographies.
+
+    * **Speed / metrics** — confidence-filtered buffers, RANSAC, reprojection gate.
+    * **Radar** — all visible keypoints (sports ``x,y > 1`` mask), same temporal smooth,
+      plain ``findHomography`` on every correspondence (no RANSAC subset jumps).
     """
 
     def __init__(
@@ -425,53 +537,86 @@ class PitchHomographyTracker:
         self._targets = np.array(self.config.vertices, dtype=np.float32)
         n = len(self._targets)
         self._buffers: list[deque] = [deque(maxlen=smooth_window) for _ in range(n)]
+        self._radar_buffers: list[deque] = [deque(maxlen=smooth_window) for _ in range(n)]
         self._last: ViewTransformer | None = None
+        self._radar_last: ViewTransformer | None = None
+
+    def _append_observations(self, xy: np.ndarray, conf: np.ndarray) -> None:
+        for i in range(len(self._targets)):
+            if i >= len(xy) or xy[i, 0] <= 1 or xy[i, 1] <= 1:
+                continue
+            self._radar_buffers[i].append(xy[i])
+            if conf[i] > self.confidence:
+                self._buffers[i].append(xy[i])
+
+    @staticmethod
+    def _correspondences(
+        buffers: list[deque], targets: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray] | None:
+        src, dst = [], []
+        for i, buf in enumerate(buffers):
+            if buf:
+                src.append(np.mean(buf, axis=0))
+                dst.append(targets[i])
+        if len(src) < 4:
+            return None
+        return np.asarray(src, np.float32), np.asarray(dst, np.float32)
 
     def update(
         self, frame: np.ndarray, keypoints: sv.KeyPoints | None = None
-    ) -> ViewTransformer | None:
+    ) -> tuple[ViewTransformer | None, ViewTransformer | None]:
+        """Return ``(speed_transformer, radar_transformer)`` for this frame."""
         if keypoints is None:
             keypoints = detect_pitch_keypoints(frame, self.homography)
         kps = keypoints
         if kps.xy.shape[0] == 0:
-            return self._last
+            return self._last, self._radar_last
 
         xy = kps.xy[0]
         conf = pitch_keypoint_confidence(kps, n_vertices=len(self._targets))
-        for i in range(len(self._targets)):
-            if i < len(xy) and conf[i] > self.confidence and xy[i, 0] > 1 and xy[i, 1] > 1:
-                self._buffers[i].append(xy[i])
+        self._append_observations(xy, conf)
 
-        src, dst = [], []
-        for i, buf in enumerate(self._buffers):
+        speed_pair = self._correspondences(self._buffers, self._targets)
+        if speed_pair is not None:
+            src_arr, dst_arr = speed_pair
+            try:
+                candidate = ViewTransformer(
+                    source=src_arr,
+                    target=dst_arr,
+                    use_ransac=True,
+                    ransac_thresh=self.ransac_thresh,
+                )
+            except ValueError:
+                pass
+            else:
+                if self._last is None:
+                    self._last = candidate
+                else:
+                    reproj = candidate.transform_points(src_arr)
+                    err = float(np.linalg.norm(reproj - dst_arr, axis=1).mean())
+                    if err <= self.max_reproj_px:
+                        self._last = candidate
+
+        radar_pair = self._correspondences(self._radar_buffers, self._targets)
+        if radar_pair is not None:
+            src_arr, dst_arr = radar_pair
+            try:
+                self._radar_last = ViewTransformer(
+                    source=src_arr, target=dst_arr, use_ransac=False
+                )
+            except ValueError:
+                pass
+
+        return self._last, self._radar_last
+
+    def smoothed_xy(self, *, for_radar: bool = True) -> np.ndarray:
+        """Per-vertex rolling-mean positions in image space; NaN where buffer is empty."""
+        buffers = self._radar_buffers if for_radar else self._buffers
+        out = np.full((len(self._targets), 2), np.nan, dtype=np.float32)
+        for i, buf in enumerate(buffers):
             if buf:
-                src.append(np.mean(buf, axis=0))
-                dst.append(self._targets[i])
-        if len(src) < 4:
-            return self._last
-
-        src_arr = np.asarray(src, np.float32)
-        dst_arr = np.asarray(dst, np.float32)
-        try:
-            candidate = ViewTransformer(
-                source=src_arr, target=dst_arr, ransac_thresh=self.ransac_thresh
-            )
-        except ValueError:
-            return self._last
-
-        if self._last is not None:
-            candidate, orient_err = _canonicalize_homography(
-                candidate, self._last, src_arr, self.config
-            )
-            if orient_err > HOMOGRAPHY_ORIENTATION_JUMP_CM:
-                return self._last
-            reproj = candidate.transform_points(src_arr)
-            err = float(np.linalg.norm(reproj - dst_arr, axis=1).mean())
-            if err > self.max_reproj_px:
-                return self._last
-
-        self._last = candidate
-        return self._last
+                out[i] = np.mean(buf, axis=0)
+        return out
 
 
 def iter_pitch_transformers(
@@ -485,11 +630,18 @@ def iter_pitch_transformers(
     max_reproj_px: float = 8.0,
     confidence: float = 0.5,
     yield_keypoints: bool = False,
+    yield_smoothed_keypoints: bool = False,
 ):
-    """Yield ``(frame_idx, transformer)`` for every frame in a SoccerNet sequence.
+    """Yield homographies for every frame in a SoccerNet sequence.
 
-    With ``yield_keypoints=True``, each item is
-    ``(frame_idx, transformer, keypoints | None)`` (one model forward per frame).
+    Each item is ``(frame_idx, speed_transformer, radar_transformer)``. Radar uses
+    temporally smoothed keypoints and plain homography (no RANSAC). Speed keeps RANSAC
+    and a reprojection gate for metric coordinates.
+
+    With ``yield_keypoints=True``, each item ends with ``raw_keypoints | None`` and, if
+    ``yield_smoothed_keypoints=True``, ``radar_smooth_xy`` and ``speed_smooth_xy`` arrays
+    (shape ``(n_vertices, 2)``, NaN where not buffered). Smoothed points are what H is
+    fit from — not display-only.
     """
     import cv2
 
@@ -508,14 +660,25 @@ def iter_pitch_transformers(
     for frame_idx in range(start, last + 1):
         frame = cv2.imread(str(sequence.frame_path(frame_idx)))
         if frame is None:
-            if yield_keypoints:
-                yield frame_idx, None, None
+            if yield_keypoints and yield_smoothed_keypoints:
+                yield frame_idx, None, None, None, None, None
+            elif yield_keypoints:
+                yield frame_idx, None, None, None
             else:
-                yield frame_idx, None
+                yield frame_idx, None, None
             continue
         kps = detect_pitch_keypoints(frame, homography)
-        transformer = tracker.update(frame, kps)
-        if yield_keypoints:
-            yield frame_idx, transformer, kps
+        speed_t, radar_t = tracker.update(frame, kps)
+        if yield_keypoints and yield_smoothed_keypoints:
+            yield (
+                frame_idx,
+                speed_t,
+                radar_t,
+                kps,
+                tracker.smoothed_xy(for_radar=True),
+                tracker.smoothed_xy(for_radar=False),
+            )
+        elif yield_keypoints:
+            yield frame_idx, speed_t, radar_t, kps
         else:
-            yield frame_idx, transformer
+            yield frame_idx, speed_t, radar_t

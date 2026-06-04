@@ -17,6 +17,8 @@ import json
 from pathlib import Path
 
 import cv2
+import numpy as np
+import supervision as sv
 
 from world_cup_projects import DEFAULT_ASSETS_DIR
 from world_cup_projects.common.clips import rank_clips
@@ -112,9 +114,13 @@ def main() -> None:
         frames = list(iter_gt_detections(sequence, end=end))
 
     frame_transforms: dict[int, object | None] = {}
-    frame_keypoints: dict[int, object | None] = {}
-    if args.mode == "homography" or args.debug_pitch_keypoints:
-        for item in iter_pitch_transformers(
+    frame_radar_transforms: dict[int, object | None] = {}
+    frame_keypoints: dict[int, sv.KeyPoints | None] = {}
+    frame_radar_smooth_xy: dict[int, np.ndarray | None] = {}
+    frame_speed_smooth_xy: dict[int, np.ndarray | None] = {}
+    need_pitch_pass = args.mode == "homography" or args.debug_pitch_keypoints
+    if need_pitch_pass:
+        for idx, t_speed, t_radar, kps, radar_xy, speed_xy in iter_pitch_transformers(
             sequence,
             device=args.device,
             end=end,
@@ -122,15 +128,15 @@ def main() -> None:
             smooth_window=args.pitch_smooth_window,
             max_reproj_px=args.max_reproj_px,
             confidence=args.pitch_confidence,
-            yield_keypoints=args.debug_pitch_keypoints,
+            yield_keypoints=True,
+            yield_smoothed_keypoints=True,
         ):
-            if args.debug_pitch_keypoints:
-                idx, t, kps = item
-                frame_keypoints[idx] = kps
-            else:
-                idx, t = item
+            frame_keypoints[idx] = kps
+            frame_radar_smooth_xy[idx] = radar_xy
+            frame_speed_smooth_xy[idx] = speed_xy
             if args.mode == "homography":
-                frame_transforms[idx] = t
+                frame_transforms[idx] = t_speed
+                frame_radar_transforms[idx] = t_radar
 
     tracks = collect_tracks(iter(frames))
     compute_kinematics(
@@ -162,8 +168,18 @@ def main() -> None:
         frame_loader=lambda fi: cv2.imread(str(sequence.frame_path(fi))),
         calibration=calibration,
         frame_transforms=frame_transforms if args.mode == "homography" else None,
+        frame_radar_transforms=(
+            frame_radar_transforms if args.mode == "homography" else None
+        ),
         show_radar=not args.no_radar and args.mode == "homography",
-        frame_keypoints=frame_keypoints if args.debug_pitch_keypoints else None,
+        frame_keypoints=frame_keypoints if need_pitch_pass else None,
+        frame_radar_smooth_xy=(
+            frame_radar_smooth_xy if args.mode == "homography" else None
+        ),
+        frame_speed_smooth_xy=(
+            frame_speed_smooth_xy if args.mode == "homography" else None
+        ),
+        pitch_kp_debug=args.debug_pitch_keypoints,
         pitch_confidence=args.pitch_confidence,
     )
     json_path = out_dir / f"player_stats_{tag}_{sequence.name}.json"

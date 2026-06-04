@@ -29,7 +29,6 @@ from world_cup_projects.common.soccernet import (
 )
 from world_cup_projects.common.visual import (
     ROBOFLOW_PURPLE_BGR,
-    RadarSmoother,
     annotate_ball,
     annotate_players,
     draw_branding_tag,
@@ -107,8 +106,8 @@ def _pitch_transform_map(
     pitch_confidence: float = 0.5,
 ) -> dict[int, ViewTransformer | None]:
     return {
-        frame_idx: transformer
-        for frame_idx, transformer in iter_pitch_transformers(
+        frame_idx: speed_t
+        for frame_idx, speed_t, _radar_t in iter_pitch_transformers(
             sequence,
             device=pitch_device,
             end=max_frames,
@@ -125,25 +124,30 @@ def _load_pitch_maps(
     pitch_confidence: float,
     need_transforms: bool,
     need_keypoints: bool,
-) -> tuple[dict[int, ViewTransformer | None], dict[int, sv.KeyPoints | None] | None]:
+) -> tuple[
+    dict[int, ViewTransformer | None],
+    dict[int, sv.KeyPoints | None] | None,
+    dict[int, ViewTransformer | None],
+]:
     """One model pass per frame when transforms and/or debug keypoints are needed."""
     transforms: dict[int, ViewTransformer | None] = {}
-    keypoints: dict[int, sv.KeyPoints | None] | None = {} if need_keypoints else None
-    for item in iter_pitch_transformers(
+    radar_transforms: dict[int, ViewTransformer | None] = {}
+    keypoints: dict[int, sv.KeyPoints | None] | None = (
+        {} if (need_keypoints or need_transforms) else None
+    )
+    for frame_idx, speed_t, radar_t, kps in iter_pitch_transformers(
         sequence,
         device=pitch_device,
         end=max_frames,
         confidence=pitch_confidence,
-        yield_keypoints=need_keypoints,
+        yield_keypoints=True,
     ):
-        if need_keypoints:
-            frame_idx, transformer, kps = item
-            keypoints[frame_idx] = kps  # type: ignore[index]
-        else:
-            frame_idx, transformer = item
+        if keypoints is not None:
+            keypoints[frame_idx] = kps
+        radar_transforms[frame_idx] = radar_t
         if need_transforms:
-            transforms[frame_idx] = transformer
-    return transforms, keypoints
+            transforms[frame_idx] = speed_t
+    return transforms, keypoints, radar_transforms
 
 
 def plan_events(
@@ -203,20 +207,15 @@ def _annotate_live(
     dets: sv.Detections,
     *,
     transformer=None,
-    radar_smoother: RadarSmoother | None = None,
+    radar_transformer: ViewTransformer | None = None,
     keypoints: sv.KeyPoints | None = None,
     pitch_confidence: float = 0.5,
 ) -> np.ndarray:
     frame = annotate_players(frame, dets)
     frame = annotate_ball(frame, dets)
-    if transformer is not None:
+    if radar_transformer is not None or keypoints is not None:
         frame = draw_radar_minimap(
-            frame,
-            dets,
-            transformer,
-            scale_frac=0.30,
-            position="bottom_right",
-            smoother=radar_smoother,
+            frame, dets, keypoints, transformer=radar_transformer
         )
     if keypoints is not None:
         frame = draw_pitch_keypoints_debug(
@@ -286,16 +285,17 @@ def render_demo(
 ) -> dict:
     """Render the full demo MP4. Returns a small manifest dict."""
     transforms: dict = frame_transforms or {}
+    frame_radar_transforms: dict[int, ViewTransformer | None] = {}
     frame_keypoints: dict[int, sv.KeyPoints | None] | None = None
     need_transforms = metric and not transforms
-    if need_transforms or debug_pitch_keypoints:
-        transforms, frame_keypoints = _load_pitch_maps(
+    if need_transforms or debug_pitch_keypoints or metric:
+        transforms, frame_keypoints, frame_radar_transforms = _load_pitch_maps(
             sequence,
             max_frames=max_frames,
             pitch_device=pitch_device,
             pitch_confidence=pitch_confidence,
             need_transforms=need_transforms,
-            need_keypoints=debug_pitch_keypoints,
+            need_keypoints=debug_pitch_keypoints or metric,
         )
     events = plan_events(
         sequence,
@@ -317,9 +317,6 @@ def render_demo(
     writer = cv2.VideoWriter(
         out_path, fourcc, sequence.frame_rate, (sequence.width, sequence.height)
     )
-    radar_smoother = RadarSmoother()
-    radar_smoother.reset()
-
     for frame_idx, dets in _iter_frames(
         sequence, detections_source, max_frames=max_frames
     ):
@@ -328,11 +325,12 @@ def render_demo(
             image = np.full((sequence.height, sequence.width, 3), 30, np.uint8)
         transformer = transforms.get(frame_idx) if transforms else None
         kps = frame_keypoints.get(frame_idx) if frame_keypoints is not None else None
+        radar_t = frame_radar_transforms.get(frame_idx)
         live = _annotate_live(
             image,
             dets,
             transformer=transformer,
-            radar_smoother=radar_smoother,
+            radar_transformer=radar_t,
             keypoints=kps,
             pitch_confidence=pitch_confidence,
         )

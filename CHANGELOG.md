@@ -11,9 +11,10 @@ Historical export of the internal `world_cup_projects` package (Roboflow monorep
 
 ### Speed / homography
 
-- Multi-scale speed: `mean(v_{j,j-1} … v_{j,j-K})` with per-step `H_{i-1}`, `H_i` warps.
-- Distance from per-step pitch steps; outlier rejection on distance only (not label zeroing).
-- Pitch keypoint skeleton fix (1-based edge indices); radar EMA jump reset on H flips.
+- Multi-scale speed: `median(v_{j,j-1} … v_{j,j-K})` with per-step `H_{i-1}`, `H_i` warps.
+- No speed caps; distance sums all homography steps.
+- Pitch keypoint skeleton fix (1-based edge indices).
+- Radar: sports-style ``H(feet)`` per frame (removed mirror lock + temporal smoother).
 
 ### Packaging
 
