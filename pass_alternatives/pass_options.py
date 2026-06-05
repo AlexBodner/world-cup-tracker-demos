@@ -2,8 +2,11 @@
 
 Each candidate lane (carrier -> teammate) is scored on three football-sense axes:
 
-* **openness** - how far the nearest blocker is from the pass line (opponent or teammate).
-* **forward progress** - how much the pass advances toward the attacking direction.
+* **openness** - nearest **rival** in the pass corridor (``lane_width``, strict).
+* **teammate lane** - optional light penalty if a teammate blocks the corridor (narrower
+  width than rivals; they can let the ball through so we only ding obvious obstacles).
+* **forward progress** - gain toward the attacking direction.
+* **carrier motion** - passes behind the carrier's recent run direction are penalized.
 * **receiver space** - how much room the receiver has from the nearest opponent.
 
 A short-range/very-long-range penalty keeps the suggestions realistic. Scores are
@@ -18,8 +21,22 @@ from dataclasses import dataclass
 import numpy as np
 import supervision as sv
 
-from world_cup_projects.common.geometry import point_to_segment_distance, unit
-from world_cup_projects.common.possession import Carrier, feet_xy, player_mask
+from world_cup_projects.common.geometry import (
+    count_lane_blockers,
+    count_lane_blockers_body,
+    lane_blocking_mask_body,
+    lane_segment_clearance,
+    lane_segment_clearance_body,
+    pass_corridor_polygon,
+    point_to_segment_distance,
+    unit,
+)
+from world_cup_projects.common.possession import (
+    Carrier,
+    bbox_center_xy,
+    feet_xy,
+    player_mask,
+)
 
 
 @dataclass(frozen=True)
@@ -34,6 +51,40 @@ class PassWeights:
     min_length: float = 60.0
     max_length: float = 1100.0
     length_penalty: float = 0.25
+    use_lane_openness: bool = True
+    lane_t_min: float = 0.0
+    lane_t_max: float = 1.0
+    lane_width: float | None = None  # corridor full width in m (pitch) or px (image lane)
+    lane_in_image_space: bool = False  # metric default: pitch/radar corridor (meters)
+    lane_use_body_center: bool = True  # min(feet, bbox center) for rival lane distance
+    teammate_lane_width: float | None = None  # None -> 0.5 * lane_width when lane_width set
+    teammate_open_ref: float | None = None  # clearance scale for teammate penalty; None -> open_ref
+    teammate_lane_penalty: float = 0.0  # max score deduction when a teammate blocks (0 = off)
+    openness_rivals_only: bool = True  # openness field = rivals only; teammate uses penalty
+    use_carrier_motion: bool = True
+    motion_lookback_frames: int = 5
+    motion_min_displacement_px: float = 5.0
+    motion_min_displacement_m: float = 0.35
+    backward_penalty: float = 0.22
+    backward_cos_threshold: float = -0.15  # pass vs run; below => backward
+    # Freeze-moment selection (plan_events): favor slow, tight ball control
+    use_ball_control_gate: bool = True
+    ball_speed_lookback_frames: int = 4
+    ball_speed_ref_m: float = 1.5
+    ball_speed_max_m: float = 4.5
+    ball_speed_skip_m: float = 8.0
+    ball_speed_penalty: float = 0.40
+    ball_speed_ref_px_s: float = 90.0
+    ball_speed_max_px_s: float = 320.0
+    ball_speed_skip_px_s: float = 500.0
+    carrier_tight_ref_m: float = 0.45
+    carrier_tight_ref_px: float = 40.0
+    carrier_tight_bonus: float = 0.12
+    # Good-pass-moment detection (plan_events): threshold + local score peaks
+    freeze_min_pick_score: float = 0.68
+    freeze_min_pass_score: float = 0.48
+    freeze_local_peak_half_window: int = 12
+    freeze_detect_local_peaks: bool = True
 
     @classmethod
     def metric(cls) -> PassWeights:
@@ -49,7 +100,31 @@ class PassWeights:
             forward_ref=25.0,
             min_length=2.0,
             max_length=45.0,
+            lane_width=2.5,
+            lane_in_image_space=False,
+            lane_use_body_center=True,
+            teammate_lane_width=1.2,
+            teammate_open_ref=0.5,
+            teammate_lane_penalty=0.10,
+            use_carrier_motion=True,
+            motion_min_displacement_m=0.35,
+            backward_penalty=0.22,
+            ball_speed_ref_m=1.2,
+            ball_speed_max_m=3.5,
+            ball_speed_skip_m=6.5,
+            carrier_tight_ref_m=0.40,
+            freeze_min_pick_score=0.72,
+            freeze_min_pass_score=0.52,
         )
+
+
+@dataclass(frozen=True)
+class PassLaneDebug:
+    """Pitch-radar debug: corridor quad (cm) and detection indices of blockers."""
+
+    corridor_polygon_cm: np.ndarray
+    blocking_rival_indices: tuple[int, ...]
+    blocking_teammate_indices: tuple[int, ...]
 
 
 @dataclass(frozen=True)
@@ -57,12 +132,171 @@ class PassOption:
     receiver_index: int
     receiver_xy: np.ndarray
     score: float
-    openness: float        # effective lane clearance (min opp / teammate distances)
+    openness: float        # rival lane clearance used for scoring (m)
     opponent_openness: float
     teammate_openness: float
+    rivals_in_lane: int
+    teammates_in_lane: int
+    segment_opponent_openness: float  # legacy: min dist without lane filter
+    segment_teammate_openness: float
     forward_gain: float    # raw projection onto attack direction
+    motion_alignment: float  # cos(pass, run); 0 if run unknown
     receiver_space: float  # raw distance, receiver to nearest opponent
     length: float
+    lane_debug: PassLaneDebug | None = None
+
+
+def _lane_width_for_pass(
+    weights: PassWeights,
+    *,
+    pass_length: float,
+    pass_length_px: float | None,
+) -> float | None:
+    """Corridor width in the units used for lane geometry (px or m)."""
+    if weights.lane_width is None or weights.lane_width <= 0:
+        return None
+    if weights.lane_in_image_space and pass_length_px is not None and pass_length > 1e-3:
+        return weights.lane_width * (pass_length_px / pass_length)
+    return weights.lane_width
+
+
+def _teammate_lane_width(
+    weights: PassWeights, *, pass_length: float, pass_length_px: float | None
+) -> float | None:
+    base = _lane_width_for_pass(
+        weights, pass_length=pass_length, pass_length_px=pass_length_px
+    )
+    if weights.teammate_lane_width is not None:
+        if weights.lane_in_image_space and pass_length_px is not None and pass_length > 1e-3:
+            return weights.teammate_lane_width * (pass_length_px / pass_length)
+        return weights.teammate_lane_width
+    if base is not None:
+        return base * 0.5
+    return None
+
+
+def _open_ref_for_lane(weights: PassWeights, lane_width: float | None) -> float:
+    if weights.lane_in_image_space and lane_width is not None and lane_width > 0:
+        return lane_width
+    return weights.open_ref
+
+
+def _half_width_cm(
+    weights: PassWeights,
+    lane_width: float | None,
+    *,
+    pass_length_m: float,
+    pass_length_px: float,
+    use_image_lane: bool,
+) -> float:
+    """Corridor half-width in pitch cm for radar overlays."""
+    if lane_width is None or lane_width <= 0:
+        return 50.0
+    if use_image_lane and pass_length_px > 1e-3 and pass_length_m > 1e-3:
+        cm_per_px = pass_length_m * 100.0 / pass_length_px
+        return (lane_width / 2.0) * cm_per_px
+    return (lane_width / 2.0) * 100.0
+
+
+def _build_lane_debug(
+    *,
+    pitch_cm: np.ndarray,
+    carrier_index: int,
+    receiver_index: int,
+    opponents: np.ndarray,
+    teammates_block: np.ndarray,
+    lane_opp_feet: np.ndarray,
+    lane_opp_body: np.ndarray,
+    lane_team_feet: np.ndarray,
+    lane_carrier: np.ndarray,
+    lane_receiver: np.ndarray,
+    lane_kw: dict,
+    team_lane_kw: dict,
+    use_body: bool,
+    opp_radius: np.ndarray | None,
+    half_width_cm: float,
+) -> PassLaneDebug:
+    opp_global = np.flatnonzero(opponents)
+    team_global = np.flatnonzero(teammates_block)
+    if use_body and len(lane_opp_feet):
+        rival_mask = lane_blocking_mask_body(
+            lane_opp_feet,
+            lane_opp_body,
+            lane_carrier,
+            lane_receiver,
+            player_radius=opp_radius,
+            **lane_kw,
+        )
+        team_mask = lane_blocking_mask_body(
+            lane_team_feet,
+            lane_team_feet,
+            lane_carrier,
+            lane_receiver,
+            player_radius=None,
+            **team_lane_kw,
+        )
+    else:
+        rival_mask = lane_blocking_mask_body(
+            lane_opp_feet,
+            lane_opp_feet,
+            lane_carrier,
+            lane_receiver,
+            **lane_kw,
+        )
+        team_mask = lane_blocking_mask_body(
+            lane_team_feet,
+            lane_team_feet,
+            lane_carrier,
+            lane_receiver,
+            **team_lane_kw,
+        )
+    poly = pass_corridor_polygon(
+        pitch_cm[carrier_index],
+        pitch_cm[receiver_index],
+        half_width_cm,
+        t_min=lane_kw["t_min"],
+        t_max=lane_kw["t_max"],
+    )
+    return PassLaneDebug(
+        corridor_polygon_cm=poly,
+        blocking_rival_indices=tuple(int(opp_global[i]) for i in np.flatnonzero(rival_mask)),
+        blocking_teammate_indices=tuple(int(team_global[i]) for i in np.flatnonzero(team_mask)),
+    )
+
+
+def _backward_motion_penalty(
+    pass_delta: np.ndarray,
+    motion_dir: np.ndarray | None,
+    weights: PassWeights,
+) -> tuple[float, float]:
+    """Penalty for passes behind the carrier's run; returns (penalty, cos alignment)."""
+    if motion_dir is None or weights.backward_penalty <= 0:
+        return 0.0, 0.0
+    length = float(np.linalg.norm(pass_delta))
+    if length < 1e-6:
+        return 0.0, 0.0
+    align = float(unit(pass_delta) @ motion_dir)
+    if align >= weights.backward_cos_threshold:
+        return 0.0, align
+    span = 1.0 - weights.backward_cos_threshold
+    severity = min(1.0, (weights.backward_cos_threshold - align) / span)
+    return weights.backward_penalty * severity, align
+
+
+def _teammate_lane_penalty_amount(
+    teammate_openness: float,
+    weights: PassWeights,
+    *,
+    open_ref: float,
+) -> float:
+    """Soft deduction when a teammate is in the narrow corridor (0 if none)."""
+    if weights.teammate_lane_penalty <= 0 or not np.isfinite(teammate_openness):
+        return 0.0
+    ref = weights.teammate_open_ref or open_ref
+    if ref <= 0:
+        return 0.0
+    tightness = max(0.0, 1.0 - teammate_openness / ref)
+    return weights.teammate_lane_penalty * tightness
 
 
 def attack_direction(
@@ -91,15 +325,24 @@ def score_pass_options(
     weights: PassWeights = PassWeights(),
     attack_dir: np.ndarray | None = None,
     positions: np.ndarray | None = None,
+    carrier_motion_dir: np.ndarray | None = None,
+    pitch_cm: np.ndarray | None = None,
+    body_pitch_m: np.ndarray | None = None,
 ) -> list[PassOption]:
     """Rank every teammate as a passing option (best first).
 
     Pass *positions* (e.g. pitch coordinates in meters) to score in metric space
-    instead of image pixels.
+    instead of image pixels. *carrier_motion_dir* is the unit run vector from recent
+    track history (same coordinate system as *positions*).
     """
     pmask = player_mask(detections)
-    feet = positions if positions is not None else feet_xy(detections)
+    feet_img = feet_xy(detections)
+    feet = positions if positions is not None else feet_img
+    body = bbox_center_xy(detections)
+    body_lane = body_pitch_m if body_pitch_m is not None else body
     teams = detections.data["team"]
+    use_image_lane = weights.lane_in_image_space and positions is not None
+    lane_feet = feet_img if use_image_lane else feet
 
     teammates = pmask & (teams == carrier.team)
     teammates[carrier.index] = False
@@ -117,30 +360,108 @@ def score_pass_options(
         if length < 1e-6:
             continue
 
+        pass_len_px = float(
+            np.linalg.norm(feet_img[idx] - feet_img[carrier.index])
+        )
+        lane_w = _lane_width_for_pass(
+            weights, pass_length=length, pass_length_px=pass_len_px
+        )
+        lane_kw = dict(
+            t_min=weights.lane_t_min,
+            t_max=weights.lane_t_max,
+            lane_width=lane_w,
+        )
+        team_lane_kw = {
+            **lane_kw,
+            "lane_width": _teammate_lane_width(
+                weights, pass_length=length, pass_length_px=pass_len_px
+            ),
+        }
+        lane_carrier = lane_feet[carrier.index]
+        lane_receiver = lane_feet[idx]
+        lane_opp_feet = lane_feet[opponents]
+        lane_opp_body = body_lane[opponents]
+        open_ref = _open_ref_for_lane(weights, lane_w)
+        opp_radius = None
+        if weights.lane_use_body_center and len(lane_opp_feet):
+            boxes = detections.xyxy[opponents]
+            if use_image_lane:
+                opp_radius = 0.22 * (boxes[:, 2] - boxes[:, 0])
+            elif pass_len_px > 1e-3 and length > 1e-3:
+                m_per_px = length / pass_len_px
+                opp_radius = 0.22 * (boxes[:, 2] - boxes[:, 0]) * m_per_px
+
         if len(opp_xy):
-            opponent_openness = float(
-                point_to_segment_distance(opp_xy, carrier_xy, receiver_xy).min()
-            )
+            if weights.use_lane_openness:
+                if weights.lane_use_body_center:
+                    opponent_openness, segment_opponent_openness = (
+                        lane_segment_clearance_body(
+                            lane_opp_feet,
+                            lane_opp_body,
+                            lane_carrier,
+                            lane_receiver,
+                            player_radius=opp_radius,
+                            **lane_kw,
+                        )
+                    )
+                    rivals_in_lane = count_lane_blockers_body(
+                        lane_opp_feet,
+                        lane_opp_body,
+                        lane_carrier,
+                        lane_receiver,
+                        player_radius=opp_radius,
+                        **lane_kw,
+                    )
+                else:
+                    opponent_openness, segment_opponent_openness = lane_segment_clearance(
+                        lane_opp_feet, lane_carrier, lane_receiver, **lane_kw
+                    )
+                    rivals_in_lane = count_lane_blockers(
+                        lane_opp_feet, lane_carrier, lane_receiver, **lane_kw
+                    )
+            else:
+                segment_opponent_openness = opponent_openness = float(
+                    point_to_segment_distance(
+                        lane_opp_feet, lane_carrier, lane_receiver
+                    ).min()
+                )
+                rivals_in_lane = len(opp_xy)
             receiver_space = float(np.linalg.norm(opp_xy - receiver_xy, axis=1).min())
         else:
-            opponent_openness = receiver_space = weights.open_ref
+            opponent_openness = segment_opponent_openness = receiver_space = open_ref
+            rivals_in_lane = 0
 
         blockers = teammates.copy()
         blockers[carrier.index] = False
         blockers[idx] = False
-        team_xy = feet[blockers]
+        team_xy = lane_feet[blockers]
+        teammates_in_lane = 0
         if len(team_xy):
-            teammate_openness = float(
-                point_to_segment_distance(team_xy, carrier_xy, receiver_xy).min()
-            )
+            if weights.use_lane_openness:
+                teammate_openness, segment_teammate_openness = lane_segment_clearance(
+                    team_xy, lane_carrier, lane_receiver, **team_lane_kw
+                )
+                teammates_in_lane = count_lane_blockers(
+                    team_xy, lane_carrier, lane_receiver, **team_lane_kw
+                )
+            else:
+                segment_teammate_openness = teammate_openness = float(
+                    point_to_segment_distance(
+                        team_xy, lane_carrier, lane_receiver
+                    ).min()
+                )
+                teammates_in_lane = len(team_xy)
         else:
-            teammate_openness = weights.open_ref
+            teammate_openness = segment_teammate_openness = open_ref
 
-        openness = min(opponent_openness, teammate_openness)
+        if weights.openness_rivals_only:
+            openness = opponent_openness
+        else:
+            openness = min(opponent_openness, teammate_openness)
 
         forward_gain = float(delta @ attack)
 
-        n_open = min(openness / weights.open_ref, 1.0)
+        n_open = min(openness / open_ref, 1.0)
         n_space = min(receiver_space / weights.space_ref, 1.0)
         n_forward = float(np.clip(forward_gain / weights.forward_ref, -1.0, 1.0))
 
@@ -149,18 +470,63 @@ def score_pass_options(
             + weights.forward * max(n_forward, 0.0)
             + weights.space * n_space
         )
+        tm_ref = weights.teammate_open_ref
+        if tm_ref is None:
+            tm_ref = (team_lane_kw["lane_width"] or open_ref) * 0.5
+        elif use_image_lane and length > 1e-3:
+            tm_ref = tm_ref * (pass_len_px / length)
+        score -= _teammate_lane_penalty_amount(
+            teammate_openness, weights, open_ref=tm_ref
+        )
+        back_pen, motion_align = _backward_motion_penalty(
+            delta, carrier_motion_dir, weights
+        )
+        score -= back_pen
         if length < weights.min_length or length > weights.max_length:
-            score -= weights.length_penalty
+            continue
+
+        lane_debug = None
+        if pitch_cm is not None and weights.use_lane_openness:
+            half_cm = _half_width_cm(
+                weights,
+                lane_w,
+                pass_length_m=length,
+                pass_length_px=pass_len_px,
+                use_image_lane=use_image_lane,
+            )
+            lane_debug = _build_lane_debug(
+                pitch_cm=pitch_cm,
+                carrier_index=carrier.index,
+                receiver_index=int(idx),
+                opponents=opponents,
+                teammates_block=blockers,
+                lane_opp_feet=lane_opp_feet,
+                lane_opp_body=lane_opp_body,
+                lane_team_feet=team_xy if len(team_xy) else np.zeros((0, 2)),
+                lane_carrier=lane_carrier,
+                lane_receiver=lane_receiver,
+                lane_kw=lane_kw,
+                team_lane_kw=team_lane_kw,
+                use_body=weights.lane_use_body_center,
+                opp_radius=opp_radius,
+                half_width_cm=half_cm,
+            )
 
         options.append(
             PassOption(
                 receiver_index=int(idx),
                 receiver_xy=receiver_xy,
                 score=float(score),
+                lane_debug=lane_debug,
                 openness=openness,
                 opponent_openness=opponent_openness,
                 teammate_openness=teammate_openness,
+                segment_opponent_openness=segment_opponent_openness,
+                segment_teammate_openness=segment_teammate_openness,
+                rivals_in_lane=rivals_in_lane,
+                teammates_in_lane=teammates_in_lane,
                 forward_gain=forward_gain,
+                motion_alignment=motion_align,
                 receiver_space=receiver_space,
                 length=length,
             )
@@ -178,6 +544,9 @@ def top_pass_options(
     weights: PassWeights = PassWeights(),
     attack_dir: np.ndarray | None = None,
     positions: np.ndarray | None = None,
+    carrier_motion_dir: np.ndarray | None = None,
+    pitch_cm: np.ndarray | None = None,
+    body_pitch_m: np.ndarray | None = None,
 ) -> list[PassOption]:
     return score_pass_options(
         detections,
@@ -185,4 +554,7 @@ def top_pass_options(
         weights=weights,
         attack_dir=attack_dir,
         positions=positions,
+        carrier_motion_dir=carrier_motion_dir,
+        pitch_cm=pitch_cm,
+        body_pitch_m=body_pitch_m,
     )[:k]

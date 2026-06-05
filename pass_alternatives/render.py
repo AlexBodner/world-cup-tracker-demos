@@ -9,16 +9,31 @@ import cv2
 import numpy as np
 import supervision as sv
 
+from world_cup_projects.common.carrier_motion import BallPositionHistory, TrackPositionHistory
+from world_cup_projects.common.clips import pitch_keypoints_unreliable
 from world_cup_projects.common.pitch import (
+    PitchHomographyTracker,
     ViewTransformer,
+    image_to_pitch_cm,
     image_to_pitch_m,
     iter_pitch_transformers,
     pitch_attack_direction,
+    render_radar_simple,
+    warmup_goal_defenders,
 )
+from world_cup_projects.pass_alternatives.lane_visual import (
+    draw_blocking_rivals_on_frame,
+    draw_pass_corridors_on_frame,
+    draw_pass_lane_legend,
+    draw_pass_lanes_on_radar,
+)
+from world_cup_projects.pass_alternatives.pass_options import PassWeights, top_pass_options
 from world_cup_projects.common.possession import (
     CARRIER_MAX_DISTANCE_M,
     CARRIER_MAX_DISTANCE_PX,
     Carrier,
+    ball_xy,
+    bbox_center_xy,
     feet_xy,
     find_ball_carrier,
     player_mask,
@@ -27,6 +42,7 @@ from world_cup_projects.common.soccernet import (
     SoccerNetSequence,
     iter_gt_detections,
 )
+from world_cup_projects.common.video import read_sequence_frame
 from world_cup_projects.common.visual import (
     ROBOFLOW_PURPLE_BGR,
     annotate_ball,
@@ -47,6 +63,12 @@ from world_cup_projects.pass_alternatives.pass_options import (
 
 RANK_COLORS_BGR = [(80, 220, 60), (40, 220, 240), (40, 140, 255)]
 RANK_LABELS = ["BEST", "2ND", "3RD"]
+
+# Cinematic slowdown before each freeze, then staggered pass-line reveals.
+MAX_RAMP_HOLD = 6
+DEFAULT_SLOWDOWN_RAMP_SECONDS = 0.72
+DEFAULT_OPTION_REVEAL_SECONDS = 0.4
+DEFAULT_FREEZE_SECONDS = 1.5
 
 DetectionSource = Callable[..., Iterator[tuple[int, sv.Detections]]]
 
@@ -69,6 +91,32 @@ def _iter_frames(
     yield from detections_source(sequence, start=1, end=end)
 
 
+def _cache_detections(
+    sequence: SoccerNetSequence,
+    detections_source: DetectionSource,
+    *,
+    max_frames: int | None,
+) -> DetectionSource:
+    """Run the detector/tracker once; render passes reuse cached frames."""
+    end = max_frames if max_frames is not None else sequence.length
+    cached = list(detections_source(sequence, start=1, end=end))
+
+    def _replay(
+        seq: SoccerNetSequence,
+        *,
+        start: int = 1,
+        end: int | None = None,
+        **kwargs: object,
+    ) -> Iterator[tuple[int, sv.Detections]]:
+        del seq, kwargs
+        last = sequence.length if end is None else min(end, sequence.length)
+        for frame_idx, dets in cached:
+            if start <= frame_idx <= last:
+                yield frame_idx, dets
+
+    return _replay
+
+
 def _score_options(
     dets: sv.Detections,
     carrier: Carrier,
@@ -76,10 +124,30 @@ def _score_options(
     weights: PassWeights,
     transformer: ViewTransformer | None,
     metric: bool,
+    frame_idx: int = 0,
+    history: TrackPositionHistory | None = None,
 ) -> list[PassOption]:
+    motion_dir = None
+    if history is not None and weights.use_carrier_motion:
+        min_disp = (
+            weights.motion_min_displacement_m
+            if metric
+            else weights.motion_min_displacement_px
+        )
+        motion_dir = history.motion_direction(
+            dets,
+            carrier,
+            frame_idx,
+            lookback_frames=weights.motion_lookback_frames,
+            min_displacement=min_disp,
+        )
+
     if metric and transformer is not None:
-        pitch_feet = image_to_pitch_m(feet_xy(dets), transformer)
-        if pitch_feet is not None:
+        feet_img = feet_xy(dets)
+        pitch_feet = image_to_pitch_m(feet_img, transformer)
+        pitch_cm = image_to_pitch_cm(feet_img, transformer)
+        body_pitch_m = image_to_pitch_m(bbox_center_xy(dets), transformer)
+        if pitch_feet is not None and pitch_cm is not None:
             attack_dir = pitch_attack_direction(
                 dets,
                 carrier.team,
@@ -94,8 +162,17 @@ def _score_options(
                 weights=weights,
                 attack_dir=attack_dir,
                 positions=pitch_feet,
+                carrier_motion_dir=motion_dir,
+                pitch_cm=pitch_cm,
+                body_pitch_m=body_pitch_m,
             )
-    return top_pass_options(dets, carrier, k=3, weights=weights)
+    return top_pass_options(
+        dets,
+        carrier,
+        k=3,
+        weights=weights,
+        carrier_motion_dir=motion_dir,
+    )
 
 
 def _pitch_transform_map(
@@ -103,7 +180,7 @@ def _pitch_transform_map(
     *,
     max_frames: int | None,
     pitch_device: str,
-    pitch_confidence: float = 0.5,
+    pitch_confidence: float = 0.98,
 ) -> dict[int, ViewTransformer | None]:
     return {
         frame_idx: speed_t
@@ -128,6 +205,7 @@ def _load_pitch_maps(
     dict[int, ViewTransformer | None],
     dict[int, sv.KeyPoints | None] | None,
     dict[int, ViewTransformer | None],
+    PitchHomographyTracker | None,
 ]:
     """One model pass per frame when transforms and/or debug keypoints are needed."""
     transforms: dict[int, ViewTransformer | None] = {}
@@ -135,25 +213,119 @@ def _load_pitch_maps(
     keypoints: dict[int, sv.KeyPoints | None] | None = (
         {} if (need_keypoints or need_transforms) else None
     )
-    for frame_idx, speed_t, radar_t, kps in iter_pitch_transformers(
+    tracker: PitchHomographyTracker | None = None
+    for frame_idx, speed_t, radar_t, kps, pitch_tracker in iter_pitch_transformers(
         sequence,
         device=pitch_device,
         end=max_frames,
         confidence=pitch_confidence,
         yield_keypoints=True,
+        yield_tracker=True,
     ):
+        tracker = pitch_tracker
         if keypoints is not None:
             keypoints[frame_idx] = kps
         radar_transforms[frame_idx] = radar_t
         if need_transforms:
             transforms[frame_idx] = speed_t
-    return transforms, keypoints, radar_transforms
+    if tracker is not None:
+        tracker.finalize_goal_lock()
+    return transforms, keypoints, radar_transforms, tracker
+
+
+def _freeze_moment_score(
+    pass_top: float,
+    carrier: Carrier,
+    *,
+    ball_speed: float | None,
+    weights: PassWeights,
+    metric: bool,
+) -> float | None:
+    """Rank freeze candidates: pass quality + tight feet + slow ball."""
+    if weights.use_ball_control_gate and ball_speed is not None:
+        if metric:
+            if ball_speed >= weights.ball_speed_skip_m:
+                return None
+            ref, cap = weights.ball_speed_ref_m, weights.ball_speed_max_m
+            tight_ref = weights.carrier_tight_ref_m
+        else:
+            if ball_speed >= weights.ball_speed_skip_px_s:
+                return None
+            ref, cap = weights.ball_speed_ref_px_s, weights.ball_speed_max_px_s
+            tight_ref = weights.carrier_tight_ref_px
+
+        score = pass_top
+        if ball_speed <= ref:
+            score += 0.05
+        elif ball_speed < cap:
+            t = (ball_speed - ref) / (cap - ref)
+            score -= weights.ball_speed_penalty * t
+        else:
+            score -= weights.ball_speed_penalty
+
+        if carrier.distance < tight_ref:
+            score += weights.carrier_tight_bonus * (
+                1.0 - carrier.distance / tight_ref
+            )
+        return score
+
+    score = pass_top
+    if metric:
+        tight_ref = weights.carrier_tight_ref_m
+    else:
+        tight_ref = weights.carrier_tight_ref_px
+    if carrier.distance < tight_ref:
+        score += weights.carrier_tight_bonus * (1.0 - carrier.distance / tight_ref)
+    return score
+
+
+def _select_pass_moments(
+    candidates: list[PassEvent],
+    *,
+    weights: PassWeights,
+    min_gap_frames: int,
+    max_events: int | None,
+) -> list[PassEvent]:
+    """Pick freeze frames where pass context is strong (score threshold + local peak)."""
+    if not candidates:
+        return []
+
+    by_frame = sorted(candidates, key=lambda e: e.frame_idx)
+    score_at = {e.frame_idx: e.top_score for e in by_frame}
+    half = weights.freeze_local_peak_half_window
+
+    peaks: list[PassEvent] = []
+    for event in by_frame:
+        if event.top_score < weights.freeze_min_pick_score:
+            continue
+        if event.options[0].score < weights.freeze_min_pass_score:
+            continue
+        if weights.freeze_detect_local_peaks:
+            f = event.frame_idx
+            neighbor_scores = [
+                score_at.get(f + d, -1.0)
+                for d in range(-half, half + 1)
+                if d != 0 and (f + d) in score_at
+            ]
+            if neighbor_scores and event.top_score <= max(neighbor_scores):
+                continue
+        peaks.append(event)
+
+    peaks.sort(key=lambda e: e.top_score, reverse=True)
+    chosen: list[PassEvent] = []
+    for event in peaks:
+        if all(abs(event.frame_idx - c.frame_idx) >= min_gap_frames for c in chosen):
+            chosen.append(event)
+        if max_events is not None and len(chosen) >= max_events:
+            break
+    chosen.sort(key=lambda e: e.frame_idx)
+    return chosen
 
 
 def plan_events(
     sequence: SoccerNetSequence,
     *,
-    max_events: int = 4,
+    max_events: int | None = None,
     min_gap_frames: int = 90,
     carrier_max_distance_px: float = CARRIER_MAX_DISTANCE_PX,
     carrier_max_distance_m: float = CARRIER_MAX_DISTANCE_M,
@@ -164,18 +336,30 @@ def plan_events(
     pitch_device: str = "cpu",
     frame_transforms: dict[int, ViewTransformer | None] | None = None,
 ) -> list[PassEvent]:
-    """Pick the most compelling freeze moments across the clip."""
+    """Detect good pass moments (threshold + local peaks), optional ``max_events`` cap."""
     transformers: dict[int, ViewTransformer | None] = frame_transforms or {}
     if metric and not transformers:
         transformers = _pitch_transform_map(
             sequence, max_frames=max_frames, pitch_device=pitch_device
         )
 
+    history = TrackPositionHistory()
+    ball_history = BallPositionHistory()
+    fps = float(sequence.frame_rate)
     candidates: list[PassEvent] = []
     for frame_idx, dets in _iter_frames(
         sequence, detections_source, max_frames=max_frames
     ):
         transformer = transformers.get(frame_idx) if metric else None
+        ball_history.record(frame_idx, ball_xy(dets))
+        feet_img = feet_xy(dets)
+        hist_xy = feet_img
+        if metric and transformer is not None:
+            pitch_feet = image_to_pitch_m(feet_img, transformer)
+            if pitch_feet is not None:
+                hist_xy = pitch_feet
+        history.record_frame(frame_idx, dets, hist_xy)
+
         carrier = find_ball_carrier(
             dets,
             max_distance_px=carrier_max_distance_px,
@@ -185,38 +369,68 @@ def plan_events(
         if carrier is None:
             continue
         options = _score_options(
-            dets, carrier, weights=weights, transformer=transformer, metric=metric
+            dets,
+            carrier,
+            weights=weights,
+            transformer=transformer,
+            metric=metric,
+            frame_idx=frame_idx,
+            history=history,
         )
         if len(options) < 3:
             continue
-        candidates.append(PassEvent(frame_idx, carrier, options, options[0].score))
+        top = options[0]
+        if top.length < weights.min_length or top.length > weights.max_length:
+            continue
+        ball_speed = ball_history.speed(
+            frame_idx,
+            lookback_frames=weights.ball_speed_lookback_frames,
+            fps=fps,
+            transformer=transformer if metric else None,
+        )
+        pick_score = _freeze_moment_score(
+            top.score,
+            carrier,
+            ball_speed=ball_speed,
+            weights=weights,
+            metric=metric,
+        )
+        if pick_score is None:
+            continue
+        candidates.append(PassEvent(frame_idx, carrier, options, pick_score))
 
-    candidates.sort(key=lambda e: e.top_score, reverse=True)
-    chosen: list[PassEvent] = []
-    for event in candidates:
-        if all(abs(event.frame_idx - c.frame_idx) >= min_gap_frames for c in chosen):
-            chosen.append(event)
-        if len(chosen) >= max_events:
-            break
-    chosen.sort(key=lambda e: e.frame_idx)
-    return chosen
+    return _select_pass_moments(
+        candidates,
+        weights=weights,
+        min_gap_frames=min_gap_frames,
+        max_events=max_events,
+    )
 
 
 def _annotate_live(
     frame: np.ndarray,
     dets: sv.Detections,
     *,
-    transformer=None,
     keypoints: sv.KeyPoints | None = None,
-    pitch_confidence: float = 0.5,
+    pitch_confidence: float = 0.98,
+    metric: bool = False,
+    show_radar: bool = True,
+    radar_transformer: ViewTransformer | None = None,
+    locked_goal_defenders: tuple[int, int] | None = None,
+    debug_pitch_keypoints: bool = False,
 ) -> np.ndarray:
     frame = annotate_players(frame, dets)
     frame = annotate_ball(frame, dets)
-    if keypoints is not None:
+    if show_radar and metric and keypoints is not None:
         frame = draw_radar_minimap(
-            frame, dets, keypoints, pitch_confidence=pitch_confidence
+            frame,
+            dets,
+            keypoints,
+            pitch_confidence=pitch_confidence,
+            transformer=radar_transformer,
+            locked_goal_defenders=locked_goal_defenders,
         )
-    if keypoints is not None:
+    if debug_pitch_keypoints and keypoints is not None:
         frame = draw_pitch_keypoints_debug(
             frame, keypoints, confidence_threshold=pitch_confidence
         )
@@ -224,20 +438,123 @@ def _annotate_live(
     return draw_branding_tag(frame)
 
 
+def _options_with_lane_debug(
+    dets: sv.Detections,
+    event: PassEvent,
+    *,
+    weights: PassWeights,
+    transformer: ViewTransformer,
+    pitch_cm: np.ndarray | None = None,
+) -> list:
+    """Re-score if needed so freeze frames always carry pitch corridor geometry."""
+    if event.options and all(o.lane_debug is not None for o in event.options):
+        return event.options
+    from world_cup_projects.common.pitch import pitch_attack_direction
+
+    pitch_feet = image_to_pitch_m(feet_xy(dets), transformer)
+    if pitch_cm is None:
+        pitch_cm = image_to_pitch_cm(feet_xy(dets), transformer)
+    body_pitch_m = image_to_pitch_m(bbox_center_xy(dets), transformer)
+    if pitch_feet is None or pitch_cm is None:
+        return event.options
+    attack_dir = pitch_attack_direction(
+        dets,
+        event.carrier.team,
+        transformer,
+        player_mask_fn=player_mask,
+        feet_fn=feet_xy,
+    )
+    return top_pass_options(
+        dets,
+        event.carrier,
+        k=3,
+        weights=weights,
+        attack_dir=attack_dir,
+        positions=pitch_feet,
+        pitch_cm=pitch_cm,
+        body_pitch_m=body_pitch_m,
+    )
+
+
+def _pass_line_label_xy(
+    start: tuple[int, int],
+    end: tuple[int, int],
+    *,
+    along: float = 0.42,
+    offset_px: int = 14,
+) -> tuple[int, int]:
+    """Point beside the pass segment for a distance label."""
+    sx, sy = start
+    ex, ey = end
+    px = sx + along * (ex - sx)
+    py = sy + along * (ey - sy)
+    dx, dy = ex - sx, ey - sy
+    norm = float(np.hypot(dx, dy)) or 1.0
+    return (
+        int(px - dy / norm * offset_px),
+        int(py + dx / norm * offset_px),
+    )
+
+
+def _slowdown_hold_count(
+    frames_until_event: int,
+    *,
+    ramp_frames: int,
+    max_extra_holds: int = MAX_RAMP_HOLD,
+) -> int:
+    """Repeat count for live frames as playback eases into a freeze."""
+    if frames_until_event <= 0 or frames_until_event > ramp_frames:
+        return 1
+    t = 1.0 - frames_until_event / ramp_frames
+    return 1 + int((t * t) * max(0, max_extra_holds - 1))
+
+
 def _draw_pass_overlay(
     frame: np.ndarray,
     dets: sv.Detections,
     event: PassEvent,
     *,
+    weights: PassWeights = PassWeights(),
+    metric: bool = False,
     keypoints: sv.KeyPoints | None = None,
-    pitch_confidence: float = 0.5,
+    pitch_confidence: float = 0.98,
+    transformer: ViewTransformer | None = None,
+    show_lane_debug: bool = True,
+    show_radar: bool = True,
+    locked_goal_defenders: tuple[int, int] | None = None,
+    debug_pitch_keypoints: bool = False,
+    revealed_options: int | None = None,
 ) -> np.ndarray:
-    """Dim the frame and draw the ranked pass arrows from the carrier."""
+    """Dim the frame and draw ranked pass arrows from the carrier.
+
+    ``revealed_options``: how many top options to show (0 = carrier only, None = all).
+    """
     dim = (frame.astype(np.float32) * 0.35).astype(np.uint8)
-    if keypoints is not None:
+    if debug_pitch_keypoints and keypoints is not None:
         dim = draw_pitch_keypoints_debug(
             dim, keypoints, confidence_threshold=pitch_confidence
         )
+
+    options = event.options
+    if show_lane_debug and transformer is not None:
+        feet_img = feet_xy(dets)
+        pitch_cm_vis = image_to_pitch_cm(feet_img, transformer)
+        options = _options_with_lane_debug(
+            dets,
+            event,
+            weights=weights,
+            transformer=transformer,
+            pitch_cm=pitch_cm_vis,
+        )
+
+    visible = options
+    if revealed_options is not None:
+        visible = options[: max(0, revealed_options)]
+
+    if show_lane_debug and transformer is not None and visible:
+        dim = draw_pass_corridors_on_frame(dim, visible, transformer)
+        dim = draw_blocking_rivals_on_frame(dim, visible, feet_xy=feet_img)
+
     dim = annotate_players(dim, dets)
     dim = annotate_ball(dim, dets)
 
@@ -248,7 +565,19 @@ def _draw_pass_overlay(
     cv2.circle(dim, (cx, cy), 18, (255, 255, 255), 2)
     draw_text_shadow(dim, "BALL CARRIER", (cx - 58, cy + 40), font_scale=0.5, color_bgr=(255, 255, 255))
 
-    for rank, option in enumerate(event.options):
+    if revealed_options == 0:
+        draw_text_shadow(
+            dim,
+            "ANALYZING OPTIONS...",
+            (cx - 110, cy - 52),
+            font_scale=0.62,
+            color_bgr=ROBOFLOW_PURPLE_BGR,
+            thickness=2,
+        )
+        dim = draw_hud_bar(dim, "PASS ALTERNATIVES  -  reading the play")
+        return draw_branding_tag(dim)
+
+    for rank, option in enumerate(visible):
         color = RANK_COLORS_BGR[rank]
         recv_xy = feet[option.receiver_index]
         rx, ry = int(recv_xy[0]), int(recv_xy[1])
@@ -258,7 +587,50 @@ def _draw_pass_overlay(
         if rank == 0:
             cv2.circle(dim, (rx, ry), ring + 6, (255, 255, 255), 1)
         midx, midy = (cx + rx) // 2, (cy + ry) // 2
-        draw_score_chip(dim, f"{RANK_LABELS[rank]}  {option.score:.2f}", (midx, midy), bg_bgr=color)
+        chip = f"{RANK_LABELS[rank]}  {option.score:.2f}"
+        if metric:
+            chip += f"  {option.length:.1f} m"
+        if option.rivals_in_lane:
+            chip += f"  ({option.rivals_in_lane} riv)"
+        if option.teammates_in_lane:
+            chip += f"  ({option.teammates_in_lane} tm)"
+        if option.lane_debug and option.lane_debug.blocking_rival_indices:
+            chip += f"  !{len(option.lane_debug.blocking_rival_indices)}"
+        draw_score_chip(dim, chip, (midx, midy), bg_bgr=color)
+        if metric:
+            lx, ly = _pass_line_label_xy((cx, cy), (rx, ry))
+            draw_text_shadow(
+                dim,
+                f"{option.length:.1f} m",
+                (lx - 18, ly - 6),
+                font_scale=0.58,
+                color_bgr=color,
+                thickness=2,
+            )
+
+    if show_lane_debug and show_radar and keypoints is not None:
+        feet_img = feet_xy(dets)
+        pitch_cm_lane = (
+            image_to_pitch_cm(feet_img, transformer) if transformer is not None else None
+        )
+        radar = render_radar_simple(
+            dets,
+            keypoints,
+            confidence=pitch_confidence,
+            transformer=transformer,
+            locked_goal_defenders=locked_goal_defenders,
+        )
+        if radar is not None and pitch_cm_lane is not None:
+            radar = draw_pass_lanes_on_radar(radar, visible, pitch_cm_lane)
+            dim = draw_radar_minimap(
+                dim,
+                dets,
+                keypoints,
+                transformer=transformer,
+                locked_goal_defenders=locked_goal_defenders,
+                prebuilt_radar=radar,
+            )
+        dim = draw_pass_lane_legend(dim)
 
     dim = draw_hud_bar(dim, "PASS ALTERNATIVES  -  top 3 open lanes")
     return draw_branding_tag(dim)
@@ -269,8 +641,10 @@ def render_demo(
     out_path: str,
     *,
     max_frames: int | None = None,
-    freeze_seconds: float = 1.5,
-    max_events: int = 4,
+    freeze_seconds: float = DEFAULT_FREEZE_SECONDS,
+    slowdown_ramp_seconds: float = DEFAULT_SLOWDOWN_RAMP_SECONDS,
+    option_reveal_seconds: float = DEFAULT_OPTION_REVEAL_SECONDS,
+    max_events: int | None = None,
     weights: PassWeights = PassWeights(),
     detections_source: DetectionSource = iter_gt_detections,
     metric: bool = False,
@@ -280,22 +654,36 @@ def render_demo(
     carrier_max_distance_px: float = CARRIER_MAX_DISTANCE_PX,
     carrier_max_distance_m: float = CARRIER_MAX_DISTANCE_M,
     debug_pitch_keypoints: bool = False,
-    pitch_confidence: float = 0.5,
+    pitch_confidence: float = 0.98,
+    show_radar: bool | None = None,
 ) -> dict:
     """Render the full demo MP4. Returns a small manifest dict."""
+    detections_source = _cache_detections(
+        sequence, detections_source, max_frames=max_frames
+    )
+    if show_radar is None:
+        show_radar = not pitch_keypoints_unreliable(sequence.name)
     transforms: dict = frame_transforms or {}
     frame_radar_transforms: dict[int, ViewTransformer | None] = {}
     frame_keypoints: dict[int, sv.KeyPoints | None] | None = None
+    pitch_tracker: PitchHomographyTracker | None = None
     need_transforms = metric and not transforms
     if need_transforms or debug_pitch_keypoints or metric:
-        transforms, frame_keypoints, frame_radar_transforms = _load_pitch_maps(
-            sequence,
-            max_frames=max_frames,
-            pitch_device=pitch_device,
-            pitch_confidence=pitch_confidence,
-            need_transforms=need_transforms,
-            need_keypoints=debug_pitch_keypoints or metric,
+        transforms, frame_keypoints, frame_radar_transforms, pitch_tracker = (
+            _load_pitch_maps(
+                sequence,
+                max_frames=max_frames,
+                pitch_device=pitch_device,
+                pitch_confidence=pitch_confidence,
+                need_transforms=need_transforms,
+                need_keypoints=debug_pitch_keypoints or metric,
+            )
         )
+    locked_goals = warmup_goal_defenders(
+        pitch_tracker,
+        _iter_frames(sequence, detections_source, max_frames=max_frames),
+        transforms,
+    )
     events = plan_events(
         sequence,
         max_events=max_events,
@@ -310,7 +698,9 @@ def render_demo(
     )
 
     events_by_frame = {e.frame_idx: e for e in events}
-    freeze_frames = int(round(freeze_seconds * sequence.frame_rate))
+    event_frames = sorted(events_by_frame)
+    ramp_frames = max(1, int(round(slowdown_ramp_seconds * sequence.frame_rate)))
+    reveal_frames = max(4, int(round(option_reveal_seconds * sequence.frame_rate)))
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(
@@ -319,30 +709,75 @@ def render_demo(
     for frame_idx, dets in _iter_frames(
         sequence, detections_source, max_frames=max_frames
     ):
-        image = cv2.imread(str(sequence.frame_path(frame_idx)))
+        image = read_sequence_frame(sequence, frame_idx)
         if image is None:
             image = np.full((sequence.height, sequence.width, 3), 30, np.uint8)
         transformer = transforms.get(frame_idx) if transforms else None
         kps = frame_keypoints.get(frame_idx) if frame_keypoints is not None else None
+        if pitch_tracker is not None and transformer is not None and locked_goals is None:
+            pmask = player_mask(dets)
+            if pmask.any():
+                pitch_m = image_to_pitch_m(feet_xy(dets)[pmask], transformer)
+                if pitch_m is not None:
+                    teams = dets.data.get("team", np.zeros(len(dets), dtype=int))[
+                        pmask
+                    ]
+                    if pitch_tracker.register_reliable_goal_vote(pitch_m, teams):
+                        locked_goals = pitch_tracker.locked_goal_defenders
         live = _annotate_live(
             image,
             dets,
-            transformer=transformer,
             keypoints=kps,
             pitch_confidence=pitch_confidence,
+            metric=metric,
+            show_radar=show_radar,
+            radar_transformer=transformer,
+            locked_goal_defenders=locked_goals,
+            debug_pitch_keypoints=debug_pitch_keypoints,
         )
-        writer.write(live)
+        frames_until = next(
+            (ef - frame_idx for ef in event_frames if ef >= frame_idx),
+            None,
+        )
+        hold = (
+            _slowdown_hold_count(frames_until, ramp_frames=ramp_frames)
+            if frames_until is not None
+            else 1
+        )
+        for _ in range(hold):
+            writer.write(live)
 
         if frame_idx in events_by_frame:
-            overlay = _draw_pass_overlay(
-                image,
-                dets,
-                events_by_frame[frame_idx],
+            event = events_by_frame[frame_idx]
+            n_options = min(3, len(event.options))
+            overlay_kwargs = dict(
+                weights=weights,
+                metric=metric,
                 keypoints=kps,
                 pitch_confidence=pitch_confidence,
+                transformer=transformer,
+                show_lane_debug=metric and kps is not None,
+                show_radar=show_radar,
+                locked_goal_defenders=locked_goals,
+                debug_pitch_keypoints=debug_pitch_keypoints,
             )
-            for _ in range(freeze_frames):
-                writer.write(overlay)
+            phases: list[tuple[int, int]] = [(0, reveal_frames)]
+            phases.extend((i, reveal_frames) for i in range(1, n_options + 1))
+            min_freeze = sum(h for _, h in phases)
+            extra_hold = max(0, int(round(freeze_seconds * sequence.frame_rate)) - min_freeze)
+            if phases:
+                phases[-1] = (phases[-1][0], phases[-1][1] + extra_hold)
+
+            for revealed, phase_hold in phases:
+                overlay = _draw_pass_overlay(
+                    image,
+                    dets,
+                    event,
+                    revealed_options=revealed,
+                    **overlay_kwargs,
+                )
+                for _ in range(phase_hold):
+                    writer.write(overlay)
 
     writer.release()
     return {
@@ -355,7 +790,12 @@ def render_demo(
                 "frame": e.frame_idx,
                 "carrier_team": e.carrier.team,
                 "top_score": round(e.top_score, 3),
-                "options": [round(o.score, 3) for o in e.options],
+                "options": [
+                    {"score": round(o.score, 3), "length_m": round(o.length, 2)}
+                    if metric
+                    else round(o.score, 3)
+                    for o in e.options
+                ],
             }
             for e in events
         ],

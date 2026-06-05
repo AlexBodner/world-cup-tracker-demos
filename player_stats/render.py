@@ -11,7 +11,11 @@ import cv2
 import numpy as np
 import supervision as sv
 
-from world_cup_projects.common.possession import player_mask
+from world_cup_projects.common.pitch import (
+    image_to_pitch_m,
+    warmup_goal_defenders,
+)
+from world_cup_projects.common.possession import feet_xy, player_mask
 from world_cup_projects.common.soccernet import SoccerNetSequence
 from world_cup_projects.common.visual import (
     ROBOFLOW_PURPLE_BGR,
@@ -106,14 +110,22 @@ def render_demo(
     show_radar: bool = True,
     frame_keypoints: dict | None = None,
     pitch_kp_debug: bool = False,
-    pitch_confidence: float = 0.5,
+    pitch_confidence: float = 0.98,
+    pitch_tracker=None,
 ) -> dict:
     """Render the speed/distance MP4. ``frame_loader(frame_idx) -> bgr image``."""
+    frames_list = list(detections_iter)
+    locked_goals: tuple[int, int] | None = None
+    if pitch_tracker is not None and frame_transforms is not None:
+        locked_goals = warmup_goal_defenders(
+            pitch_tracker, frames_list, frame_transforms
+        )
+
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(
         out_path, fourcc, sequence.frame_rate, (sequence.width, sequence.height)
     )
-    for frame_idx, dets in detections_iter:
+    for frame_idx, dets in frames_list:
         image = frame_loader(frame_idx)
         if image is None:
             image = np.full((sequence.height, sequence.width, 3), 30, np.uint8)
@@ -122,9 +134,29 @@ def render_demo(
         image = annotate_players(image, dets, labels=labels)
         image = annotate_ball(image, dets)
         kps = frame_keypoints.get(frame_idx) if frame_keypoints is not None else None
+        h_t = (
+            frame_transforms.get(frame_idx)
+            if frame_transforms is not None
+            else None
+        )
+        if pitch_tracker is not None and h_t is not None and locked_goals is None:
+            pmask = player_mask(dets)
+            if pmask.any():
+                pitch_m = image_to_pitch_m(feet_xy(dets)[pmask], h_t)
+                if pitch_m is not None:
+                    teams = dets.data.get("team", np.zeros(len(dets), dtype=int))[
+                        pmask
+                    ]
+                    if pitch_tracker.register_reliable_goal_vote(pitch_m, teams):
+                        locked_goals = pitch_tracker.locked_goal_defenders
         if show_radar and kps is not None:
             image = draw_radar_minimap(
-                image, dets, kps, pitch_confidence=pitch_confidence
+                image,
+                dets,
+                kps,
+                pitch_confidence=pitch_confidence,
+                transformer=h_t,
+                locked_goal_defenders=locked_goals,
             )
         if pitch_kp_debug and frame_keypoints is not None:
             image = draw_pitch_keypoints_debug(

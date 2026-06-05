@@ -49,6 +49,11 @@ def _count_frames(
     carrier_max_px: float,
     metric: bool,
 ) -> dict:
+    from world_cup_projects.common.carrier_motion import TrackPositionHistory
+    from world_cup_projects.common.pitch import image_to_pitch_m
+    from world_cup_projects.common.possession import feet_xy
+
+    history = TrackPositionHistory()
     carrier_frames = 0
     candidate_frames = 0
     total = 0
@@ -56,6 +61,14 @@ def _count_frames(
     for frame_idx, dets in iter_gt_detections(sequence, end=max_frames):
         total += 1
         transformer = transformers.get(frame_idx) if metric else None
+        feet_img = feet_xy(dets)
+        hist_xy = feet_img
+        if metric and transformer is not None:
+            pitch_feet = image_to_pitch_m(feet_img, transformer)
+            if pitch_feet is not None:
+                hist_xy = pitch_feet
+        history.record_frame(frame_idx, dets, hist_xy)
+
         carrier = find_ball_carrier(
             dets,
             max_distance_px=carrier_max_px,
@@ -71,6 +84,8 @@ def _count_frames(
             weights=PassWeights.metric() if metric else PassWeights(),
             transformer=transformer,
             metric=metric,
+            frame_idx=frame_idx,
+            history=history,
         )
         if len(options) >= 3:
             candidate_frames += 1

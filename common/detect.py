@@ -1,21 +1,15 @@
-"""RF-DETR detection + trackers.ByteTrackTracker tracking (the v2 "raw pixels" path).
+"""Model-based detection + ByteTrack for non-SoccerNet video (v2 path).
 
-TODO: homography/speed looks miscalibrated on the RF-DETR path — likely a resolution/scale
-mismatch between RF-DETR inference resolution and the 1920x1080 frames used for pitch
-keypoints; scale boxes back to native frame size before tracking/homography.
+Sources:
+- ``football``: YOLO ``football-players-detection`` (DFL-trained; ball/player/gk/referee).
+- ``rfdetr``: generic COCO RF-DETR (person + sports ball only; poor team/role split).
 
-This produces the same ``sv.Detections`` contract as
-:func:`common.soccernet.iter_gt_detections` - ``tracker_id``, ``class_id`` (role) and a
-``data['team']`` array - so the pass / speed demos run unchanged on top of it.
-
-Roles available from COCO RF-DETR: ``person`` -> player, ``sports ball`` -> ball.
-Goalkeeper / referee are not separable from players here (documented limitation); teams
-come from a lightweight jersey-color classifier instead of the heavier Siglip+UMAP
-``TeamClassifier`` in roboflow/sports.
+Both yield the same ``sv.Detections`` contract as :func:`common.soccernet.iter_gt_detections`.
 """
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Iterator
 
 import cv2
@@ -26,10 +20,36 @@ from trackers import ByteTrackTracker
 
 from world_cup_projects.common.soccernet import (
     ROLE_BALL,
+    ROLE_GOALKEEPER,
     ROLE_PLAYER,
+    ROLE_REFEREE,
     TEAM_NONE,
     SoccerNetSequence,
 )
+from world_cup_projects.common.teams import (
+    JerseyColorTeamClassifier,
+    get_crops,
+    resolve_goalkeepers_team_id,
+)
+from world_cup_projects.common.video import read_sequence_frame
+
+# Class ids in football-players-detection / roboflow/sports football-player-detection.pt
+_FP_BALL = 0
+_FP_GOALKEEPER = 1
+_FP_PLAYER = 2
+_FP_REFEREE = 3
+
+_FP_TO_ROLE = {
+    _FP_BALL: ROLE_BALL,
+    _FP_GOALKEEPER: ROLE_GOALKEEPER,
+    _FP_PLAYER: ROLE_PLAYER,
+    _FP_REFEREE: ROLE_REFEREE,
+}
+
+_MODEL_DIR = Path(__file__).resolve().parent.parent / ".cache" / "models"
+_FOOTBALL_PLAYERS_MODEL_PATH = _MODEL_DIR / "football-player-detection.pt"
+_FOOTBALL_PLAYERS_MODEL_GDRIVE_ID = "17PXFNlx-jI7VjVo_vQnB1sONjRyvoB-q"
+DEFAULT_FOOTBALL_PLAYERS_MODEL_ID = "football-players-detection-3zvbc/11"
 
 
 class RFDETRDetector:
@@ -106,7 +126,7 @@ def fit_team_classifier(
     feats: list[np.ndarray] = []
     last = min(max_frames, sequence.length)
     for frame_idx in range(1, last + 1, sample_stride):
-        image = cv2.imread(str(sequence.frame_path(frame_idx)))
+        image = read_sequence_frame(sequence, frame_idx)
         if image is None:
             continue
         det = detector.detect(image)
@@ -135,7 +155,7 @@ def iter_rfdetr_detections(
     last = sequence.length if end is None else min(end, sequence.length)
 
     for frame_idx in range(start, last + 1):
-        image = cv2.imread(str(sequence.frame_path(frame_idx)))
+        image = read_sequence_frame(sequence, frame_idx)
         if image is None:
             yield frame_idx, sv.Detections.empty()
             continue
@@ -189,5 +209,199 @@ def iter_model_detections(
         sequence, detector, sample_stride=sample_stride, max_frames=end or sequence.length
     )
     yield from iter_rfdetr_detections(
+        sequence, detector, team_classifier, start=start, end=end
+    )
+
+
+def ensure_football_players_model() -> Path:
+    """Download football-player-detection.pt (DFL / football-players-detection-3zvbc)."""
+    _MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    if _FOOTBALL_PLAYERS_MODEL_PATH.is_file():
+        return _FOOTBALL_PLAYERS_MODEL_PATH
+
+    try:
+        import gdown
+    except ImportError as exc:
+        raise ImportError("Install gdown to download football player model weights.") from exc
+
+    url = f"https://drive.google.com/uc?id={_FOOTBALL_PLAYERS_MODEL_GDRIVE_ID}"
+    gdown.download(url, str(_FOOTBALL_PLAYERS_MODEL_PATH), quiet=False)
+    return _FOOTBALL_PLAYERS_MODEL_PATH
+
+
+def _map_fp_detections(det: sv.Detections) -> sv.Detections:
+    if len(det) == 0:
+        return det
+    roles = np.array([_FP_TO_ROLE.get(int(c), -1) for c in det.class_id], dtype=int)
+    keep = roles >= 0
+    det = det[keep]
+    det.class_id = roles[keep]
+    return det
+
+
+class FootballPlayersDetector:
+    """YOLO weights from roboflow/sports (football-players-detection-3zvbc)."""
+
+    def __init__(
+        self,
+        model_path: str | Path | None = None,
+        device: str = "cpu",
+        threshold: float = 0.5,
+    ) -> None:
+        from ultralytics import YOLO
+
+        path = Path(model_path) if model_path else ensure_football_players_model()
+        self.model = YOLO(str(path))
+        self.device = device
+        self.threshold = threshold
+
+    def detect(self, frame_bgr: np.ndarray) -> sv.Detections:
+        results = self.model.predict(
+            frame_bgr,
+            conf=self.threshold,
+            verbose=False,
+            device=self.device,
+        )[0]
+        return _map_fp_detections(sv.Detections.from_ultralytics(results))
+
+
+def fit_football_team_classifier(
+    sequence: SoccerNetSequence,
+    detector: FootballPlayersDetector,
+    *,
+    sample_stride: int = 30,
+    max_frames: int = 750,
+) -> JerseyColorTeamClassifier:
+    """Fit jersey-color clusters on outfield players only (excludes gk/referee)."""
+    clf = JerseyColorTeamClassifier()
+    crops: list[np.ndarray] = []
+    last = min(max_frames, sequence.length)
+    for frame_idx in range(1, last + 1, sample_stride):
+        image = read_sequence_frame(sequence, frame_idx)
+        if image is None:
+            continue
+        det = detector.detect(image)
+        players = det[det.class_id == ROLE_PLAYER]
+        crops.extend(get_crops(image, players))
+    if crops:
+        clf.fit(crops)
+    return clf
+
+
+def _empty_detections_data(n: int) -> dict:
+    return {
+        "team": np.full(n, TEAM_NONE, dtype=int),
+        "jersey": np.asarray([""] * n, dtype=object),
+    }
+
+
+def iter_football_detections(
+    sequence: SoccerNetSequence,
+    detector: FootballPlayersDetector,
+    team_classifier: JerseyColorTeamClassifier,
+    *,
+    start: int = 1,
+    end: int | None = None,
+    track_activation_threshold: float = 0.4,
+) -> Iterator[tuple[int, sv.Detections]]:
+    """Detect + track with football-players-detection; refs excluded from teams."""
+    tracker = ByteTrackTracker(
+        frame_rate=sequence.frame_rate,
+        track_activation_threshold=track_activation_threshold,
+    )
+    last = sequence.length if end is None else min(end, sequence.length)
+
+    for frame_idx in range(start, last + 1):
+        image = read_sequence_frame(sequence, frame_idx)
+        if image is None:
+            yield frame_idx, sv.Detections.empty()
+            continue
+
+        det = detector.detect(image)
+        balls = det[det.class_id == ROLE_BALL]
+        players = det[det.class_id == ROLE_PLAYER]
+        gks = det[det.class_id == ROLE_GOALKEEPER]
+        refs = det[det.class_id == ROLE_REFEREE]
+
+        trackable = sv.Detections.merge([players, gks])
+        tracked = tracker.update(trackable, frame=image) if len(trackable) else sv.Detections.empty()
+
+        parts: list[sv.Detections] = []
+        if len(tracked):
+            t_players = tracked[tracked.class_id == ROLE_PLAYER]
+            t_gks = tracked[tracked.class_id == ROLE_GOALKEEPER]
+            if len(t_players):
+                player_teams = team_classifier.predict(get_crops(image, t_players))
+            else:
+                player_teams = np.array([], dtype=int)
+            if len(t_gks) and len(t_players):
+                gk_teams = resolve_goalkeepers_team_id(t_players, player_teams, t_gks)
+            elif len(t_gks):
+                gk_teams = np.full(len(t_gks), TEAM_NONE, dtype=int)
+            else:
+                gk_teams = np.array([], dtype=int)
+
+            for subset, teams in ((t_players, player_teams), (t_gks, gk_teams)):
+                if len(subset) == 0:
+                    continue
+                tid = subset.tracker_id if subset.tracker_id is not None else np.full(len(subset), -1)
+                parts.append(
+                    sv.Detections(
+                        xyxy=subset.xyxy.astype(np.float32),
+                        tracker_id=tid.astype(int),
+                        class_id=subset.class_id.astype(int),
+                        data={
+                            "team": teams.astype(int),
+                            "jersey": np.asarray([""] * len(subset), dtype=object),
+                        },
+                    )
+                )
+
+        if len(refs):
+            parts.append(
+                sv.Detections(
+                    xyxy=refs.xyxy.astype(np.float32),
+                    tracker_id=np.full(len(refs), -1, dtype=int),
+                    class_id=np.full(len(refs), ROLE_REFEREE, dtype=int),
+                    data=_empty_detections_data(len(refs)),
+                )
+            )
+
+        if len(balls):
+            parts.append(
+                sv.Detections(
+                    xyxy=balls.xyxy[:1].astype(np.float32),
+                    tracker_id=np.array([-1], dtype=int),
+                    class_id=np.array([ROLE_BALL], dtype=int),
+                    data=_empty_detections_data(1),
+                )
+            )
+
+        if not parts:
+            yield frame_idx, sv.Detections.empty()
+            continue
+
+        merged = parts[0]
+        for p in parts[1:]:
+            merged = sv.Detections.merge([merged, p])
+        yield frame_idx, merged
+
+
+def iter_football_model_detections(
+    sequence: SoccerNetSequence,
+    *,
+    start: int = 1,
+    end: int | None = None,
+    device: str = "cpu",
+    threshold: float = 0.5,
+    sample_stride: int = 30,
+    model_path: str | Path | None = None,
+) -> Iterator[tuple[int, sv.Detections]]:
+    """Convenience wrapper: football-players YOLO + jersey team classifier."""
+    detector = FootballPlayersDetector(model_path=model_path, device=device, threshold=threshold)
+    team_classifier = fit_football_team_classifier(
+        sequence, detector, sample_stride=sample_stride, max_frames=end or sequence.length
+    )
+    yield from iter_football_detections(
         sequence, detector, team_classifier, start=start, end=end
     )

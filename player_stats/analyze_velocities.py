@@ -176,7 +176,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Velocity analysis for one SNMOT clip")
     parser.add_argument("--data", default=DEFAULT_TRACKING_ROOT)
     parser.add_argument("--split", default="test")
-    parser.add_argument("--sequence", default="SNMOT-197")
+    parser.add_argument("--sequence", default="SNMOT-117")
     parser.add_argument("--out", default=str(DEFAULT_ASSETS_DIR))
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--max-frames", type=int, default=None)

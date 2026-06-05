@@ -10,16 +10,25 @@ Metric scoring (GT detections -> pitch homography -> meters)::
         --sequence SNMOT-194 --metric --device cpu
 
 ``--source`` swaps the detector. ``gt`` (default) uses the SoccerNet ground-truth
-tracks; ``rfdetr`` uses the optional RF-DETR + ByteTrack pipeline (``common/detect.py``).
+tracks; ``football`` uses football-players-detection YOLO (default for ``--video``);
+``rfdetr`` is a generic COCO fallback (poor team/role split).
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+from dataclasses import replace
 from pathlib import Path
 
-from world_cup_projects.common.clips import rank_clips
+from world_cup_projects.common.clips import (
+    PITCH_HOMOGRAPHY_DEMO_CLIP,
+    PITCH_KEYPOINT_AVOID,
+    PITCH_KEYPOINT_AVOID_NOTES,
+    pick_homography_demo_clip,
+    pitch_keypoints_unreliable,
+    rank_clips,
+)
 from world_cup_projects.common.possession import CARRIER_MAX_DISTANCE_M, CARRIER_MAX_DISTANCE_PX
 from world_cup_projects import DEFAULT_ASSETS_DIR
 from world_cup_projects.common.soccernet import (
@@ -37,14 +46,24 @@ def main() -> None:
     parser.add_argument("--data", default=DEFAULT_TRACKING_ROOT)
     parser.add_argument("--split", default="test")
     parser.add_argument("--sequence", default=None)
+    parser.add_argument(
+        "--video",
+        default=None,
+        help="MP4 path instead of SNMOT (implies --source football).",
+    )
     parser.add_argument("--out", default=str(DEFAULT_ASSETS_DIR))
     parser.add_argument("--max-frames", type=int, default=None)
-    parser.add_argument("--max-events", type=int, default=4)
+    parser.add_argument(
+        "--max-events",
+        type=int,
+        default=0,
+        help="Cap freeze count; 0 = auto-detect all good moments (default).",
+    )
     parser.add_argument(
         "--source",
-        choices=("gt", "rfdetr"),
+        choices=("gt", "football", "rfdetr"),
         default="gt",
-        help="Detection source. gt = SoccerNet GT (default); rfdetr = optional RF-DETR.",
+        help="Detection source. gt = SoccerNet GT; football = DFL player detector; rfdetr = COCO.",
     )
     parser.add_argument(
         "--metric",
@@ -77,33 +96,129 @@ def main() -> None:
     parser.add_argument(
         "--pitch-confidence",
         type=float,
-        default=0.5,
+        default=0.98,
         help="Keypoint confidence threshold (overlay legend + homography filter).",
+    )
+    parser.add_argument(
+        "--freeze-min-pick-score",
+        type=float,
+        default=None,
+        help="Min combined freeze score (pass + control); default from PassWeights.",
+    )
+    parser.add_argument(
+        "--freeze-min-pass-score",
+        type=float,
+        default=None,
+        help="Min score of the best pass option; default from PassWeights.",
+    )
+    parser.add_argument(
+        "--pass-segment-openness",
+        action="store_true",
+        help="Use old openness (any defender near the pass line). Default is lane-only.",
+    )
+    parser.add_argument(
+        "--pass-lane-image",
+        action="store_true",
+        help="Score rival corridors in image pixels instead of pitch/radar meters.",
+    )
+    parser.add_argument(
+        "--pass-lane-width",
+        type=float,
+        default=None,
+        metavar="W",
+        help="Intercept corridor full width in m (--metric) or px. Default 2.5 m with --metric; 0 disables.",
+    )
+    parser.add_argument(
+        "--pass-teammate-lane-width",
+        type=float,
+        default=None,
+        metavar="W",
+        help="Teammate corridor width (default 0.5 m with --metric). 0 uses rival width.",
+    )
+    parser.add_argument(
+        "--force-unreliable-pitch",
+        action="store_true",
+        help="Allow --metric on SNMOT-132 / SNMOT-189 (pitch keypoints usually bad).",
+    )
+    parser.add_argument(
+        "--pass-teammate-penalty",
+        type=float,
+        default=None,
+        metavar="P",
+        help="Max score deduction for a blocking teammate (default 0.10 with --metric).",
     )
     args = parser.parse_args()
 
+    if args.video:
+        if args.rank_only:
+            raise SystemExit("--rank-only is for SNMOT clip ranking only.")
+        from world_cup_projects.common.video import load_video_sequence
+
+        sequence = load_video_sequence(args.video)
+        if args.source == "gt":
+            print("Note: --video uses football-players-detection (--source football).")
+            args.source = "football"
+    else:
+        sequence = None
+
     seq_dirs = find_sequences(args.data, args.split)
-    if not seq_dirs:
+    if sequence is None and not seq_dirs:
         raise SystemExit(f"No SNMOT-* sequences under {args.data}/{args.split}")
 
-    if args.rank_only or args.sequence is None:
-        ranking = rank_clips(seq_dirs)
+    if sequence is None and (args.rank_only or args.sequence is None):
+        ranking = (
+            rank_clips(
+                seq_dirs,
+                assess_pitch=True,
+                pitch_confidence=args.pitch_confidence,
+                homography_demo=args.metric,
+            )
+            if args.metric
+            else rank_clips(seq_dirs)
+        )
         print("Clip ranking (best first):")
         for i, clip in enumerate(ranking[:10], 1):
             print(f"  {i:2d}. {clip.name}  score={clip.score:7.1f}  | {clip.reason}")
         if args.rank_only:
             return
-        chosen_name = ranking[0].name
-        print(f"\nAuto-picked: {chosen_name} -> {ranking[0].reason}")
+        if args.metric:
+            pick = pick_homography_demo_clip(
+                seq_dirs,
+                pitch_device=args.device,
+                pitch_confidence=args.pitch_confidence,
+            )
+            chosen_name = pick.name
+            print(
+                f"\nAuto-picked (homography): {chosen_name} -> {pick.reason}"
+            )
+        else:
+            chosen_name = ranking[0].name
+            print(f"\nAuto-picked: {chosen_name} -> {ranking[0].reason}")
         seq_dir = next(p for p in seq_dirs if p.name == chosen_name)
-    else:
+    elif sequence is None:
         seq_dir = next(p for p in seq_dirs if p.name == args.sequence)
+        sequence = load_sequence(seq_dir)
 
-    sequence = load_sequence(seq_dir)
+    if pitch_keypoints_unreliable(sequence.name):
+        note = PITCH_KEYPOINT_AVOID_NOTES.get(sequence.name, "Pitch keypoints unreliable.")
+        if args.metric and not args.force_unreliable_pitch:
+            raise SystemExit(
+                f"{sequence.name}: {note}\n"
+                f"Omit --metric (pixel-space demo) or use {PITCH_HOMOGRAPHY_DEMO_CLIP} / SNMOT-194. "
+                "Pass --force-unreliable-pitch to render metric anyway."
+            )
+        if args.metric:
+            print(f"Warning: {sequence.name} — {note} (--force-unreliable-pitch set).")
+        else:
+            print(f"Note: {sequence.name} — {note} Pixel-space mode is fine.")
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    if args.source == "rfdetr":
+    if args.source == "football":
+        from world_cup_projects.common.detect import iter_football_model_detections
+
+        detections_source = iter_football_model_detections
+    elif args.source == "rfdetr":
         from world_cup_projects.common.detect import iter_model_detections
 
         detections_source = iter_model_detections
@@ -111,6 +226,26 @@ def main() -> None:
         detections_source = iter_gt_detections
 
     weights = PassWeights.metric() if args.metric else PassWeights()
+    if args.pass_segment_openness:
+        weights = replace(weights, use_lane_openness=False)
+    if args.pass_lane_image:
+        weights = replace(weights, lane_in_image_space=True)
+    if args.pass_lane_width is not None:
+        w = args.pass_lane_width
+        weights = replace(weights, lane_width=None if w <= 0 else w)
+    if args.pass_teammate_lane_width is not None:
+        tw = args.pass_teammate_lane_width
+        weights = replace(
+            weights,
+            teammate_lane_width=None if tw <= 0 else tw,
+        )
+    if args.pass_teammate_penalty is not None:
+        weights = replace(weights, teammate_lane_penalty=max(0.0, args.pass_teammate_penalty))
+    if args.freeze_min_pick_score is not None:
+        weights = replace(weights, freeze_min_pick_score=args.freeze_min_pick_score)
+    if args.freeze_min_pass_score is not None:
+        weights = replace(weights, freeze_min_pass_score=args.freeze_min_pass_score)
+    max_events = args.max_events if args.max_events > 0 else None
     tag = args.source + ("_metric" if args.metric else "")
     if args.debug_pitch_keypoints:
         tag += "_pitch_kp_debug"
@@ -120,7 +255,7 @@ def main() -> None:
         sequence,
         str(out_path),
         max_frames=args.max_frames,
-        max_events=args.max_events,
+        max_events=max_events,
         weights=weights,
         detections_source=detections_source,
         metric=args.metric,
@@ -134,7 +269,8 @@ def main() -> None:
     json_path = out_dir / f"pass_alternatives_{tag}_{sequence.name}.json"
     json_path.write_text(json.dumps(manifest, indent=2))
     print(json.dumps(manifest, indent=2))
-    print(f"\nWrote {out_path}")
+    n_events = len(manifest.get("events", []))
+    print(f"\nWrote {out_path}  ({n_events} pass moment{'s' if n_events != 1 else ''})")
 
 
 if __name__ == "__main__":

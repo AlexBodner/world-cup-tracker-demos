@@ -175,21 +175,33 @@ def draw_radar_minimap(
     *,
     scale_frac: float = 0.33,
     position: str = "bottom_right",
-    pitch_confidence: float = 0.5,
+    pitch_confidence: float = 0.98,
     use_ransac: bool = False,
     ransac_thresh: float = HOMOGRAPHY_RANSAC_REPROJ_THRESH,
     transformer: ViewTransformer | None = None,
+    locked_goal_defenders: tuple[int, int] | None = None,
+    prebuilt_radar: np.ndarray | None = None,
 ) -> np.ndarray:
     """Sports-style radar minimap from per-frame model keypoints."""
-    if transformer is not None:
-        radar = render_radar_from_transformer(dets, transformer)
+    if prebuilt_radar is not None:
+        radar = prebuilt_radar
     elif keypoints is not None:
-        radar = render_radar_sports(
+        from world_cup_projects.common.pitch import render_radar_simple
+
+        radar = render_radar_simple(
             dets,
             keypoints,
             confidence=pitch_confidence,
-            use_ransac=use_ransac,
-            ransac_thresh=ransac_thresh,
+            transformer=transformer,
+            locked_goal_defenders=locked_goal_defenders,
+        )
+        if radar is None and transformer is not None:
+            radar = render_radar_from_transformer(
+                dets, transformer, locked_goal_defenders=locked_goal_defenders
+            )
+    elif transformer is not None:
+        radar = render_radar_from_transformer(
+            dets, transformer, locked_goal_defenders=locked_goal_defenders
         )
     else:
         return frame
@@ -308,18 +320,25 @@ def draw_pitch_keypoints_compare(
     return frame
 
 
+def _keypoint_xy_valid(x: float, y: float) -> bool:
+    return bool(np.isfinite(x) and np.isfinite(y) and x > 1 and y > 1)
+
+
 def draw_pitch_keypoints_debug(
     frame: np.ndarray,
     keypoints: sv.KeyPoints | None,
     *,
     confidence_threshold: float = 0.5,
     draw_skeleton: bool = True,
+    show_rejected: bool = True,
 ) -> np.ndarray:
     """Overlay raw pitch-keypoint detections (index + confidence) for homography debugging.
 
     Labels use 0-based indices matching ``config.vertices`` / the YOLO pose head order.
     Skeleton edges only connect keypoints that pass the confidence filter (model is
     trained on broadcast football; SoccerNet angles may still look sparse or wrong).
+    Missing/placeholder model outputs (``x <= 1`` or ``y <= 1``) are omitted from the
+    overlay so they do not stack on the frame border.
     """
     margin = 14
     legend_y = 52  # below HUD bar; avoids overlapping bottom-right radar
@@ -340,13 +359,17 @@ def draw_pitch_keypoints_debug(
     conf = pitch_keypoint_confidence(keypoints, n_vertices=n)
     accept = pitch_keypoint_accept_mask(xy, conf, confidence=confidence_threshold)
 
+    n_invalid = 0
     if draw_skeleton:
         # edges are 1-based vertex ids (same as draw_pitch / roboflow sports)
         for start, end in PITCH_CONFIG.edges:
             i, j = start - 1, end - 1
             if i >= len(xy) or j >= len(xy):
                 continue
-            if xy[i, 0] <= 1 or xy[i, 1] <= 1 or xy[j, 0] <= 1 or xy[j, 1] <= 1:
+            if not (
+                _keypoint_xy_valid(float(xy[i, 0]), float(xy[i, 1]))
+                and _keypoint_xy_valid(float(xy[j, 0]), float(xy[j, 1]))
+            ):
                 continue
             if not (accept[i] and accept[j]):
                 continue
@@ -356,12 +379,15 @@ def draw_pitch_keypoints_debug(
 
     for i in range(min(len(xy), n)):
         x, y = float(xy[i, 0]), float(xy[i, 1])
-        if x <= 1 or y <= 1:
-            color = _KP_INVALID_BGR
-        elif accept[i]:
+        if not _keypoint_xy_valid(x, y):
+            n_invalid += 1
+            continue
+        if accept[i]:
             color = _KP_USED_BGR
-        else:
+        elif show_rejected:
             color = _KP_LOW_CONF_BGR
+        else:
+            continue
         px, py = int(x), int(y)
         cv2.circle(frame, (px, py), 5, color, -1, cv2.LINE_AA)
         cv2.circle(frame, (px, py), 5, (255, 255, 255), 1, cv2.LINE_AA)
@@ -376,7 +402,10 @@ def draw_pitch_keypoints_debug(
         )
 
     n_ok = int(accept[: min(len(xy), n)].sum())
-    summary = f"pitch kp {n_ok}/{n} used (conf > {confidence_threshold:.2f})"
+    summary = (
+        f"pitch kp {n_ok}/{n} used (conf > {confidence_threshold:.2f}, "
+        f"{n_invalid} missing)"
+    )
     draw_text_shadow(
         frame, summary, (margin, legend_y), font_scale=0.52, color_bgr=(230, 230, 230), thickness=1
     )

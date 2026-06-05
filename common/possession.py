@@ -29,6 +29,15 @@ def feet_xy(detections: sv.Detections) -> np.ndarray:
     return detections.get_anchors_coordinates(sv.Position.BOTTOM_CENTER)
 
 
+def bbox_center_xy(detections: sv.Detections) -> np.ndarray:
+    """BBox center — better for lane blocking than feet when players lean across a pass."""
+    boxes = detections.xyxy
+    return np.stack(
+        [(boxes[:, 0] + boxes[:, 2]) / 2, (boxes[:, 1] + boxes[:, 3]) / 2],
+        axis=1,
+    )
+
+
 def player_mask(detections: sv.Detections) -> np.ndarray:
     """Boolean mask of outfield players + goalkeepers."""
     return np.isin(detections.class_id, (ROLE_PLAYER, ROLE_GOALKEEPER))
@@ -75,16 +84,19 @@ def find_ball_carrier(
     feet_img = feet_xy(detections)[pmask]
     global_indices = np.flatnonzero(pmask)
 
+    use_pixels = transformer is None
     if transformer is not None:
         from world_cup_projects.common.pitch import image_to_pitch_m
 
         feet_m = image_to_pitch_m(feet_img, transformer)
         ball_m = image_to_pitch_m(np.array([ball], dtype=np.float32), transformer)
-        if feet_m is None or ball_m is None:
-            return None
-        dist = np.linalg.norm(feet_m - ball_m[0], axis=1)
-        limit = max_distance_m
-    else:
+        if feet_m is not None and ball_m is not None:
+            dist = np.linalg.norm(feet_m - ball_m[0], axis=1)
+            limit = max_distance_m
+        else:
+            use_pixels = True
+
+    if use_pixels:
         dist = np.hypot(feet_img[:, 0] - ball[0], feet_img[:, 1] - ball[1])
         limit = max_distance_px
 
