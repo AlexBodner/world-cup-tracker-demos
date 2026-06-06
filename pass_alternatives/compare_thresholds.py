@@ -87,7 +87,7 @@ def _count_frames(
             frame_idx=frame_idx,
             history=history,
         )
-        if len(options) >= 3:
+        if len(options) >= 2:
             candidate_frames += 1
 
     return {

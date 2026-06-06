@@ -682,12 +682,12 @@ def draw_pass_analysis_panel(
     if revealed == 0:
         title = "PASS ANALYSIS"
         step = int(progress * 9) % 3
-        dots = "".join("●" if i == step else "○" for i in range(3))
-        subtitle = f"Scanning open lanes  {dots}"
+        dots = "." * (step + 1)
+        subtitle = f"Scanning open lanes{dots}"
     else:
         label = rank_label or f"OPTION {revealed}"
         title = label
-        subtitle = f"Route {revealed} of {total}  ·  ranked by lane + distance"
+        subtitle = f"Route {revealed} of {total}  |  ranked by lane + distance"
 
     draw_text_shadow(
         frame,

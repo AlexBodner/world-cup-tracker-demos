@@ -209,7 +209,7 @@ def _pitch_transform_map(
     *,
     max_frames: int | None,
     pitch_device: str,
-    pitch_confidence: float = 0.98,
+    pitch_confidence: float = 0.99,
 ) -> dict[int, ViewTransformer | None]:
     return {
         frame_idx: speed_t
@@ -404,7 +404,7 @@ def plan_events(
             transformer=transformer,
             metric=metric,
         )
-        if len(options) < 3:
+        if len(options) < 2:
             continue
         top = options[0]
         if top.length < weights.min_length or top.length > weights.max_length:
@@ -439,7 +439,7 @@ def _annotate_live(
     dets: sv.Detections,
     *,
     keypoints: sv.KeyPoints | None = None,
-    pitch_confidence: float = 0.98,
+    pitch_confidence: float = 0.99,
     metric: bool = False,
     show_radar: bool = True,
     radar_transformer: ViewTransformer | None = None,
@@ -555,7 +555,7 @@ def _draw_pass_overlay(
     weights: PassWeights = PassWeights(),
     metric: bool = False,
     keypoints: sv.KeyPoints | None = None,
-    pitch_confidence: float = 0.98,
+    pitch_confidence: float = 0.99,
     transformer: ViewTransformer | None = None,
     show_lane_debug: bool = True,
     show_radar: bool = True,
@@ -726,7 +726,7 @@ def render_demo(
     carrier_max_distance_px: float = CARRIER_MAX_DISTANCE_PX,
     carrier_max_distance_m: float = CARRIER_MAX_DISTANCE_M,
     debug_pitch_keypoints: bool = False,
-    pitch_confidence: float = 0.98,
+    pitch_confidence: float = 0.99,
     show_radar: bool | None = None,
     facing_mode: Literal["motion", "kalman", "both"] = "kalman",
     tracker_kind: TrackerKind = "bytetrack",
