@@ -65,6 +65,36 @@ class TrackPositionHistory:
             return None
         return unit(delta)
 
+    def player_facing(
+        self,
+        detections: sv.Detections,
+        frame_idx: int,
+        *,
+        lookback_frames: int = 4,
+        min_displacement: float = 2.0,
+    ) -> np.ndarray:
+        """Per-row unit facing vectors from recent tracker motion (NaN if unknown)."""
+        n = len(detections)
+        out = np.full((n, 2), np.nan, dtype=np.float64)
+        if detections.tracker_id is None or n == 0:
+            return out
+        for i in range(n):
+            tid = int(detections.tracker_id[i])
+            if tid < 0:
+                continue
+            buf = [
+                (f, p)
+                for f, p in self._samples.get(tid, [])
+                if frame_idx - lookback_frames <= f < frame_idx
+            ]
+            if len(buf) < 2:
+                continue
+            delta = buf[-1][1] - buf[0][1]
+            if float(np.linalg.norm(delta)) < min_displacement:
+                continue
+            out[i] = unit(delta)
+        return out
+
 
 class BallPositionHistory:
     """Recent ball ground positions for speed when picking freeze frames."""

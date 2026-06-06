@@ -6,7 +6,7 @@ Each candidate lane (carrier -> teammate) is scored on three football-sense axes
 * **teammate lane** - optional light penalty if a teammate blocks the corridor (narrower
   width than rivals; they can let the ball through so we only ding obvious obstacles).
 * **forward progress** - gain toward the attacking direction.
-* **carrier motion** - passes behind the carrier's recent run direction are penalized.
+* **carrier motion** - passes behind the carrier's Kalman-predicted run direction are penalized.
 * **receiver space** - how much room the receiver has from the nearest opponent.
 
 A short-range/very-long-range penalty keeps the suggestions realistic. Scores are
@@ -113,8 +113,8 @@ class PassWeights:
             ball_speed_max_m=3.5,
             ball_speed_skip_m=6.5,
             carrier_tight_ref_m=0.40,
-            freeze_min_pick_score=0.72,
-            freeze_min_pass_score=0.52,
+            freeze_min_pick_score=0.66,
+            freeze_min_pass_score=0.45,
         )
 
 
@@ -333,7 +333,7 @@ def score_pass_options(
 
     Pass *positions* (e.g. pitch coordinates in meters) to score in metric space
     instead of image pixels. *carrier_motion_dir* is the unit run vector from recent
-    track history (same coordinate system as *positions*).
+    Kalman filter velocity (same coordinate system as *positions*).
     """
     pmask = player_mask(detections)
     feet_img = feet_xy(detections)

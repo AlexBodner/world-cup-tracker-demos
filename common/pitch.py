@@ -364,6 +364,77 @@ def homography_from_keypoints_simple(
     return t
 
 
+def _keypoint_image_valid(x: float, y: float) -> bool:
+    return bool(np.isfinite(x) and np.isfinite(y) and x > 1 and y > 1)
+
+
+def draw_radar_pitch_keypoints_debug(
+    radar: np.ndarray,
+    keypoints: sv.KeyPoints,
+    transformer: ViewTransformer,
+    *,
+    config: SoccerPitchConfiguration = PITCH_CONFIG,
+    confidence: float = 0.5,
+    padding: int = 50,
+    scale: float = 0.1,
+) -> np.ndarray:
+    """Warp all detected pitch keypoints onto the minimap (accepted vs rejected)."""
+    if keypoints.xy.shape[0] == 0:
+        return radar
+    xy = keypoints.xy[0]
+    n = len(config.vertices)
+    conf = pitch_keypoint_confidence(keypoints, n_vertices=n)
+    accept = pitch_keypoint_accept_mask(xy, conf, confidence=confidence)
+
+    def _to_radar_px(cm_xy: np.ndarray) -> tuple[int, int]:
+        return (
+            int(cm_xy[0] * scale) + padding,
+            int(cm_xy[1] * scale) + padding,
+        )
+
+    for start, end in config.edges:
+        i, j = start - 1, end - 1
+        if i >= len(xy) or j >= len(xy):
+            continue
+        if not (
+            _keypoint_image_valid(float(xy[i, 0]), float(xy[i, 1]))
+            and _keypoint_image_valid(float(xy[j, 0]), float(xy[j, 1]))
+            and accept[i]
+            and accept[j]
+        ):
+            continue
+        seg = transformer.transform_points(xy[[i, j]].astype(np.float32))
+        cv2.line(
+            radar,
+            _to_radar_px(seg[0]),
+            _to_radar_px(seg[1]),
+            (90, 90, 110),
+            1,
+            cv2.LINE_AA,
+        )
+
+    for i in range(min(len(xy), n)):
+        x, y = float(xy[i, 0]), float(xy[i, 1])
+        if not _keypoint_image_valid(x, y):
+            continue
+        kp_cm = transformer.transform_points(np.array([[x, y]], dtype=np.float32))
+        if accept[i]:
+            face = sv.Color.from_hex("#50DC32")
+            radius = 14
+        else:
+            face = sv.Color.from_hex("#5050FF")
+            radius = 10
+        radar = draw_points_on_pitch(
+            config=config,
+            xy=kp_cm,
+            face_color=face,
+            edge_color=sv.Color.WHITE,
+            radius=radius,
+            pitch=radar,
+        )
+    return radar
+
+
 def render_radar_simple(
     detections: sv.Detections,
     keypoints: sv.KeyPoints | None,
@@ -372,10 +443,15 @@ def render_radar_simple(
     confidence: float = 0.5,
     transformer: ViewTransformer | None = None,
     locked_goal_defenders: tuple[int, int] | None = None,
+    debug_keypoints: bool = False,
 ) -> np.ndarray | None:
     """Minimap: H, team-colored goals, keypoints, player feet."""
-    from world_cup_projects.common.possession import player_mask
-    from world_cup_projects.common.soccernet import TEAM_LEFT, TEAM_RIGHT
+    from world_cup_projects.common.soccernet import (
+        ROLE_GOALKEEPER,
+        ROLE_PLAYER,
+        TEAM_LEFT,
+        TEAM_RIGHT,
+    )
 
     t = homography_from_keypoints_simple(
         keypoints, config=config, confidence=confidence
@@ -386,25 +462,34 @@ def render_radar_simple(
         return None
 
     radar = draw_pitch(config=config)
-    pmask = player_mask(detections)
+    outfield_mask = detections.class_id == ROLE_PLAYER
+    gk_mask = detections.class_id == ROLE_GOALKEEPER
     feet_cm = None
     teams = None
+    gk_feet_cm = None
     layout_ok = False
 
-    if pmask.any():
-        players = detections[pmask]
-        feet = players.get_anchors_coordinates(anchor=sv.Position.BOTTOM_CENTER)
+    if outfield_mask.any():
+        outfield = detections[outfield_mask]
+        feet = outfield.get_anchors_coordinates(anchor=sv.Position.BOTTOM_CENTER)
         feet_cm = t.transform_points(feet.astype(np.float32))
-        teams = players.data.get("team", np.zeros(len(players), dtype=int))
+        teams = outfield.data.get("team", np.zeros(len(outfield), dtype=int))
         feet_m = feet_cm / 100.0
         layout_ok = pitch_layout_reliable(feet_m, teams, config=config)
 
-    if layout_ok and feet_cm is not None and teams is not None:
-        feet_m = feet_cm / 100.0
+    if gk_mask.any():
+        gks = detections[gk_mask]
+        gk_feet = gks.get_anchors_coordinates(anchor=sv.Position.BOTTOM_CENTER)
+        gk_feet_cm = t.transform_points(gk_feet.astype(np.float32))
+
+    has_players = outfield_mask.any() or gk_mask.any()
+    if feet_cm is not None and teams is not None and outfield_mask.any():
         if locked_goal_defenders is not None:
             left_team, right_team = locked_goal_defenders
+        elif layout_ok:
+            left_team, right_team = infer_goal_defenders(feet_cm, teams)
         else:
-            left_team, right_team = infer_goal_defenders(feet_m * 100.0, teams)
+            left_team, right_team = TEAM_LEFT, TEAM_RIGHT
         radar = draw_goals_on_pitch(
             config,
             left_defender_team=left_team,
@@ -412,7 +497,7 @@ def render_radar_simple(
             team_colors=_SPORTS_RADAR_COLORS,
             pitch=radar,
         )
-    elif not pmask.any():
+    elif not has_players:
         left_team, right_team = TEAM_LEFT, TEAM_RIGHT
         radar = draw_goals_on_pitch(
             config,
@@ -423,23 +508,31 @@ def render_radar_simple(
         )
 
     if keypoints is not None and keypoints.xy.shape[0] > 0:
-        xy = keypoints.xy[0]
-        conf = pitch_keypoint_confidence(keypoints, n_vertices=len(config.vertices))
-        mask = pitch_keypoint_accept_mask(xy, conf, confidence=confidence)
-        if mask.any():
-            kp_cm = t.transform_points(xy[mask].astype(np.float32))
-            radar = draw_points_on_pitch(
-                config=config,
-                xy=kp_cm,
-                face_color=sv.Color.from_hex("#FFFFFF"),
-                edge_color=sv.Color.from_hex("#333333"),
-                radius=10,
-                pitch=radar,
+        if debug_keypoints:
+            radar = draw_radar_pitch_keypoints_debug(
+                radar, keypoints, t, config=config, confidence=confidence
             )
+        else:
+            xy = keypoints.xy[0]
+            conf = pitch_keypoint_confidence(keypoints, n_vertices=len(config.vertices))
+            mask = pitch_keypoint_accept_mask(xy, conf, confidence=confidence)
+            if mask.any():
+                kp_cm = t.transform_points(xy[mask].astype(np.float32))
+                radar = draw_points_on_pitch(
+                    config=config,
+                    xy=kp_cm,
+                    face_color=sv.Color.from_hex("#FFFFFF"),
+                    edge_color=sv.Color.from_hex("#333333"),
+                    radius=10,
+                    pitch=radar,
+                )
 
-    if layout_ok and feet_cm is not None and teams is not None:
+    if feet_cm is not None and teams is not None and outfield_mask.any():
+        from world_cup_projects.common.visual import _valid_pitch_cm
+
+        on_pitch = _valid_pitch_cm(feet_cm, config, margin_cm=80.0)
         for team_id, color in enumerate(_SPORTS_RADAR_COLORS[:2]):
-            team_mask = teams == team_id
+            team_mask = (teams == team_id) & on_pitch
             if not team_mask.any():
                 continue
             radar = draw_points_on_pitch(
@@ -448,6 +541,36 @@ def render_radar_simple(
                 face_color=color,
                 edge_color=sv.Color.BLACK,
                 radius=20,
+                pitch=radar,
+            )
+
+    if gk_feet_cm is not None and gk_mask.any():
+        from world_cup_projects.common.visual import _valid_pitch_cm
+
+        gk_teams = detections[gk_mask].data.get(
+            "team", np.full(int(gk_mask.sum()), -1, dtype=int)
+        )
+        on_pitch = _valid_pitch_cm(gk_feet_cm, config, margin_cm=80.0)
+        for team_id, color in enumerate(_SPORTS_RADAR_COLORS[:2]):
+            team_mask = (gk_teams == team_id) & on_pitch
+            if not team_mask.any():
+                continue
+            radar = draw_points_on_pitch(
+                config=config,
+                xy=gk_feet_cm[team_mask],
+                face_color=color,
+                edge_color=sv.Color.WHITE,
+                radius=16,
+                pitch=radar,
+            )
+        neutral = on_pitch & ~np.isin(gk_teams, (0, 1))
+        if neutral.any():
+            radar = draw_points_on_pitch(
+                config=config,
+                xy=gk_feet_cm[neutral],
+                face_color=sv.Color.from_hex("#E8E8E8"),
+                edge_color=sv.Color.BLACK,
+                radius=14,
                 pitch=radar,
             )
     return radar
@@ -461,26 +584,36 @@ def render_radar_from_transformer(
     locked_goal_defenders: tuple[int, int] | None = None,
 ) -> np.ndarray | None:
     """Warp player feet with a precomputed homography."""
-    from world_cup_projects.common.possession import player_mask
+    from world_cup_projects.common.soccernet import (
+        ROLE_GOALKEEPER,
+        ROLE_PLAYER,
+        TEAM_LEFT,
+        TEAM_RIGHT,
+    )
 
-    from world_cup_projects.common.soccernet import TEAM_LEFT, TEAM_RIGHT
-
-    pmask = player_mask(detections)
+    outfield_mask = detections.class_id == ROLE_PLAYER
+    gk_mask = detections.class_id == ROLE_GOALKEEPER
     radar = draw_pitch(config=config)
     transformed_xy = None
     teams = None
+    gk_xy = None
 
-    if pmask.any():
-        players = detections[pmask]
-        xy = players.get_anchors_coordinates(anchor=sv.Position.BOTTOM_CENTER)
+    if outfield_mask.any():
+        outfield = detections[outfield_mask]
+        xy = outfield.get_anchors_coordinates(anchor=sv.Position.BOTTOM_CENTER)
         transformed_xy = transformer.transform_points(points=xy.astype(np.float32))
-        teams = players.data.get("team", np.zeros(len(players), dtype=int))
+        teams = outfield.data.get("team", np.zeros(len(outfield), dtype=int))
         if locked_goal_defenders is not None:
             left_team, right_team = locked_goal_defenders
         else:
             left_team, right_team = infer_goal_defenders(transformed_xy, teams)
     else:
         left_team, right_team = TEAM_LEFT, TEAM_RIGHT
+
+    if gk_mask.any():
+        gks = detections[gk_mask]
+        gk_feet = gks.get_anchors_coordinates(anchor=sv.Position.BOTTOM_CENTER)
+        gk_xy = transformer.transform_points(points=gk_feet.astype(np.float32))
 
     radar = draw_goals_on_pitch(
         config,
@@ -489,21 +622,46 @@ def render_radar_from_transformer(
         team_colors=_SPORTS_RADAR_COLORS,
         pitch=radar,
     )
-    if transformed_xy is None:
-        return radar
+    if transformed_xy is not None and teams is not None:
+        for team_id, color in enumerate(_SPORTS_RADAR_COLORS[:2]):
+            team_mask = teams == team_id
+            if not team_mask.any():
+                continue
+            radar = draw_points_on_pitch(
+                config=config,
+                xy=transformed_xy[team_mask],
+                face_color=color,
+                edge_color=sv.Color.BLACK,
+                radius=20,
+                pitch=radar,
+            )
 
-    for team_id, color in enumerate(_SPORTS_RADAR_COLORS[:2]):
-        team_mask = teams == team_id
-        if not team_mask.any():
-            continue
-        radar = draw_points_on_pitch(
-            config=config,
-            xy=transformed_xy[team_mask],
-            face_color=color,
-            edge_color=sv.Color.BLACK,
-            radius=20,
-            pitch=radar,
+    if gk_xy is not None and gk_mask.any():
+        gk_teams = detections[gk_mask].data.get(
+            "team", np.full(len(gk_xy), -1, dtype=int)
         )
+        for team_id, color in enumerate(_SPORTS_RADAR_COLORS[:2]):
+            team_mask = gk_teams == team_id
+            if not team_mask.any():
+                continue
+            radar = draw_points_on_pitch(
+                config=config,
+                xy=gk_xy[team_mask],
+                face_color=color,
+                edge_color=sv.Color.WHITE,
+                radius=16,
+                pitch=radar,
+            )
+        neutral = ~np.isin(gk_teams, (0, 1))
+        if neutral.any():
+            radar = draw_points_on_pitch(
+                config=config,
+                xy=gk_xy[neutral],
+                face_color=sv.Color.from_hex("#E8E8E8"),
+                edge_color=sv.Color.BLACK,
+                radius=14,
+                pitch=radar,
+            )
     return radar
 
 

@@ -1,4 +1,4 @@
-"""Model-based detection + ByteTrack for non-SoccerNet video (v2 path).
+"""Model-based detection + tracking for non-SoccerNet video (v2 path).
 
 Sources:
 - ``football``: YOLO ``football-players-detection`` (DFL-trained; ball/player/gk/referee).
@@ -18,6 +18,8 @@ import supervision as sv
 
 from trackers import ByteTrackTracker
 
+from world_cup_projects.common.player_tracker import TrackerKind, create_player_tracker
+from world_cup_projects.common.tracking_facing import kalman_velocity_arrays
 from world_cup_projects.common.soccernet import (
     ROLE_BALL,
     ROLE_GOALKEEPER,
@@ -26,11 +28,7 @@ from world_cup_projects.common.soccernet import (
     TEAM_NONE,
     SoccerNetSequence,
 )
-from world_cup_projects.common.teams import (
-    JerseyColorTeamClassifier,
-    get_crops,
-    resolve_goalkeepers_team_id,
-)
+from world_cup_projects.common.teams import JerseyColorTeamClassifier, get_crops
 from world_cup_projects.common.video import read_sequence_frame
 
 # Class ids in football-players-detection / roboflow/sports football-player-detection.pt
@@ -292,6 +290,8 @@ def _empty_detections_data(n: int) -> dict:
     return {
         "team": np.full(n, TEAM_NONE, dtype=int),
         "jersey": np.asarray([""] * n, dtype=object),
+        "kf_vx": np.full(n, np.nan, dtype=np.float32),
+        "kf_vy": np.full(n, np.nan, dtype=np.float32),
     }
 
 
@@ -303,12 +303,15 @@ def iter_football_detections(
     start: int = 1,
     end: int | None = None,
     track_activation_threshold: float = 0.4,
+    tracker: TrackerKind = "bytetrack",
 ) -> Iterator[tuple[int, sv.Detections]]:
     """Detect + track with football-players-detection; refs excluded from teams."""
-    tracker = ByteTrackTracker(
-        frame_rate=sequence.frame_rate,
+    player_tracker = create_player_tracker(
+        sequence.frame_rate,
+        kind=tracker,
         track_activation_threshold=track_activation_threshold,
     )
+    needs_frame = tracker == "botsort"
     last = sequence.length if end is None else min(end, sequence.length)
 
     for frame_idx in range(start, last + 1):
@@ -324,7 +327,14 @@ def iter_football_detections(
         refs = det[det.class_id == ROLE_REFEREE]
 
         trackable = sv.Detections.merge([players, gks])
-        tracked = tracker.update(trackable, frame=image) if len(trackable) else sv.Detections.empty()
+        tracked = (
+            player_tracker.update(
+                trackable,
+                frame=image if needs_frame else None,
+            )
+            if len(trackable)
+            else sv.Detections.empty()
+        )
 
         parts: list[sv.Detections] = []
         if len(tracked):
@@ -334,9 +344,8 @@ def iter_football_detections(
                 player_teams = team_classifier.predict(get_crops(image, t_players))
             else:
                 player_teams = np.array([], dtype=int)
-            if len(t_gks) and len(t_players):
-                gk_teams = resolve_goalkeepers_team_id(t_players, player_teams, t_gks)
-            elif len(t_gks):
+            # Goalkeepers keep neutral styling (distinct jersey confuses team clustering).
+            if len(t_gks):
                 gk_teams = np.full(len(t_gks), TEAM_NONE, dtype=int)
             else:
                 gk_teams = np.array([], dtype=int)
@@ -345,6 +354,7 @@ def iter_football_detections(
                 if len(subset) == 0:
                     continue
                 tid = subset.tracker_id if subset.tracker_id is not None else np.full(len(subset), -1)
+                kf_vx, kf_vy = kalman_velocity_arrays(subset, player_tracker)
                 parts.append(
                     sv.Detections(
                         xyxy=subset.xyxy.astype(np.float32),
@@ -353,6 +363,8 @@ def iter_football_detections(
                         data={
                             "team": teams.astype(int),
                             "jersey": np.asarray([""] * len(subset), dtype=object),
+                            "kf_vx": kf_vx,
+                            "kf_vy": kf_vy,
                         },
                     )
                 )
@@ -396,6 +408,7 @@ def iter_football_model_detections(
     threshold: float = 0.5,
     sample_stride: int = 30,
     model_path: str | Path | None = None,
+    tracker: TrackerKind = "bytetrack",
 ) -> Iterator[tuple[int, sv.Detections]]:
     """Convenience wrapper: football-players YOLO + jersey team classifier."""
     detector = FootballPlayersDetector(model_path=model_path, device=device, threshold=threshold)
@@ -403,5 +416,10 @@ def iter_football_model_detections(
         sequence, detector, sample_stride=sample_stride, max_frames=end or sequence.length
     )
     yield from iter_football_detections(
-        sequence, detector, team_classifier, start=start, end=end
+        sequence,
+        detector,
+        team_classifier,
+        start=start,
+        end=end,
+        tracker=tracker,
     )

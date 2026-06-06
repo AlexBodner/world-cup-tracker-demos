@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 import cv2
 import numpy as np
 import supervision as sv
@@ -20,6 +22,7 @@ from world_cup_projects.common.pitch import (
     render_radar_sports,
 )
 from world_cup_projects.common.possession import ball_xy, feet_xy, player_mask
+from world_cup_projects.common.soccernet import ROLE_GOALKEEPER, ROLE_PLAYER
 
 ROBOFLOW_PURPLE = sv.Color.from_hex("#8315F9")
 ROBOFLOW_PURPLE_BGR = ROBOFLOW_PURPLE.as_bgr()
@@ -30,6 +33,7 @@ TEAM_COLORS = [
 ]
 TEAM_PALETTE = sv.ColorPalette(TEAM_COLORS)
 BALL_COLOR = sv.Color.from_hex("#FFD700")
+KALMAN_FACING_BGR = (0, 200, 255)
 
 _ELLIPSE = sv.EllipseAnnotator(
     color=TEAM_PALETTE, color_lookup=sv.ColorLookup.CLASS, thickness=2
@@ -44,6 +48,9 @@ _LABEL = sv.LabelAnnotator(
 )
 _BALL_TRI = sv.TriangleAnnotator(
     color=BALL_COLOR, base=14, height=18, color_lookup=sv.ColorLookup.INDEX
+)
+_GK_ELLIPSE = sv.EllipseAnnotator(
+    color=sv.Color.from_hex("#E8E8E8"), thickness=2
 )
 
 
@@ -122,21 +129,152 @@ def draw_branding_tag(frame: np.ndarray, text: str = "powered by trackers") -> n
     return frame
 
 
+def draw_player_facing_arrows(
+    frame: np.ndarray,
+    dets: sv.Detections,
+    facing: np.ndarray,
+    *,
+    style: Literal["motion", "kalman"] = "motion",
+    arrow_len: int | None = None,
+) -> np.ndarray:
+    """Small arrow from each player ellipse showing motion/facing direction."""
+    if facing is None or len(dets) == 0:
+        return frame
+    if arrow_len is None:
+        arrow_len = 24 if style == "motion" else 20
+    pmask = np.isin(dets.class_id, (ROLE_PLAYER, ROLE_GOALKEEPER))
+    if not pmask.any():
+        return frame
+    indices = np.flatnonzero(pmask)
+    anchors = dets[pmask].get_anchors_coordinates(sv.Position.BOTTOM_CENTER)
+    teams = dets.data.get("team", np.full(len(dets), -1))[pmask]
+    for local_i, global_i in enumerate(indices):
+        direction = facing[global_i]
+        if not np.isfinite(direction).all():
+            continue
+        ax, ay = anchors[local_i]
+        if style == "kalman":
+            ax, ay = ax + 5, ay - 3
+        dx, dy = float(direction[0]), float(direction[1])
+        tip = (int(ax + dx * arrow_len), int(ay + dy * arrow_len))
+        if style == "kalman":
+            color = KALMAN_FACING_BGR
+        else:
+            team = int(teams[local_i])
+            if team in (0, 1):
+                color = TEAM_COLORS[team].as_bgr()
+            else:
+                color = (230, 230, 230)
+        cv2.arrowedLine(
+            frame,
+            (int(ax), int(ay)),
+            tip,
+            (16, 16, 20),
+            4,
+            cv2.LINE_AA,
+            tipLength=0.42,
+        )
+        cv2.arrowedLine(
+            frame,
+            (int(ax), int(ay)),
+            tip,
+            color,
+            2,
+            cv2.LINE_AA,
+            tipLength=0.42,
+        )
+    return frame
+
+
+def draw_facing_legend(frame: np.ndarray) -> np.ndarray:
+    """Legend when both motion and Kalman facing arrows are shown."""
+    margin = 14
+    legend_y = 52
+    draw_text_shadow(
+        frame,
+        "motion=team color | kalman=gold",
+        (margin, legend_y),
+        font_scale=0.48,
+        color_bgr=(210, 210, 210),
+        thickness=1,
+    )
+    return frame
+
+
+def _tracker_id_labels(dets: sv.Detections) -> list[str]:
+    n = len(dets)
+    tids = dets.tracker_id if dets.tracker_id is not None else np.full(n, -1, dtype=int)
+    return [f"#{int(tid)}" if int(tid) >= 0 else "" for tid in tids]
+
+
 def annotate_players(
     frame: np.ndarray,
     dets: sv.Detections,
     *,
     labels: list[str] | None = None,
+    facing: np.ndarray | None = None,
+    facing_motion: np.ndarray | None = None,
+    facing_kalman: np.ndarray | None = None,
+    show_tracker_ids: bool = False,
 ) -> np.ndarray:
-    pmask = player_mask(dets)
-    if not pmask.any():
-        return frame
-    players = dets[pmask]
-    teams = players.data.get("team", np.zeros(len(players)))
-    players.class_id = team_class_ids(teams)
-    frame = _ELLIPSE.annotate(frame, players)
-    if labels is not None:
-        frame = _LABEL.annotate(frame, players, labels=labels)
+    outfield = dets[dets.class_id == ROLE_PLAYER]
+    if len(outfield):
+        teams = outfield.data.get("team", np.zeros(len(outfield)))
+        outfield_vis = sv.Detections(
+            xyxy=outfield.xyxy,
+            class_id=team_class_ids(teams),
+            tracker_id=outfield.tracker_id,
+            data=outfield.data,
+        )
+        frame = _ELLIPSE.annotate(frame, outfield_vis)
+        player_labels = labels
+        if player_labels is None and show_tracker_ids:
+            player_labels = _tracker_id_labels(outfield)
+        if player_labels is not None:
+            frame = _LABEL.annotate(frame, outfield_vis, labels=player_labels)
+
+    gks = dets[dets.class_id == ROLE_GOALKEEPER]
+    if len(gks):
+        gk_teams = gks.data.get("team", np.full(len(gks), -1))
+        has_team = np.isin(gk_teams, (0, 1))
+        if has_team.any():
+            gk_colored = gks[has_team]
+            gk_vis = sv.Detections(
+                xyxy=gk_colored.xyxy,
+                class_id=team_class_ids(gk_teams[has_team]),
+                tracker_id=gk_colored.tracker_id,
+                data=gk_colored.data,
+            )
+            frame = _ELLIPSE.annotate(frame, gk_vis)
+            if show_tracker_ids:
+                frame = _LABEL.annotate(
+                    frame, gk_vis, labels=_tracker_id_labels(gk_colored)
+                )
+        if (~has_team).any():
+            gk_neutral = gks[~has_team]
+            frame = _GK_ELLIPSE.annotate(frame, gk_neutral)
+            if show_tracker_ids:
+                gk_vis = sv.Detections(
+                    xyxy=gk_neutral.xyxy,
+                    class_id=np.zeros(len(gk_neutral), dtype=int),
+                    tracker_id=gk_neutral.tracker_id,
+                    data=gk_neutral.data,
+                )
+                frame = _LABEL.annotate(
+                    frame, gk_vis, labels=_tracker_id_labels(gk_neutral)
+                )
+
+    if facing_motion is None and facing is not None:
+        facing_motion = facing
+    if facing_motion is not None:
+        frame = draw_player_facing_arrows(frame, dets, facing_motion, style="motion")
+    if facing_kalman is not None:
+        kalman_style = "kalman" if facing_motion is not None else "motion"
+        frame = draw_player_facing_arrows(
+            frame, dets, facing_kalman, style=kalman_style
+        )
+    if facing_motion is not None and facing_kalman is not None:
+        frame = draw_facing_legend(frame)
     return frame
 
 
@@ -181,6 +319,7 @@ def draw_radar_minimap(
     transformer: ViewTransformer | None = None,
     locked_goal_defenders: tuple[int, int] | None = None,
     prebuilt_radar: np.ndarray | None = None,
+    debug_keypoints: bool = False,
 ) -> np.ndarray:
     """Sports-style radar minimap from per-frame model keypoints."""
     if prebuilt_radar is not None:
@@ -194,6 +333,7 @@ def draw_radar_minimap(
             confidence=pitch_confidence,
             transformer=transformer,
             locked_goal_defenders=locked_goal_defenders,
+            debug_keypoints=debug_keypoints,
         )
         if radar is None and transformer is not None:
             radar = render_radar_from_transformer(
@@ -472,6 +612,115 @@ def draw_homography_feet_debug(
     return frame
 
 
+def ease_out_cubic(t: float) -> float:
+    t = float(np.clip(t, 0.0, 1.0))
+    return 1.0 - (1.0 - t) ** 3
+
+
+def draw_carrier_spotlight(
+    dimmed: np.ndarray,
+    original: np.ndarray,
+    center: tuple[int, int],
+    *,
+    radius: int = 150,
+    strength: float = 0.62,
+) -> np.ndarray:
+    """Keep the ball carrier readable while the rest of the frame is dimmed."""
+    h, w = dimmed.shape[:2]
+    cx, cy = center
+    mask = np.zeros((h, w), dtype=np.float32)
+    cv2.circle(mask, (cx, cy), radius, 1.0, -1, cv2.LINE_AA)
+    mask = cv2.GaussianBlur(mask, (0, 0), sigmaX=radius * 0.38)
+    mask = (mask[..., None] * strength).astype(np.float32)
+    out = dimmed.astype(np.float32) * (1.0 - mask) + original.astype(np.float32) * mask
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def draw_carrier_pulse(
+    frame: np.ndarray,
+    center: tuple[int, int],
+    t: float,
+    *,
+    color_bgr: tuple[int, int, int] = ROBOFLOW_PURPLE_BGR,
+) -> None:
+    """Animated focus rings on the ball carrier."""
+    cx, cy = center
+    for i, base_r in enumerate((22, 36, 52)):
+        phase = (t + i * 0.22) % 1.0
+        wave = 0.5 + 0.5 * np.sin(phase * 2.0 * np.pi)
+        radius = int(base_r * (0.92 + 0.12 * wave))
+        alpha = 0.22 + 0.18 * wave
+        layer = frame.copy()
+        cv2.circle(layer, (cx, cy), radius, color_bgr, 2, cv2.LINE_AA)
+        frame[:] = cv2.addWeighted(layer, alpha, frame, 1.0 - alpha, 0)
+    cv2.circle(frame, (cx, cy), 10, (255, 255, 255), -1, cv2.LINE_AA)
+    cv2.circle(frame, (cx, cy), 14, color_bgr, 2, cv2.LINE_AA)
+
+
+def draw_pass_analysis_panel(
+    frame: np.ndarray,
+    *,
+    progress: float,
+    revealed: int,
+    total: int = 3,
+    rank_label: str | None = None,
+    rank_color: tuple[int, int, int] | None = None,
+) -> np.ndarray:
+    """Bottom broadcast-style panel for the freeze / reveal sequence."""
+    h, w = frame.shape[:2]
+    panel_h = 78
+    panel_w = min(460, w - 48)
+    px = (w - panel_w) // 2
+    py = h - panel_h - 62
+
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (px, py), (px + panel_w, py + panel_h), (16, 16, 20), -1)
+    cv2.rectangle(overlay, (px, py), (px + panel_w, py + panel_h), (48, 48, 58), 1)
+    cv2.rectangle(overlay, (px, py), (px + panel_w, py + 4), ROBOFLOW_PURPLE_BGR, -1)
+    frame[:] = cv2.addWeighted(overlay, 0.9, frame, 0.1, 0)
+
+    if revealed == 0:
+        title = "PASS ANALYSIS"
+        step = int(progress * 9) % 3
+        dots = "".join("●" if i == step else "○" for i in range(3))
+        subtitle = f"Scanning open lanes  {dots}"
+    else:
+        label = rank_label or f"OPTION {revealed}"
+        title = label
+        subtitle = f"Route {revealed} of {total}  ·  ranked by lane + distance"
+
+    draw_text_shadow(
+        frame,
+        title,
+        (px + 18, py + 30),
+        font_scale=0.62,
+        color_bgr=rank_color or (255, 255, 255),
+        thickness=2,
+    )
+    draw_text_shadow(
+        frame,
+        subtitle,
+        (px + 18, py + 58),
+        font_scale=0.46,
+        color_bgr=(175, 175, 185),
+        thickness=1,
+    )
+
+    bar_w = panel_w - 36
+    bar_x = px + 18
+    bar_y = py + panel_h - 12
+    cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_w, bar_y + 4), (40, 40, 48), -1)
+    fill = int(bar_w * ease_out_cubic(progress if revealed else (0.35 + 0.65 * progress)))
+    cv2.rectangle(
+        frame,
+        (bar_x, bar_y),
+        (bar_x + max(fill, 6), bar_y + 4),
+        rank_color or ROBOFLOW_PURPLE_BGR,
+        -1,
+    )
+    return frame
+
+
 def draw_glow_arrow(
     frame: np.ndarray,
     start: tuple[int, int],
@@ -479,11 +728,19 @@ def draw_glow_arrow(
     color_bgr: tuple[int, int, int],
     *,
     thickness: int = 4,
+    alpha: float = 1.0,
 ) -> None:
+    if alpha <= 0.01:
+        return
+    layer = frame.copy()
     cv2.arrowedLine(
-        frame, start, end, (20, 20, 20), thickness + 3, cv2.LINE_AA, tipLength=0.05
+        layer, start, end, (20, 20, 20), thickness + 3, cv2.LINE_AA, tipLength=0.05
     )
-    cv2.arrowedLine(frame, start, end, color_bgr, thickness, cv2.LINE_AA, tipLength=0.05)
+    cv2.arrowedLine(layer, start, end, color_bgr, thickness, cv2.LINE_AA, tipLength=0.05)
+    if alpha >= 0.99:
+        frame[:] = layer
+    else:
+        frame[:] = cv2.addWeighted(layer, alpha, frame, 1.0 - alpha, 0)
 
 
 def draw_score_chip(

@@ -47,10 +47,11 @@ def _team_color(team: int) -> tuple[int, int, int]:
 def _player_labels(
     dets: sv.Detections, tracks: dict[int, PlayerTrack], frame_idx: int
 ) -> list[str]:
-    """Per-player chip text aligned with ``dets[player_mask(dets)]`` order."""
-    pmask = player_mask(dets)
+    """Per-player chip text aligned with outfield ``ROLE_PLAYER`` rows in ``dets``."""
+    from world_cup_projects.common.soccernet import ROLE_PLAYER
+
     labels: list[str] = []
-    for i in np.flatnonzero(pmask):
+    for i in np.flatnonzero(dets.class_id == ROLE_PLAYER):
         tid = int(dets.tracker_id[i]) if dets.tracker_id is not None else -1
         track = tracks.get(tid)
         speed = speed_at_frame(track, frame_idx) if track is not None else None
@@ -140,12 +141,14 @@ def render_demo(
             else None
         )
         if pitch_tracker is not None and h_t is not None and locked_goals is None:
-            pmask = player_mask(dets)
-            if pmask.any():
-                pitch_m = image_to_pitch_m(feet_xy(dets)[pmask], h_t)
+            from world_cup_projects.common.soccernet import ROLE_PLAYER
+
+            omask = dets.class_id == ROLE_PLAYER
+            if omask.any():
+                pitch_m = image_to_pitch_m(feet_xy(dets)[omask], h_t)
                 if pitch_m is not None:
                     teams = dets.data.get("team", np.zeros(len(dets), dtype=int))[
-                        pmask
+                        omask
                     ]
                     if pitch_tracker.register_reliable_goal_vote(pitch_m, teams):
                         locked_goals = pitch_tracker.locked_goal_defenders
@@ -157,6 +160,7 @@ def render_demo(
                 pitch_confidence=pitch_confidence,
                 transformer=h_t,
                 locked_goal_defenders=locked_goals,
+                debug_keypoints=pitch_kp_debug,
             )
         if pitch_kp_debug and frame_keypoints is not None:
             image = draw_pitch_keypoints_debug(

@@ -91,13 +91,30 @@ def main() -> None:
     parser.add_argument(
         "--debug-pitch-keypoints",
         action="store_true",
-        help="Draw pitch keypoints + confidence on each frame (homography debug).",
+        help="Draw pitch keypoints on the video + radar (green=used, blue=rejected).",
     )
     parser.add_argument(
         "--pitch-confidence",
         type=float,
         default=0.98,
         help="Keypoint confidence threshold (overlay legend + homography filter).",
+    )
+    parser.add_argument(
+        "--facing-mode",
+        choices=("motion", "kalman", "both"),
+        default="kalman",
+        help="Player facing arrows: kalman (default), displacement motion, or both.",
+    )
+    parser.add_argument(
+        "--tracker",
+        choices=("bytetrack", "botsort", "botsort_nocmc"),
+        default="bytetrack",
+        help="Player tracker for --source football/rfdetr. botsort = BoT-SORT + CMC.",
+    )
+    parser.add_argument(
+        "--refresh-detections-cache",
+        action="store_true",
+        help="Re-run YOLO/RF-DETR instead of loading .cache/detections/.",
     )
     parser.add_argument(
         "--freeze-min-pick-score",
@@ -110,6 +127,11 @@ def main() -> None:
         type=float,
         default=None,
         help="Min score of the best pass option; default from PassWeights.",
+    )
+    parser.add_argument(
+        "--no-freeze-local-peaks",
+        action="store_true",
+        help="Accept any frame above score thresholds (skip local-peak filter).",
     )
     parser.add_argument(
         "--pass-segment-openness",
@@ -216,12 +238,26 @@ def main() -> None:
 
     if args.source == "football":
         from world_cup_projects.common.detect import iter_football_model_detections
+        from world_cup_projects.common.detection_cache import wrap_detections_cache
 
-        detections_source = iter_football_model_detections
+        detections_source = wrap_detections_cache(
+            iter_football_model_detections,
+            source_name="football",
+            refresh=args.refresh_detections_cache,
+            device=args.device,
+            threshold=0.5,
+            tracker=args.tracker,
+        )
     elif args.source == "rfdetr":
         from world_cup_projects.common.detect import iter_model_detections
+        from world_cup_projects.common.detection_cache import wrap_detections_cache
 
-        detections_source = iter_model_detections
+        detections_source = wrap_detections_cache(
+            iter_model_detections,
+            source_name="rfdetr",
+            refresh=args.refresh_detections_cache,
+            device=args.device,
+        )
     else:
         detections_source = iter_gt_detections
 
@@ -245,8 +281,13 @@ def main() -> None:
         weights = replace(weights, freeze_min_pick_score=args.freeze_min_pick_score)
     if args.freeze_min_pass_score is not None:
         weights = replace(weights, freeze_min_pass_score=args.freeze_min_pass_score)
+    if args.no_freeze_local_peaks:
+        weights = replace(weights, freeze_detect_local_peaks=False)
     max_events = args.max_events if args.max_events > 0 else None
     tag = args.source + ("_metric" if args.metric else "")
+    if args.tracker != "bytetrack":
+        tag += f"_{args.tracker}"
+    tag += f"_facing_{args.facing_mode}"
     if args.debug_pitch_keypoints:
         tag += "_pitch_kp_debug"
 
@@ -265,6 +306,8 @@ def main() -> None:
         carrier_max_distance_m=args.carrier_max_m,
         debug_pitch_keypoints=args.debug_pitch_keypoints,
         pitch_confidence=args.pitch_confidence,
+        facing_mode=args.facing_mode,
+        tracker_kind=args.tracker,
     )
     json_path = out_dir / f"pass_alternatives_{tag}_{sequence.name}.json"
     json_path.write_text(json.dumps(manifest, indent=2))

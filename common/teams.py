@@ -22,6 +22,73 @@ def get_crops(frame: np.ndarray, detections: sv.Detections) -> List[np.ndarray]:
     return [sv.crop_image(frame, xyxy) for xyxy in detections.xyxy]
 
 
+def resolve_goalkeepers_team_by_goal(
+    goalkeepers_pitch_cm: np.ndarray,
+    outfield_pitch_cm: np.ndarray,
+    outfield_team_id: np.ndarray,
+    *,
+    pitch_length_cm: float = 12000.0,
+    pitch_width_cm: float = 7000.0,
+) -> np.ndarray:
+    """Assign each GK to the team defending the nearer goal mouth."""
+    from world_cup_projects.common.pitch import infer_goal_defenders
+    from world_cup_projects.common.soccernet import TEAM_LEFT, TEAM_RIGHT
+
+    if len(goalkeepers_pitch_cm) == 0:
+        return np.array([], dtype=int)
+
+    if (
+        len(outfield_pitch_cm) >= 4
+        and np.any(outfield_team_id == 0)
+        and np.any(outfield_team_id == 1)
+    ):
+        left_def, right_def = infer_goal_defenders(outfield_pitch_cm, outfield_team_id)
+    else:
+        left_def, right_def = TEAM_LEFT, TEAM_RIGHT
+
+    left_goal = np.array([0.0, pitch_width_cm / 2.0], dtype=np.float32)
+    right_goal = np.array([pitch_length_cm, pitch_width_cm / 2.0], dtype=np.float32)
+    ids: list[int] = []
+    for xy in goalkeepers_pitch_cm:
+        d_left = float(np.linalg.norm(xy - left_goal))
+        d_right = float(np.linalg.norm(xy - right_goal))
+        ids.append(left_def if d_left < d_right else right_def)
+    return np.array(ids, dtype=int)
+
+
+def apply_goalkeeper_teams_by_goal(dets: sv.Detections, transformer) -> sv.Detections:
+    """Set ``data['team']`` on goalkeeper rows from pitch distance to each goal."""
+    from world_cup_projects.common.pitch import image_to_pitch_cm
+    from world_cup_projects.common.possession import feet_xy
+
+    gk_mask = dets.class_id == ROLE_GOALKEEPER
+    out_mask = dets.class_id == ROLE_PLAYER
+    if not gk_mask.any():
+        return dets
+
+    feet = feet_xy(dets)
+    gk_cm = image_to_pitch_cm(feet[gk_mask], transformer)
+    if gk_cm is None or not np.isfinite(gk_cm).all():
+        return dets
+
+    out_cm = None
+    out_teams = None
+    if out_mask.any():
+        out_cm = image_to_pitch_cm(feet[out_mask], transformer)
+        out_teams = dets.data.get("team", np.zeros(len(dets), dtype=int))[out_mask]
+
+    gk_teams = resolve_goalkeepers_team_by_goal(
+        gk_cm,
+        out_cm if out_cm is not None else np.empty((0, 2), dtype=np.float32),
+        out_teams if out_teams is not None else np.array([], dtype=int),
+    )
+
+    team = np.array(dets.data.get("team", np.full(len(dets), TEAM_NONE)), dtype=int)
+    team[gk_mask] = gk_teams
+    dets.data["team"] = team
+    return dets
+
+
 def resolve_goalkeepers_team_id(
     players: sv.Detections,
     players_team_id: np.ndarray,
@@ -107,11 +174,14 @@ class JerseyColorTeamClassifier:
 
     @staticmethod
     def _jersey_color(crop: np.ndarray) -> np.ndarray:
+        import cv2
+
         h, w = crop.shape[:2]
         torso = crop[int(h * 0.15) : int(h * 0.55), int(w * 0.2) : int(w * 0.8)]
         if torso.size == 0:
             torso = crop
-        return torso.reshape(-1, 3).mean(axis=0)
+        lab = cv2.cvtColor(torso, cv2.COLOR_BGR2LAB).reshape(-1, 3)
+        return lab.mean(axis=0)
 
     def fit(self, crops: List[np.ndarray]) -> None:
         if not crops:

@@ -4,12 +4,20 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
+from typing import Literal
 
 import cv2
 import numpy as np
 import supervision as sv
 
 from world_cup_projects.common.carrier_motion import BallPositionHistory, TrackPositionHistory
+from world_cup_projects.common.player_tracker import TrackerKind
+from world_cup_projects.common.tracking_facing import (
+    KalmanFacingReplay,
+    carrier_kalman_direction,
+    detections_have_kalman_velocity,
+    facing_kalman_from_detections,
+)
 from world_cup_projects.common.clips import pitch_keypoints_unreliable
 from world_cup_projects.common.pitch import (
     PitchHomographyTracker,
@@ -48,12 +56,16 @@ from world_cup_projects.common.visual import (
     annotate_ball,
     annotate_players,
     draw_branding_tag,
+    draw_carrier_pulse,
+    draw_carrier_spotlight,
     draw_glow_arrow,
     draw_hud_bar,
+    draw_pass_analysis_panel,
     draw_pitch_keypoints_debug,
     draw_radar_minimap,
     draw_score_chip,
     draw_text_shadow,
+    ease_out_cubic,
 )
 from world_cup_projects.pass_alternatives.pass_options import (
     PassOption,
@@ -67,8 +79,9 @@ RANK_LABELS = ["BEST", "2ND", "3RD"]
 # Cinematic slowdown before each freeze, then staggered pass-line reveals.
 MAX_RAMP_HOLD = 6
 DEFAULT_SLOWDOWN_RAMP_SECONDS = 0.72
-DEFAULT_OPTION_REVEAL_SECONDS = 0.4
-DEFAULT_FREEZE_SECONDS = 1.5
+DEFAULT_OPTION_REVEAL_SECONDS = 0.6
+DEFAULT_FREEZE_SECONDS = 2.5
+DEFAULT_FINAL_OPTION_EXTRA_SECONDS = 1.0
 
 DetectionSource = Callable[..., Iterator[tuple[int, sv.Detections]]]
 
@@ -89,6 +102,31 @@ def _iter_frames(
 ) -> Iterator[tuple[int, sv.Detections]]:
     end = max_frames if max_frames is not None else sequence.length
     yield from detections_source(sequence, start=1, end=end)
+
+
+def _patch_goalkeeper_teams(
+    detections_source: DetectionSource,
+    transforms: dict[int, ViewTransformer | None],
+) -> DetectionSource:
+    """Infer goalkeeper team from pitch distance to each goal mouth."""
+    from world_cup_projects.common.teams import apply_goalkeeper_teams_by_goal
+
+    def _wrapped(
+        seq: SoccerNetSequence,
+        *,
+        start: int = 1,
+        end: int | None = None,
+        **kwargs: object,
+    ) -> Iterator[tuple[int, sv.Detections]]:
+        del kwargs
+        last = seq.length if end is None else min(end, seq.length)
+        for frame_idx, dets in detections_source(seq, start=start, end=last):
+            t = transforms.get(frame_idx)
+            if t is not None:
+                dets = apply_goalkeeper_teams_by_goal(dets, t)
+            yield frame_idx, dets
+
+    return _wrapped
 
 
 def _cache_detections(
@@ -124,22 +162,13 @@ def _score_options(
     weights: PassWeights,
     transformer: ViewTransformer | None,
     metric: bool,
-    frame_idx: int = 0,
-    history: TrackPositionHistory | None = None,
 ) -> list[PassOption]:
     motion_dir = None
-    if history is not None and weights.use_carrier_motion:
-        min_disp = (
-            weights.motion_min_displacement_m
-            if metric
-            else weights.motion_min_displacement_px
-        )
-        motion_dir = history.motion_direction(
+    if weights.use_carrier_motion:
+        motion_dir = carrier_kalman_direction(
             dets,
-            carrier,
-            frame_idx,
-            lookback_frames=weights.motion_lookback_frames,
-            min_displacement=min_disp,
+            carrier.index,
+            transformer=transformer if metric else None,
         )
 
     if metric and transformer is not None:
@@ -374,8 +403,6 @@ def plan_events(
             weights=weights,
             transformer=transformer,
             metric=metric,
-            frame_idx=frame_idx,
-            history=history,
         )
         if len(options) < 3:
             continue
@@ -418,8 +445,18 @@ def _annotate_live(
     radar_transformer: ViewTransformer | None = None,
     locked_goal_defenders: tuple[int, int] | None = None,
     debug_pitch_keypoints: bool = False,
+    facing: np.ndarray | None = None,
+    facing_motion: np.ndarray | None = None,
+    facing_kalman: np.ndarray | None = None,
 ) -> np.ndarray:
-    frame = annotate_players(frame, dets)
+    frame = annotate_players(
+        frame,
+        dets,
+        facing=facing,
+        facing_motion=facing_motion,
+        facing_kalman=facing_kalman,
+        show_tracker_ids=True,
+    )
     frame = annotate_ball(frame, dets)
     if show_radar and metric and keypoints is not None:
         frame = draw_radar_minimap(
@@ -429,6 +466,7 @@ def _annotate_live(
             pitch_confidence=pitch_confidence,
             transformer=radar_transformer,
             locked_goal_defenders=locked_goal_defenders,
+            debug_keypoints=debug_pitch_keypoints,
         )
     if debug_pitch_keypoints and keypoints is not None:
         frame = draw_pitch_keypoints_debug(
@@ -524,12 +562,17 @@ def _draw_pass_overlay(
     locked_goal_defenders: tuple[int, int] | None = None,
     debug_pitch_keypoints: bool = False,
     revealed_options: int | None = None,
+    reveal_progress: float = 1.0,
+    facing: np.ndarray | None = None,
+    facing_motion: np.ndarray | None = None,
+    facing_kalman: np.ndarray | None = None,
 ) -> np.ndarray:
     """Dim the frame and draw ranked pass arrows from the carrier.
 
     ``revealed_options``: how many top options to show (0 = carrier only, None = all).
+    ``reveal_progress``: 0–1 animation within the current reveal phase.
     """
-    dim = (frame.astype(np.float32) * 0.35).astype(np.uint8)
+    dim = (frame.astype(np.float32) * 0.32).astype(np.uint8)
     if debug_pitch_keypoints and keypoints is not None:
         dim = draw_pitch_keypoints_debug(
             dim, keypoints, confidence_threshold=pitch_confidence
@@ -555,37 +598,54 @@ def _draw_pass_overlay(
         dim = draw_pass_corridors_on_frame(dim, visible, transformer)
         dim = draw_blocking_rivals_on_frame(dim, visible, feet_xy=feet_img)
 
-    dim = annotate_players(dim, dets)
+    dim = annotate_players(
+        dim,
+        dets,
+        facing=facing,
+        facing_motion=facing_motion,
+        facing_kalman=facing_kalman,
+        show_tracker_ids=True,
+    )
     dim = annotate_ball(dim, dets)
 
     feet = feet_xy(dets)
     carrier_xy = feet[event.carrier.index]
     cx, cy = int(carrier_xy[0]), int(carrier_xy[1])
+    dim = draw_carrier_spotlight(dim, frame, (cx, cy))
 
-    cv2.circle(dim, (cx, cy), 18, (255, 255, 255), 2)
-    draw_text_shadow(dim, "BALL CARRIER", (cx - 58, cy + 40), font_scale=0.5, color_bgr=(255, 255, 255))
+    n_total = min(3, len(options))
+    phase_revealed = 0 if revealed_options == 0 else revealed_options
 
     if revealed_options == 0:
-        draw_text_shadow(
+        draw_carrier_pulse(dim, (cx, cy), reveal_progress)
+        draw_score_chip(dim, "ON BALL", (cx, cy - 42), bg_bgr=ROBOFLOW_PURPLE_BGR)
+        dim = draw_pass_analysis_panel(
             dim,
-            "ANALYZING OPTIONS...",
-            (cx - 110, cy - 52),
-            font_scale=0.62,
-            color_bgr=ROBOFLOW_PURPLE_BGR,
-            thickness=2,
+            progress=reveal_progress,
+            revealed=0,
+            total=n_total,
         )
-        dim = draw_hud_bar(dim, "PASS ALTERNATIVES  -  reading the play")
+        dim = draw_hud_bar(dim, "PASS ALTERNATIVES")
         return draw_branding_tag(dim)
+
+    draw_carrier_pulse(dim, (cx, cy), min(1.0, reveal_progress * 0.35 + 0.65))
 
     for rank, option in enumerate(visible):
         color = RANK_COLORS_BGR[rank]
         recv_xy = feet[option.receiver_index]
         rx, ry = int(recv_xy[0]), int(recv_xy[1])
-        draw_glow_arrow(dim, (cx, cy), (rx, ry), color, thickness=5)
+        is_new = rank == len(visible) - 1
+        alpha = ease_out_cubic(reveal_progress) if is_new else 1.0
+        draw_glow_arrow(dim, (cx, cy), (rx, ry), color, thickness=5, alpha=alpha)
         ring = 20 if rank == 0 else 14
-        cv2.circle(dim, (rx, ry), ring, color, 3 if rank == 0 else 2)
-        if rank == 0:
-            cv2.circle(dim, (rx, ry), ring + 6, (255, 255, 255), 1)
+        if alpha > 0.2:
+            layer = dim.copy()
+            cv2.circle(layer, (rx, ry), ring, color, 3 if rank == 0 else 2)
+            if rank == 0:
+                cv2.circle(layer, (rx, ry), ring + 6, (255, 255, 255), 1)
+            dim[:] = cv2.addWeighted(layer, alpha, dim, 1.0 - alpha, 0)
+        if alpha < 0.85:
+            continue
         midx, midy = (cx + rx) // 2, (cy + ry) // 2
         chip = f"{RANK_LABELS[rank]}  {option.score:.2f}"
         if metric:
@@ -608,6 +668,16 @@ def _draw_pass_overlay(
                 thickness=2,
             )
 
+    latest_rank = len(visible) - 1
+    dim = draw_pass_analysis_panel(
+        dim,
+        progress=reveal_progress,
+        revealed=phase_revealed,
+        total=n_total,
+        rank_label=RANK_LABELS[latest_rank] if visible else None,
+        rank_color=RANK_COLORS_BGR[latest_rank] if visible else None,
+    )
+
     if show_lane_debug and show_radar and keypoints is not None:
         feet_img = feet_xy(dets)
         pitch_cm_lane = (
@@ -619,6 +689,7 @@ def _draw_pass_overlay(
             confidence=pitch_confidence,
             transformer=transformer,
             locked_goal_defenders=locked_goal_defenders,
+            debug_keypoints=debug_pitch_keypoints,
         )
         if radar is not None and pitch_cm_lane is not None:
             radar = draw_pass_lanes_on_radar(radar, visible, pitch_cm_lane)
@@ -644,6 +715,7 @@ def render_demo(
     freeze_seconds: float = DEFAULT_FREEZE_SECONDS,
     slowdown_ramp_seconds: float = DEFAULT_SLOWDOWN_RAMP_SECONDS,
     option_reveal_seconds: float = DEFAULT_OPTION_REVEAL_SECONDS,
+    final_option_extra_seconds: float = DEFAULT_FINAL_OPTION_EXTRA_SECONDS,
     max_events: int | None = None,
     weights: PassWeights = PassWeights(),
     detections_source: DetectionSource = iter_gt_detections,
@@ -656,6 +728,8 @@ def render_demo(
     debug_pitch_keypoints: bool = False,
     pitch_confidence: float = 0.98,
     show_radar: bool | None = None,
+    facing_mode: Literal["motion", "kalman", "both"] = "kalman",
+    tracker_kind: TrackerKind = "bytetrack",
 ) -> dict:
     """Render the full demo MP4. Returns a small manifest dict."""
     detections_source = _cache_detections(
@@ -679,6 +753,8 @@ def render_demo(
                 need_keypoints=debug_pitch_keypoints or metric,
             )
         )
+    if metric and transforms:
+        detections_source = _patch_goalkeeper_teams(detections_source, transforms)
     locked_goals = warmup_goal_defenders(
         pitch_tracker,
         _iter_frames(sequence, detections_source, max_frames=max_frames),
@@ -706,6 +782,20 @@ def render_demo(
     writer = cv2.VideoWriter(
         out_path, fourcc, sequence.frame_rate, (sequence.width, sequence.height)
     )
+    track_history = TrackPositionHistory()
+    use_cached_kalman = False
+    kalman_replay = None
+    if facing_mode in ("kalman", "both"):
+        sample = next(
+            _iter_frames(sequence, detections_source, max_frames=max_frames),
+            None,
+        )
+        if sample is not None and detections_have_kalman_velocity(sample[1]):
+            use_cached_kalman = True
+        else:
+            kalman_replay = KalmanFacingReplay(
+                sequence.frame_rate, tracker_kind=tracker_kind
+            )
     for frame_idx, dets in _iter_frames(
         sequence, detections_source, max_frames=max_frames
     ):
@@ -715,15 +805,30 @@ def render_demo(
         transformer = transforms.get(frame_idx) if transforms else None
         kps = frame_keypoints.get(frame_idx) if frame_keypoints is not None else None
         if pitch_tracker is not None and transformer is not None and locked_goals is None:
-            pmask = player_mask(dets)
-            if pmask.any():
-                pitch_m = image_to_pitch_m(feet_xy(dets)[pmask], transformer)
+            from world_cup_projects.common.soccernet import ROLE_PLAYER
+
+            omask = dets.class_id == ROLE_PLAYER
+            if omask.any():
+                pitch_m = image_to_pitch_m(feet_xy(dets)[omask], transformer)
                 if pitch_m is not None:
                     teams = dets.data.get("team", np.zeros(len(dets), dtype=int))[
-                        pmask
+                        omask
                     ]
                     if pitch_tracker.register_reliable_goal_vote(pitch_m, teams):
                         locked_goals = pitch_tracker.locked_goal_defenders
+        track_history.record_frame(frame_idx, dets, feet_xy(dets))
+        facing_motion = (
+            track_history.player_facing(dets, frame_idx)
+            if facing_mode in ("motion", "both")
+            else None
+        )
+        if facing_mode in ("kalman", "both"):
+            if use_cached_kalman:
+                facing_kalman = facing_kalman_from_detections(dets)
+            else:
+                facing_kalman = kalman_replay.advance(dets, image) if kalman_replay else None
+        else:
+            facing_kalman = None
         live = _annotate_live(
             image,
             dets,
@@ -734,6 +839,8 @@ def render_demo(
             radar_transformer=transformer,
             locked_goal_defenders=locked_goals,
             debug_pitch_keypoints=debug_pitch_keypoints,
+            facing_motion=facing_motion,
+            facing_kalman=facing_kalman,
         )
         frames_until = next(
             (ef - frame_idx for ef in event_frames if ef >= frame_idx),
@@ -765,18 +872,23 @@ def render_demo(
             phases.extend((i, reveal_frames) for i in range(1, n_options + 1))
             min_freeze = sum(h for _, h in phases)
             extra_hold = max(0, int(round(freeze_seconds * sequence.frame_rate)) - min_freeze)
+            final_extra = max(4, int(round(final_option_extra_seconds * sequence.frame_rate)))
             if phases:
-                phases[-1] = (phases[-1][0], phases[-1][1] + extra_hold)
+                phases[-1] = (phases[-1][0], phases[-1][1] + extra_hold + final_extra)
 
             for revealed, phase_hold in phases:
-                overlay = _draw_pass_overlay(
-                    image,
-                    dets,
-                    event,
-                    revealed_options=revealed,
-                    **overlay_kwargs,
-                )
-                for _ in range(phase_hold):
+                for step in range(phase_hold):
+                    progress = (step + 1) / max(phase_hold, 1)
+                    overlay = _draw_pass_overlay(
+                        image,
+                        dets,
+                        event,
+                        revealed_options=revealed,
+                        reveal_progress=progress,
+                        facing_motion=facing_motion,
+                        facing_kalman=facing_kalman,
+                        **overlay_kwargs,
+                    )
                     writer.write(overlay)
 
     writer.release()
