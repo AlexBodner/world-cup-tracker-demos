@@ -2,6 +2,18 @@
 
 Historical export of the internal `world_cup_projects` package (Roboflow monorepo).
 
+## [0.2.0] — 2026-06
+
+### Pass Network & Visuals
+- Implemented `pass_network_run.py` to analyze passing events and build collaboration links.
+- Added dynamic pass highlights: glowing, perspective-aware ellipses at players' feet and an arrow that interpolates to follow the ball's flight path.
+- Added a "twinkle" pulse effect upon successful pass reception.
+- Updated the stats end-card to use clear, self-explanatory labels ("Passes", "Avg Quality", "Made", "Received") instead of technical abbreviations.
+
+### Pitch & Team Logic
+- **Defensive Block Goal Inference**: Overhauled `infer_goal_defenders` to use the 3 most defensive players per team and a margin-of-advantage check, fixing issues where offensive presses caused inverted goal assignments.
+- **Goalkeeper Stabilization**: Introduced `stabilize_goalkeeper_teams` to use tracklet history to reliably map Goalkeepers to their defending goal and prevent team/role flickering.
+
 ## [0.1.0] — 2025-06 snapshot
 
 ### Demos
