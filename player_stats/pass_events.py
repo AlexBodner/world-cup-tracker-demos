@@ -46,8 +46,11 @@ class PassDetectionConfig:
     max_pass_gap_frames: int = 120
     min_ball_travel_m: float = 2.0
     min_ball_travel_px: float = 40.0
-    carrier_max_distance_m: float = CARRIER_MAX_DISTANCE_M
-    carrier_max_distance_px: float = CARRIER_MAX_DISTANCE_PX
+    # Tightened distance to require the ball to be closer to outfield feet
+    carrier_max_distance_m: float = 0.8
+    carrier_max_distance_px: float = 60.0
+    # Require player to hold the ball for several frames to confirm possession
+    min_consecutive_possession_frames: int = 2
 
 
 @dataclass(frozen=True)
@@ -189,8 +192,17 @@ def detect_pass_events(
 ) -> list[InferredPass]:
     """Scan tracked detections and infer directed pass events."""
     transformers = transformers or {}
-    last: tuple[int, sv.Detections, Carrier] | None = None
+    
     events: list[InferredPass] = []
+    
+    current_candidate_tid = -1
+    candidate_frames = 0
+    candidate_first_frame = -1
+    candidate_first_carrier = None
+    candidate_first_dets = None
+
+    # Stores the latest frame where a confirmed carrier had the ball (release frame)
+    confirmed_passer: tuple[int, sv.Detections, Carrier, int] | None = None
 
     for frame_idx, dets in detections_iter:
         transformer = transformers.get(frame_idx) if metric else None
@@ -207,51 +219,70 @@ def detect_pass_events(
         if tid < 0 or carrier.team not in (0, 1):
             continue
 
-        if last is not None:
-            last_frame, last_dets, last_carrier = last
-            last_tid = (
-                int(last_dets.tracker_id[last_carrier.index])
-                if last_dets.tracker_id is not None
-                else -1
-            )
-            gap = frame_idx - last_frame
-            if (
-                last_tid >= 0
-                and last_tid != tid
-                and last_carrier.team == carrier.team
-                and config.min_carrier_gap_frames <= gap <= config.max_pass_gap_frames
-            ):
-                travel = _ball_travel(
-                    last_carrier.ball,
-                    carrier.ball,
-                    metric=metric,
-                    transformer_from=transformers.get(last_frame),
-                    transformer_to=transformer,
-                    min_travel_m=config.min_ball_travel_m,
-                    min_travel_px=config.min_ball_travel_px,
-                )
-                min_travel = config.min_ball_travel_m if metric else config.min_ball_travel_px
-                if travel is not None and travel >= min_travel:
-                    option = scorer.option_for_receiver(
-                        last_frame, last_dets, last_carrier, tid
-                    )
-                    events.append(
-                        InferredPass(
-                            frame_idx=last_frame,
-                            passer_tid=last_tid,
-                            receiver_tid=tid,
-                            team=int(last_carrier.team),
-                            gap_frames=gap,
-                            pass_length_m=_pass_length_m(option, metric),
-                            quality_score=float(option.score) if option else 0.0,
-                            openness=float(option.openness) if option else 0.0,
-                            forward_gain=float(option.forward_gain) if option else 0.0,
-                            rivals_in_lane=int(option.rivals_in_lane) if option else 0,
-                            motion_alignment=float(option.motion_alignment) if option else 0.0,
-                            receiver_space=float(option.receiver_space) if option else 0.0,
-                        )
-                    )
+        if tid == current_candidate_tid:
+            candidate_frames += 1
+        else:
+            # New player touched the ball
+            current_candidate_tid = tid
+            candidate_frames = 1
+            candidate_first_frame = frame_idx
+            candidate_first_carrier = carrier
+            candidate_first_dets = dets
 
-        last = (frame_idx, dets, carrier)
+        from world_cup_projects.common.soccernet import ROLE_GOALKEEPER
+        role = dets.class_id[carrier.index]
+        required_frames = 1 if role == ROLE_GOALKEEPER else config.min_consecutive_possession_frames
+
+        if candidate_frames == required_frames:
+            # We confirmed possession for this player!
+            if confirmed_passer is not None:
+                p_frame, p_dets, p_carrier, p_tid = confirmed_passer
+                
+                # Gap is from the passer's LAST touch to the receiver's FIRST touch
+                gap = candidate_first_frame - p_frame
+                
+                if (
+                    p_tid != current_candidate_tid
+                    and p_carrier.team == carrier.team
+                    and config.min_carrier_gap_frames <= gap <= config.max_pass_gap_frames
+                ):
+                    travel = _ball_travel(
+                        p_carrier.ball,
+                        candidate_first_carrier.ball,
+                        metric=metric,
+                        transformer_from=transformers.get(p_frame),
+                        transformer_to=transformers.get(candidate_first_frame),
+                        min_travel_m=config.min_ball_travel_m,
+                        min_travel_px=config.min_ball_travel_px,
+                    )
+                    min_travel = config.min_ball_travel_m if metric else config.min_ball_travel_px
+                    if travel is not None and travel >= min_travel:
+                        option = scorer.option_for_receiver(
+                            p_frame, p_dets, p_carrier, current_candidate_tid
+                        )
+                        events.append(
+                            InferredPass(
+                                frame_idx=p_frame,
+                                passer_tid=p_tid,
+                                receiver_tid=current_candidate_tid,
+                                team=int(p_carrier.team),
+                                gap_frames=gap,
+                                pass_length_m=_pass_length_m(option, metric),
+                                quality_score=float(option.score) if option else 0.0,
+                                openness=float(option.openness) if option else 0.0,
+                                forward_gain=float(option.forward_gain) if option else 0.0,
+                                rivals_in_lane=int(option.rivals_in_lane) if option else 0,
+                                motion_alignment=float(option.motion_alignment) if option else 0.0,
+                                receiver_space=float(option.receiver_space) if option else 0.0,
+                            )
+                        )
+            
+            # Now that they are confirmed, they become the passer for the NEXT pass
+            confirmed_passer = (frame_idx, dets, carrier, current_candidate_tid)
+
+        elif candidate_frames > required_frames:
+            # They are still holding it. Update their "last touch" frame for accurate release timing.
+            confirmed_passer = (frame_idx, dets, carrier, current_candidate_tid)
+
 
     return events
