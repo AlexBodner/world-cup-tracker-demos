@@ -199,35 +199,75 @@ class JerseyColorTeamClassifier:
         return self.cluster_model.predict(colors)
 
 
-def assign_teams(
-    frame: np.ndarray,
-    detections: sv.Detections,
-    classifier: TeamClassifier | JerseyColorTeamClassifier,
-) -> np.ndarray:
-    """Return a ``team`` array aligned with *detections* rows."""
-    n = len(detections)
-    team = np.full(n, TEAM_NONE, dtype=int)
+def stabilize_goalkeeper_teams(
+    frames: list[tuple[int, sv.Detections]],
+    transforms: dict[int, object | None],
+    locked_goal_defenders: tuple[int, int] | None = None,
+) -> None:
+    """Mutate frames to ensure goalkeepers have stable teams and roles via tracking.
 
-    player_rows = np.flatnonzero(
-        np.isin(detections.class_id, (ROLE_PLAYER, ROLE_GOALKEEPER))
-    )
-    if len(player_rows) == 0:
-        return team
+    1. Identify tracklets that are ever detected as ROLE_GOALKEEPER.
+    2. For each, determine which goal they are closer to on average (pitch-space).
+    3. Force ROLE_GOALKEEPER and the defending team for the entire tracklet duration.
+    """
+    from world_cup_projects.common.pitch import image_to_pitch_cm
+    from world_cup_projects.common.possession import feet_xy
+    from world_cup_projects.common.soccernet import TEAM_LEFT, TEAM_RIGHT
 
-    players = detections[player_rows]
-    player_teams = classifier.predict(get_crops(frame, players))
-
-    outfield_local = players.class_id == ROLE_PLAYER
-    gk_local = players.class_id == ROLE_GOALKEEPER
-
-    if outfield_local.any() and gk_local.any():
-        outfield = players[outfield_local]
-        outfield_teams = player_teams[outfield_local]
-        gks = players[gk_local]
-        gk_teams = resolve_goalkeepers_team_id(outfield, outfield_teams, gks)
-        team[player_rows[outfield_local]] = player_teams[outfield_local]
-        team[player_rows[gk_local]] = gk_teams
+    if not locked_goal_defenders:
+        left_def, right_def = TEAM_LEFT, TEAM_RIGHT
     else:
-        team[player_rows] = player_teams
+        left_def, right_def = locked_goal_defenders
 
-    return team
+    # track_id -> list of X-positions in pitch centimeters
+    track_positions: dict[int, list[float]] = {}
+    gk_track_ids: set[int] = set()
+
+    for frame_idx, dets in frames:
+        if dets.tracker_id is None:
+            continue
+        t = transforms.get(frame_idx)
+        if t is None:
+            continue
+
+        feet = feet_xy(dets)
+        feet_cm = image_to_pitch_cm(feet, t)
+        if feet_cm is None:
+            continue
+
+        for i, tid in enumerate(dets.tracker_id):
+            tid = int(tid)
+            if tid < 0:
+                continue
+            if dets.class_id[i] == ROLE_GOALKEEPER:
+                gk_track_ids.add(tid)
+
+            if np.isfinite(feet_cm[i]).all():
+                track_positions.setdefault(tid, []).append(float(feet_cm[i, 0]))
+
+    # Determine stable team for each goalkeeper tracklet
+    stable_assignments: dict[int, int] = {}
+    pitch_mid_cm = 12000.0 / 2.0
+
+    for tid in gk_track_ids:
+        positions = track_positions.get(tid)
+        if not positions:
+            continue
+        avg_x = sum(positions) / len(positions)
+        # Fix: The original logic assigned the GK to the team *defending* the goal,
+        # but users reported it appeared inverted (GKs showing up as the opponent).
+        # We swap left_def and right_def to align the GK with their actual team colors.
+        stable_assignments[tid] = right_def if avg_x < pitch_mid_cm else left_def
+
+    # Patch frames in place
+    for _, dets in frames:
+        if dets.tracker_id is None or dets.data is None:
+            continue
+        team_array = dets.data.get("team")
+        if team_array is None:
+            continue
+        for i, tid in enumerate(dets.tracker_id):
+            tid = int(tid)
+            if tid in stable_assignments:
+                dets.class_id[i] = ROLE_GOALKEEPER
+                team_array[i] = stable_assignments[tid]

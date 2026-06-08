@@ -1,1 +1,1 @@
-"""Player speed & distance demo (metric via bbox-height or pitch homography)."""
+"""Player demos: speed/distance and pass-network interaction stats."""

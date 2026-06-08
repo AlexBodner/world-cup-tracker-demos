@@ -69,7 +69,9 @@ class SoccerPitchConfiguration:
 # Homography (vendored from sports/common/view.py)
 # --------------------------------------------------------------------------- #
 # RANSAC reprojection threshold in image pixels; rejects mis-detected pitch keypoints.
-HOMOGRAPHY_RANSAC_REPROJ_THRESH = 5.0
+HOMOGRAPHY_RANSAC_REPROJ_THRESH = 10.0
+
+
 def _find_homography_matrix(
     source: npt.NDArray,
     target: npt.NDArray,
@@ -77,12 +79,24 @@ def _find_homography_matrix(
     use_ransac: bool = True,
     ransac_thresh: float = HOMOGRAPHY_RANSAC_REPROJ_THRESH,
 ) -> npt.NDArray:
+    """Find H mapping source (image px) -> target (pitch cm).
+
+    When ``use_ransac=True``, we fit H from target -> source so the threshold
+    is in pixels, then invert. This matches roboflow/sports defaults.
+    """
     src = source.astype(np.float32)
     dst = target.astype(np.float32)
     if use_ransac and len(src) >= 4:
-        m, _ = cv2.findHomography(src, dst, cv2.RANSAC, ransacReprojThreshold=ransac_thresh)
-        if m is not None:
-            return m
+        # Fit inverse H (pitch -> image) so threshold is in pixels.
+        m_inv, _ = cv2.findHomography(
+            dst, src, cv2.RANSAC, ransacReprojThreshold=ransac_thresh
+        )
+        if m_inv is not None:
+            try:
+                return np.linalg.inv(m_inv)
+            except np.linalg.LinAlgError:
+                pass
+
     m, _ = cv2.findHomography(src, dst)
     if m is None:
         raise ValueError("Homography matrix could not be calculated.")
@@ -218,22 +232,52 @@ PITCH_CONFIG = SoccerPitchConfiguration()
 
 
 def infer_goal_defenders(
-    pitch_xy_cm: np.ndarray, teams: np.ndarray
+    pitch_xy_cm: np.ndarray, teams: np.ndarray, n_defenders: int = 3
 ) -> tuple[int, int]:
-    """Return ``(left_goal_team, right_goal_team)`` from feet on the pitch (cm)."""
-    if len(pitch_xy_cm) == 0:
-        from world_cup_projects.common.soccernet import TEAM_LEFT, TEAM_RIGHT
+    """Return ``(left_goal_team, right_goal_team)`` using defensive blocks.
 
+    Instead of team-wide averages, we look at the 'defensive block' (average of the
+    N most defensive players) for each team at both ends. We then assign teams to
+    the side where their defensive advantage margin is strongest.
+    """
+    from world_cup_projects.common.soccernet import TEAM_LEFT, TEAM_RIGHT
+
+    # 1. Filter and sort X-coordinates for each team
+    x_by_team: dict[int, np.ndarray] = {}
+    for tid in (0, 1):
+        mask = teams == tid
+        if mask.any():
+            x_by_team[tid] = np.sort(pitch_xy_cm[mask, 0])
+        else:
+            x_by_team[tid] = np.array([])
+
+    # Handle missing teams
+    if x_by_team[0].size == 0 or x_by_team[1].size == 0:
         return TEAM_LEFT, TEAM_RIGHT
-    medians: list[float] = []
-    for team_id in (0, 1):
-        mask = teams == team_id
-        medians.append(
-            float(pitch_xy_cm[mask, 0].mean()) if mask.any() else float("inf")
-        )
-    if medians[0] <= medians[1]:
+
+    # 2. Calculate Defensive Blocks (average of N most defensive players at each end)
+    # Note: For the left goal, "defensive" means lowest X. For the right, highest X.
+    def _block_avg(x_sorted: np.ndarray, side: str) -> float:
+        n = min(len(x_sorted), n_defenders)
+        if side == "left":
+            return float(x_sorted[:n].mean())
+        else:
+            return float(x_sorted[-n:].mean())
+
+    l0, r0 = _block_avg(x_by_team[0], "left"), _block_avg(x_by_team[0], "right")
+    l1, r1 = _block_avg(x_by_team[1], "left"), _block_avg(x_by_team[1], "right")
+
+    # 3. Calculate Advantage Margins
+    # left_margin > 0 means Team 0 is further left than Team 1
+    left_margin = l1 - l0
+    # right_margin > 0 means Team 1 is further right than Team 0
+    right_margin = r1 - r0
+
+    # 4. Global Handshake: Assign to the side with the stronger dominance
+    if left_margin >= right_margin:
         return 0, 1
-    return 1, 0
+    else:
+        return 1, 0
 
 
 def pitch_layout_reliable(
@@ -948,9 +992,18 @@ def _flip_pitch_x_targets(dst: np.ndarray, length: float) -> np.ndarray:
     return out
 
 
-def _mean_reproj_px(transformer: ViewTransformer, src: np.ndarray, dst: np.ndarray) -> float:
-    reproj = transformer.transform_points(src)
-    return float(np.linalg.norm(reproj - dst, axis=1).mean())
+def _mean_reproj_px(
+    transformer: ViewTransformer, src: np.ndarray, dst: np.ndarray
+) -> float:
+    """Average reprojection error in image pixels."""
+    try:
+        m_inv = np.linalg.inv(transformer.m)
+    except np.linalg.LinAlgError:
+        return float("inf")
+    # Map pitch points (dst) back to image pixels (src)
+    reshaped_dst = dst.reshape(-1, 1, 2).astype(np.float32)
+    reproj_src = cv2.perspectiveTransform(reshaped_dst, m_inv).reshape(-1, 2)
+    return float(np.linalg.norm(reproj_src - src, axis=1).mean())
 
 
 def _orientation_matches_anchor(
