@@ -132,6 +132,59 @@ def _draw_pass_highlights(
                     )
 
 
+def _draw_collaboration_web(
+    image: np.ndarray,
+    dets: sv.Detections,
+    frame_idx: int,
+    passes: tuple[InferredPass, ...],
+) -> None:
+    """Draw a dynamic network graph on the pitch representing completed passes."""
+    # 1. Aggregate connection strength for passes completed *before* this frame
+    connections: dict[tuple[int, int], dict] = {}
+    for p in passes:
+        receive_idx = p.frame_idx + p.gap_frames
+        if receive_idx <= frame_idx:
+            # Undirected link between teammates
+            pair = tuple(sorted([p.passer_tid, p.receiver_tid]))
+            if pair not in connections:
+                connections[pair] = {"count": 0, "team": p.team}
+            connections[pair]["count"] += 1
+
+    if not connections:
+        return
+
+    # 2. Draw lines for active pairs currently visible
+    overlay = image.copy()
+    max_count = max(c["count"] for c in connections.values())
+
+    for (t1, t2), data in connections.items():
+        box1 = _get_player_box(dets, t1)
+        box2 = _get_player_box(dets, t2)
+        
+        if box1 is not None and box2 is not None:
+            # Feet positions
+            p1 = (int((box1[0] + box1[2]) / 2), int(box1[3]))
+            p2 = (int((box2[0] + box2[2]) / 2), int(box2[3]))
+            
+            # Visual mapping based on interaction strength
+            count = data["count"]
+            intensity = min(count / max(max_count, 1), 1.0)
+            
+            # Base alpha 0.15 for 1 pass, scaling up to 0.6 for max passes
+            alpha = 0.15 + (intensity * 0.45)
+            # Thickness 1 to 4
+            thickness = 1 + int(intensity * 3)
+            color = _team_color(data["team"])
+            
+            # Draw line directly on the alpha-blended overlay
+            temp_overlay = image.copy()
+            cv2.line(temp_overlay, p1, p2, color, thickness, cv2.LINE_AA)
+            cv2.addWeighted(temp_overlay, alpha, overlay, 1.0 - alpha, 0, overlay)
+
+    # Blend the entire web back onto the main image
+    image[:] = overlay
+
+
 def _player_teams(network: PassNetwork) -> dict[int, int]:
     teams: dict[int, int] = {}
     for player in network.players:
@@ -360,6 +413,8 @@ def render_pass_network_demo(
 
         image = annotate_players(image, dets, show_tracker_ids=True)
         image = annotate_ball(image, dets)
+
+        _draw_collaboration_web(image, dets, frame_idx, network.passes)
 
         _draw_pass_highlights(
             image, dets, frame_idx, network.passes, sequence.frame_rate
