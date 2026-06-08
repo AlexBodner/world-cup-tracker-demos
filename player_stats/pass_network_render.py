@@ -98,12 +98,19 @@ def _draw_pass_highlights(
                     _draw_ground_highlight(image, receiver_box, color, alpha=pulse_alpha)
 
                 if passer_box is not None and receiver_box is not None:
-                    # Arrow from passer feet to interpolated ball position towards receiver feet
+                    # Arrow from passer feet to actual ball position (or interpolated if ball missing)
                     p_feet = (int((passer_box[0] + passer_box[2]) / 2), int(passer_box[3]))
                     r_feet = (int((receiver_box[0] + receiver_box[2]) / 2), int(receiver_box[3]))
                     
-                    current_tip_x = int(p_feet[0] + (r_feet[0] - p_feet[0]) * t)
-                    current_tip_y = int(p_feet[1] + (r_feet[1] - p_feet[1]) * t)
+                    from world_cup_projects.common.possession import ball_xy
+                    ball_pos = ball_xy(dets)
+                    
+                    if ball_pos is not None:
+                        current_tip_x, current_tip_y = int(ball_pos[0]), int(ball_pos[1])
+                    else:
+                        current_tip_x = int(p_feet[0] + (r_feet[0] - p_feet[0]) * t)
+                        current_tip_y = int(p_feet[1] + (r_feet[1] - p_feet[1]) * t)
+                        
                     current_tip = (current_tip_x, current_tip_y)
                     
                     # Only draw if the arrow has some length
