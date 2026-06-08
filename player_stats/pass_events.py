@@ -281,5 +281,5 @@ def detect_pass_events(
             # They are still holding it. Update their "last touch" frame for accurate release timing.
             confirmed_passer = (frame_idx, dets, carrier, current_candidate_tid)
 
-        return events
+    return events
 
