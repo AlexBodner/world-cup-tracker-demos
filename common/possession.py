@@ -83,8 +83,11 @@ def find_ball_carrier(
 
     feet_img = feet_xy(detections)[pmask]
     global_indices = np.flatnonzero(pmask)
+    roles = detections.class_id[pmask]
 
     use_pixels = transformer is None
+    dist = None
+    
     if transformer is not None:
         from world_cup_projects.common.pitch import image_to_pitch_m
 
@@ -92,16 +95,22 @@ def find_ball_carrier(
         ball_m = image_to_pitch_m(np.array([ball], dtype=np.float32), transformer)
         if feet_m is not None and ball_m is not None:
             dist = np.linalg.norm(feet_m - ball_m[0], axis=1)
-            limit = max_distance_m
+            # Relax the limit for Goalkeepers since the ball in hands projects far away
+            limit = np.full(len(dist), max_distance_m, dtype=np.float32)
+            limit[roles == ROLE_GOALKEEPER] = max_distance_m * 3.5
         else:
             use_pixels = True
 
     if use_pixels:
         dist = np.hypot(feet_img[:, 0] - ball[0], feet_img[:, 1] - ball[1])
-        limit = max_distance_px
+        limit = np.full(len(dist), max_distance_px, dtype=np.float32)
+        limit[roles == ROLE_GOALKEEPER] = max_distance_px * 2.5
+
+    if dist is None:
+        return None
 
     local = int(np.argmin(dist))
-    if dist[local] > limit:
+    if dist[local] > limit[local]:
         return None
     global_idx = int(global_indices[local])
     team = int(detections.data["team"][global_idx])

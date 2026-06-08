@@ -43,7 +43,7 @@ class PassDetectionConfig:
     """Heuristic gates for carrier-to-carrier pass inference."""
 
     min_carrier_gap_frames: int = 3
-    max_pass_gap_frames: int = 45
+    max_pass_gap_frames: int = 120
     min_ball_travel_m: float = 2.0
     min_ball_travel_px: float = 40.0
     carrier_max_distance_m: float = CARRIER_MAX_DISTANCE_M
