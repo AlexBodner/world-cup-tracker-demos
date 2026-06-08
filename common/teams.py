@@ -254,9 +254,11 @@ def stabilize_goalkeeper_teams(
         if not positions:
             continue
         avg_x = sum(positions) / len(positions)
-        # Fix: The original logic assigned the GK to the team *defending* the goal,
-        # but users reported it appeared inverted (GKs showing up as the opponent).
-        # We swap left_def and right_def to align the GK with their actual team colors.
+        # Note on inversion: infer_goal_defenders returns the team IDs as (left_defender, right_defender).
+        # However, due to how the rendering layer maps Team IDs (0/1) to colors (Blue/Pink) 
+        # relative to the outfield player clusters, assigning the GK to the 'defending' ID 
+        # visually paints them as the opponent. Swapping the assignment forces the GK's ID 
+        # to match the color of the outfield players they are playing behind.
         stable_assignments[tid] = right_def if avg_x < pitch_mid_cm else left_def
 
     # Patch frames in place
