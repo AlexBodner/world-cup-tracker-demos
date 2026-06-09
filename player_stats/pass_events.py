@@ -44,13 +44,13 @@ class PassDetectionConfig:
 
     min_carrier_gap_frames: int = 2
     max_pass_gap_frames: int = 120
-    min_ball_travel_m: float = 1.0
-    min_ball_travel_px: float = 20.0
+    min_ball_travel_m: float = 3.0
+    min_ball_travel_px: float = 40.0
     # Tightened distance to require the ball to be closer to outfield feet
     carrier_max_distance_m: float = 0.8
     carrier_max_distance_px: float = 60.0
-    # Require player to hold the ball for several frames to confirm possession
-    min_consecutive_possession_frames: int = 2
+    # Allow 1-touch passes, relying on distance/travel constraints to filter noise
+    min_consecutive_possession_frames: int = 1
 
 
 @dataclass(frozen=True)
@@ -200,6 +200,7 @@ def detect_pass_events(
     candidate_first_frame = -1
     candidate_first_carrier = None
     candidate_first_dets = None
+    missing_ball_tolerance = 0  # Allow a few frames of occlusion without dropping possession
 
     # Stores the latest frame where a confirmed carrier had the ball (release frame)
     confirmed_passer: tuple[int, sv.Detections, Carrier, int] | None = None
@@ -212,29 +213,44 @@ def detect_pass_events(
             transformer=transformer,
             max_distance_m=config.carrier_max_distance_m,
         )
+        
+        # 1. Occlusion Tolerance: Ball or Carrier missing
         if carrier is None:
+            if current_candidate_tid >= 0:
+                missing_ball_tolerance += 1
+                if missing_ball_tolerance > 3:  # Drop candidate after ~100ms of no ball
+                    current_candidate_tid = -1
+                    candidate_frames = 0
             continue
 
         tid = int(dets.tracker_id[carrier.index]) if dets.tracker_id is not None else -1
         if tid < 0 or carrier.team not in (0, 1):
             continue
 
+        # 2. Update Candidate State
         if tid == current_candidate_tid:
+            # Same player touches it again (or still has it)
             candidate_frames += 1
+            missing_ball_tolerance = 0  # Reset tolerance
         else:
             # New player touched the ball
             current_candidate_tid = tid
             candidate_frames = 1
+            missing_ball_tolerance = 0
             candidate_first_frame = frame_idx
             candidate_first_carrier = carrier
             candidate_first_dets = dets
 
+        # 3. Check for Confirmation
         from world_cup_projects.common.soccernet import ROLE_GOALKEEPER
         role = dets.class_id[carrier.index]
         required_frames = 1 if role == ROLE_GOALKEEPER else config.min_consecutive_possession_frames
 
         if candidate_frames == required_frames:
             # We confirmed possession for this player!
+            if current_candidate_tid == 20 or carrier.team == 1:
+                print(f"[DEBUG] Frame {frame_idx}: Confirmed possession for TID {current_candidate_tid} (Team {carrier.team})")
+                
             if confirmed_passer is not None:
                 p_frame, p_dets, p_carrier, p_tid = confirmed_passer
 
@@ -254,6 +270,9 @@ def detect_pass_events(
                         )
                         min_travel = config.min_ball_travel_m if metric else config.min_ball_travel_px
                         if travel is not None and travel >= min_travel:
+                            if p_tid == 20 or current_candidate_tid == 20 or carrier.team == 1:
+                                print(f"[DEBUG] ACCEPTED pass {p_tid}->{current_candidate_tid} (gap: {gap}, travel: {travel:.2f}m)")
+                                
                             option = scorer.option_for_receiver(
                                 p_frame, p_dets, p_carrier, current_candidate_tid
                             )
@@ -273,6 +292,12 @@ def detect_pass_events(
                                     receiver_space=float(option.receiver_space) if option else 0.0,
                                 )
                             )
+                        else:
+                            if p_tid == 20 or current_candidate_tid == 20 or carrier.team == 1:
+                                print(f"[DEBUG] Rejected pass {p_tid}->{current_candidate_tid} due to short travel: {travel}")
+                    else:
+                        if p_tid == 20 or current_candidate_tid == 20 or carrier.team == 1:
+                            print(f"[DEBUG] Rejected pass {p_tid}->{current_candidate_tid} due to gap: {gap} frames")
 
             # Now that they are confirmed, they become the passer for the NEXT pass
             confirmed_passer = (frame_idx, dets, carrier, current_candidate_tid)
