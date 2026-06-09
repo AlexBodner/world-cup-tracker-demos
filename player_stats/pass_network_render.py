@@ -136,15 +136,22 @@ def _draw_pass_highlights(
                     # Since we don't have the exact release frame's feet cached, we blend the current feet
                     # with the back-projected expected origin.
                     
-                    # For a smoother look, the arrow should point exactly to the ball when visible.
-                    # This prevents the arrow tip from lagging behind the live video.
+                    # Calculate expected mathematical trajectory
                     expected_x = p_feet[0] + (r_feet[0] - p_feet[0]) * t
                     expected_y = p_feet[1] + (r_feet[1] - p_feet[1]) * t
                     
                     if ball_pos is not None:
-                        # Follow the ball exactly to ensure it never lags
-                        current_tip_x = int(ball_pos[0])
-                        current_tip_y = int(ball_pos[1])
+                        # Prevent backward snapping: only use raw ball if it is at least as far 
+                        # along the path as the expected trajectory. We measure distance to receiver.
+                        dist_expected_to_recv = np.hypot(r_feet[0] - expected_x, r_feet[1] - expected_y)
+                        dist_ball_to_recv = np.hypot(r_feet[0] - ball_pos[0], r_feet[1] - ball_pos[1])
+                        
+                        if dist_ball_to_recv <= dist_expected_to_recv + 20: # 20px tolerance
+                            current_tip_x = int(ball_pos[0])
+                            current_tip_y = int(ball_pos[1])
+                        else:
+                            current_tip_x = int(expected_x)
+                            current_tip_y = int(expected_y)
                     else:
                         current_tip_x = int(expected_x)
                         current_tip_y = int(expected_y)
