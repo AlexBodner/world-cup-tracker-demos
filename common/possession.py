@@ -88,13 +88,17 @@ def find_ball_carrier(
 
     # Always calculate pixel distance as a robust fallback
     # To prevent aerial balls from triggering false possession, we heavily penalize 
-    # balls that are higher up on the screen (lower Y coordinate) than the player's feet.
+    # balls that are significantly above OR below the feet in the 2D image.
     dx = feet_img[:, 0] - ball[0]
     dy = feet_img[:, 1] - ball[1]
     
-    # If the ball is "above" the feet (dy > 0), we multiply the vertical distance penalty.
-    # This stretches the effective distance for aerial balls, preventing fly-bys.
-    dy_penalty = np.where(dy > 10, dy * 2.5, dy)
+    # If the ball is significantly displaced on the Y-axis (abs(dy) > 20px), 
+    # it is likely an aerial pass (either behind or in front of the player).
+    # We use this as a strict veto against the 3D metric projection.
+    is_aerial = np.abs(dy) > 20
+    
+    # We stretch the effective Y distance to prevent pixel-fallback fly-bys.
+    dy_penalty = np.where(np.abs(dy) > 10, dy * 2.5, dy)
     
     dist_px = np.hypot(dx, dy_penalty)
     limit_px = np.full(len(dist_px), max_distance_px, dtype=np.float32)
@@ -113,8 +117,11 @@ def find_ball_carrier(
             limit_m = np.full(len(dist_m), max_distance_m, dtype=np.float32)
             limit_m[roles == ROLE_GOALKEEPER] = max_distance_m * 3.5
             
-            # A player is valid if they pass the metric check OR the pixel check
-            valid_mask = valid_mask | (dist_m <= limit_m)
+            # A player is valid if they pass the metric check OR the pixel check.
+            # HOWEVER, if the ball is clearly aerial in 2D space, we veto the metric check
+            # because the 2D-to-3D projection assumes the ball is flat on the ground.
+            metric_valid = (dist_m <= limit_m) & ~is_aerial
+            valid_mask = valid_mask | metric_valid
             dist_to_use = dist_m
 
     if not valid_mask.any():
