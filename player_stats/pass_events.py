@@ -51,8 +51,8 @@ class PassDetectionConfig:
     # This prevents aerial passes from triggering false possession during pixel-fallback
     carrier_max_distance_m: float = 0.5
     carrier_max_distance_px: float = 35.0
-    # Allow 1-touch passes minimum, relying on robust spatial constraints to catch fly-bys
-    min_consecutive_possession_frames: int = 1
+    # Allow 2-touch passes minimum, relying on dual-distance to catch them
+    min_consecutive_possession_frames: int = 2
 
 
 
