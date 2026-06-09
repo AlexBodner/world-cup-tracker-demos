@@ -71,8 +71,9 @@ def find_ball_carrier(
 ) -> Carrier | None:
     """Nearest player to the ball, if within range (pixels or pitch meters).
 
-    When ``transformer`` is set (metric / homography path), distance is measured on the
-    pitch in meters via :func:`common.pitch.image_to_pitch_m`. Otherwise image pixels.
+    When ``transformer`` is set, we check both metric and pixel distance. A player
+    is considered a valid carrier if they are within the limit in EITHER space.
+    This prevents possession drops when homography is temporarily distorted by camera blur.
     """
     ball = ball_xy(detections)
     if ball is None:
@@ -85,33 +86,37 @@ def find_ball_carrier(
     global_indices = np.flatnonzero(pmask)
     roles = detections.class_id[pmask]
 
-    use_pixels = transformer is None
-    dist = None
-    
+    # Always calculate pixel distance as a robust fallback
+    dist_px = np.hypot(feet_img[:, 0] - ball[0], feet_img[:, 1] - ball[1])
+    limit_px = np.full(len(dist_px), max_distance_px, dtype=np.float32)
+    limit_px[roles == ROLE_GOALKEEPER] = max_distance_px * 2.5
+
+    valid_mask = dist_px <= limit_px
+    dist_to_use = dist_px
+
     if transformer is not None:
         from world_cup_projects.common.pitch import image_to_pitch_m
 
         feet_m = image_to_pitch_m(feet_img, transformer)
         ball_m = image_to_pitch_m(np.array([ball], dtype=np.float32), transformer)
         if feet_m is not None and ball_m is not None:
-            dist = np.linalg.norm(feet_m - ball_m[0], axis=1)
-            # Relax the limit for Goalkeepers since the ball in hands projects far away
-            limit = np.full(len(dist), max_distance_m, dtype=np.float32)
-            limit[roles == ROLE_GOALKEEPER] = max_distance_m * 3.5
-        else:
-            use_pixels = True
+            dist_m = np.linalg.norm(feet_m - ball_m[0], axis=1)
+            limit_m = np.full(len(dist_m), max_distance_m, dtype=np.float32)
+            limit_m[roles == ROLE_GOALKEEPER] = max_distance_m * 3.5
+            
+            # A player is valid if they pass the metric check OR the pixel check
+            valid_mask = valid_mask | (dist_m <= limit_m)
+            dist_to_use = dist_m
 
-    if use_pixels:
-        dist = np.hypot(feet_img[:, 0] - ball[0], feet_img[:, 1] - ball[1])
-        limit = np.full(len(dist), max_distance_px, dtype=np.float32)
-        limit[roles == ROLE_GOALKEEPER] = max_distance_px * 2.5
-
-    if dist is None:
+    if not valid_mask.any():
         return None
 
-    local = int(np.argmin(dist))
-    if dist[local] > limit[local]:
-        return None
+    # Find the closest player among the valid candidates
+    # We use dist_to_use (metric if available, else px) to pick the 'closest'
+    # We set invalid players to infinity so they aren't chosen
+    dist_to_use[~valid_mask] = float('inf')
+    local = int(np.argmin(dist_to_use))
+    
     global_idx = int(global_indices[local])
     team = int(detections.data["team"][global_idx])
-    return Carrier(global_idx, team, float(dist[local]), ball)
+    return Carrier(global_idx, team, float(dist_to_use[local]), ball)
