@@ -451,6 +451,7 @@ def render_pass_network_demo(
             image = np.full((sequence.height, sequence.width, 3), 30, np.uint8)
 
         # Pre-define transformers for this frame
+        kps = frame_keypoints.get(frame_idx) if frame_keypoints is not None else None
         transformer = (
             frame_transforms.get(frame_idx) if frame_transforms is not None else None
         )
@@ -485,17 +486,51 @@ def render_pass_network_demo(
             if carrier is not None:
                 options = scorer.top_options(frame_idx, dets, carrier, k=3)
                 
-                # Cinematic Freeze & Reveal
-                for revealed in range(1, len(options) + 1):
-                    for step in range(reveal_frames):
-                        progress = (step + 1) / reveal_frames
-                        # Dimming effect
-                        dim = (image.astype(np.float32) * 0.4).astype(np.uint8)
-                        # Draw corridors
-                        dim = draw_pass_corridors_on_frame(dim, options[:revealed], radar_transformer)
-                        # HUD
-                        dim = draw_hud_bar(dim, f"PREDICTING PASS - {RANK_LABELS[revealed-1]}")
-                        writer.write(dim)
+                # Cinematic Freeze & Reveal (using original Pass Alternatives styling)
+                from world_cup_projects.pass_alternatives.render import _draw_pass_overlay, PassEvent
+                
+                # Create a mock PassEvent for the renderer
+                freeze_event = PassEvent(
+                    frame_idx=frame_idx,
+                    carrier=carrier,
+                    options=options,
+                    top_score=options[0].score if options else 0.0,
+                )
+                
+                n_options = min(3, len(options))
+                reveal_frames = max(4, int(round(0.6 * sequence.frame_rate))) # 0.6 seconds per option
+                
+                phases: list[tuple[int, int]] = [(0, reveal_frames)]
+                phases.extend((i, reveal_frames) for i in range(1, n_options + 1))
+                
+                # Extra hold at the end
+                min_freeze = sum(h for _, h in phases)
+                extra_hold = max(0, int(round(2.5 * sequence.frame_rate)) - min_freeze)
+                final_extra = max(4, int(round(1.0 * sequence.frame_rate)))
+                if phases:
+                    phases[-1] = (phases[-1][0], phases[-1][1] + extra_hold + final_extra)
+
+                for revealed, phase_hold in phases:
+                    for step in range(phase_hold):
+                        progress = (step + 1) / max(phase_hold, 1)
+                        # We pass `image` because `_draw_pass_overlay` dims it internally
+                        overlay = _draw_pass_overlay(
+                            image,
+                            dets,
+                            freeze_event,
+                            revealed_options=revealed,
+                            reveal_progress=progress,
+                            weights=scorer._weights,
+                            metric=metric,
+                            keypoints=kps,
+                            pitch_confidence=pitch_confidence,
+                            transformer=radar_transformer,
+                            show_lane_debug=metric and kps is not None,
+                            show_radar=show_radar,
+                            locked_goal_defenders=locked_goals,
+                            debug_pitch_keypoints=debug_pitch_keypoints,
+                        )
+                        writer.write(overlay)
 
         # 5. Metadata/Debug
         if metric and transformer is None and frame_transforms is not None:
