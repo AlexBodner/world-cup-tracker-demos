@@ -151,6 +151,12 @@ def main() -> None:
         action="store_true",
         help="Overlay real-time pass alternatives (predictions) alongside the pass network.",
     )
+    parser.add_argument(
+        "--freeze-quality-threshold",
+        type=float,
+        default=0.0,
+        help="Only freeze for passes with quality score above this threshold.",
+    )
     args = parser.parse_args()
 
     if args.video:
@@ -246,6 +252,7 @@ def main() -> None:
             debug_pitch_keypoints=args.debug_pitch_keypoints,
             scorer=scorer,
             show_predictions=args.show_predictions,
+            freeze_quality_threshold=args.freeze_quality_threshold,
         )
         manifest["video"] = render_manifest["output"]
         json_path.write_text(json.dumps(manifest, indent=2))

@@ -429,6 +429,7 @@ def render_pass_network_demo(
     debug_pitch_keypoints: bool = False,
     scorer: PassQualityScorer | None = None,
     show_predictions: bool = False,
+    freeze_quality_threshold: float = 0.0,
 ) -> dict:
     """Render tracked clip plus a stats end-card."""
     locked_goals: tuple[int, int] | None = None
@@ -472,7 +473,12 @@ def render_pass_network_demo(
         )
 
         # 4. Predictive Freeze (If applicable)
-        if show_predictions and scorer is not None and frame_idx in events_by_frame:
+        if (
+            show_predictions 
+            and scorer is not None 
+            and frame_idx in events_by_frame 
+            and events_by_frame[frame_idx].quality_score >= freeze_quality_threshold
+        ):
             event = events_by_frame[frame_idx]
             from world_cup_projects.common.possession import find_ball_carrier
             carrier = find_ball_carrier(dets, transformer=radar_transformer)
