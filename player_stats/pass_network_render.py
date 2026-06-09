@@ -449,6 +449,16 @@ def render_pass_network_demo(
         if image is None:
             image = np.full((sequence.height, sequence.width, 3), 30, np.uint8)
 
+        # Pre-define transformers for this frame
+        transformer = (
+            frame_transforms.get(frame_idx) if frame_transforms is not None else None
+        )
+        radar_transformer = (
+            frame_radar_transforms.get(frame_idx)
+            if frame_radar_transforms is not None
+            else transformer
+        )
+
         # 1. Base Annotations
         image = annotate_players(image, dets, show_tracker_ids=True)
         image = annotate_ball(image, dets)
