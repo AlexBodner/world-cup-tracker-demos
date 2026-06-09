@@ -497,11 +497,11 @@ def render_radar_simple(
         TEAM_RIGHT,
     )
 
-    t = homography_from_keypoints_simple(
-        keypoints, config=config, confidence=confidence
-    )
-    if t is None and transformer is not None:
-        t = transformer
+    t = transformer
+    if t is None:
+        t = homography_from_keypoints_simple(
+            keypoints, config=config, confidence=confidence
+        )
     if t is None:
         return None
 
