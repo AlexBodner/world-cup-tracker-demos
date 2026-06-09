@@ -46,9 +46,10 @@ class PassDetectionConfig:
     max_pass_gap_frames: int = 120
     min_ball_travel_m: float = 3.0
     min_ball_travel_px: float = 40.0
-    # Tightened distance to require the ball to be closer to outfield feet
-    carrier_max_distance_m: float = 0.8
-    carrier_max_distance_px: float = 60.0
+    # Tightened distance to require the ball to be extremely close to outfield feet
+    # This prevents aerial passes from triggering false possession during pixel-fallback
+    carrier_max_distance_m: float = 0.5
+    carrier_max_distance_px: float = 25.0
     # Allow 2-touch passes minimum, relying on dual-distance to catch them
     min_consecutive_possession_frames: int = 2
 
