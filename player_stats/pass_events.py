@@ -50,9 +50,10 @@ class PassDetectionConfig:
     # Tightened distance to require the ball to be extremely close to outfield feet
     # This prevents aerial passes from triggering false possession during pixel-fallback
     carrier_max_distance_m: float = 0.5
-    carrier_max_distance_px: float = 25.0
-    # Allow 2-touch passes minimum, relying on dual-distance to catch them
-    min_consecutive_possession_frames: int = 2
+    carrier_max_distance_px: float = 35.0
+    # Allow 1-touch passes minimum, relying on robust spatial constraints to catch fly-bys
+    min_consecutive_possession_frames: int = 1
+
 
 
 @dataclass(frozen=True)
@@ -304,10 +305,18 @@ def detect_pass_events(
             continue
 
         # 2. Update Candidate State
+        from world_cup_projects.common.soccernet import ROLE_GOALKEEPER
+        role = dets.class_id[carrier.index]
+        required_frames = 1 if role == ROLE_GOALKEEPER else config.min_consecutive_possession_frames
+
         if tid == current_candidate_tid:
             # Same player touches it again (or still has it)
-            # Allow possession counter to increment if it was paused by occlusion
-            candidate_frames += 1 + missing_ball_tolerance
+            if missing_ball_tolerance > 0 and candidate_frames < required_frames:
+                # Possession was broken before being confirmed; restart the consecutive count.
+                candidate_frames = 1
+            else:
+                # Allow possession counter to increment if it was paused by occlusion
+                candidate_frames += 1 + missing_ball_tolerance
             missing_ball_tolerance = 0  # Reset tolerance
         else:
             # New player touched the ball
@@ -319,10 +328,6 @@ def detect_pass_events(
             candidate_first_dets = dets
 
         # 3. Check for Confirmation
-        from world_cup_projects.common.soccernet import ROLE_GOALKEEPER
-        role = dets.class_id[carrier.index]
-        required_frames = 1 if role == ROLE_GOALKEEPER else config.min_consecutive_possession_frames
-
         if candidate_frames >= required_frames and (candidate_frames - missing_ball_tolerance) <= required_frames:
             # We confirmed possession for this player on this exact frame!
             if confirmed_passer is not None:
