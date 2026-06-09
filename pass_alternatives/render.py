@@ -73,7 +73,7 @@ from world_cup_projects.pass_alternatives.pass_options import (
     top_pass_options,
 )
 
-RANK_COLORS_BGR = [(80, 220, 60), (40, 220, 240), (40, 140, 255)]
+RANK_COLORS_BGR = [(80, 220, 60), (0, 215, 255), (40, 140, 255)]
 RANK_LABELS = ["BEST", "2ND", "3RD"]
 
 # Cinematic slowdown before each freeze, then staggered pass-line reveals.
@@ -685,7 +685,7 @@ def _draw_pass_overlay(
         )
         radar = render_radar_simple(
             dets,
-            keypoints,
+            None,  # Force use of transformer to maintain orientation lock
             confidence=pitch_confidence,
             transformer=transformer,
             locked_goal_defenders=locked_goal_defenders,
