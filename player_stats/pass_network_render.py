@@ -97,8 +97,12 @@ def _draw_pass_highlights(
     frame_idx: int,
     passes: tuple[InferredPass, ...],
     frame_rate: float,
+    frame_keypoints: dict | None = None,
+    frame_transforms: dict | None = None,
 ) -> None:
     """Highlight active passes: pulse passer/receiver and draw the lane arrow."""
+    from world_cup_projects.common.possession import ball_xy
+    
     for p in passes:
         # Window: from release frame to 0.5s after reception
         receive_idx = p.frame_idx + p.gap_frames
@@ -121,25 +125,41 @@ def _draw_pass_highlights(
                 if receiver_box is not None:
                     _draw_ground_highlight(image, receiver_box, color, alpha=pulse_alpha)
 
+                # Smooth the arrow by fixing the origin if possible
                 if passer_box is not None and receiver_box is not None:
-                    # Arrow from passer feet to actual ball position (or interpolated if ball missing)
                     p_feet = (int((passer_box[0] + passer_box[2]) / 2), int(passer_box[3]))
                     r_feet = (int((receiver_box[0] + receiver_box[2]) / 2), int(receiver_box[3]))
                     
-                    from world_cup_projects.common.possession import ball_xy
                     ball_pos = ball_xy(dets)
                     
+                    # To reduce shaking from bounding box vibration, we interpolate the origin heavily
+                    # Since we don't have the exact release frame's feet cached, we blend the current feet
+                    # with the back-projected expected origin.
+                    
+                    # For a smoother look, the arrow should point to the ball
+                    # We interpolate the tip heavily towards the ball position to hide detection jitter
+                    expected_x = p_feet[0] + (r_feet[0] - p_feet[0]) * t
+                    expected_y = p_feet[1] + (r_feet[1] - p_feet[1]) * t
+                    
                     if ball_pos is not None:
-                        current_tip_x, current_tip_y = int(ball_pos[0]), int(ball_pos[1])
+                        # 60% real ball, 40% expected trajectory to dampen noise
+                        current_tip_x = int(ball_pos[0] * 0.6 + expected_x * 0.4)
+                        current_tip_y = int(ball_pos[1] * 0.6 + expected_y * 0.4)
                     else:
-                        current_tip_x = int(p_feet[0] + (r_feet[0] - p_feet[0]) * t)
-                        current_tip_y = int(p_feet[1] + (r_feet[1] - p_feet[1]) * t)
+                        current_tip_x = int(expected_x)
+                        current_tip_y = int(expected_y)
                         
+                    # Dampen the origin (passer feet) so it doesn't vibrate as much
+                    # As t increases, we rely more on the mathematical line between the current feet
+                    damped_origin_x = int(p_feet[0] * (1-t) + (current_tip_x - (r_feet[0]-p_feet[0])*t) * t)
+                    damped_origin_y = int(p_feet[1] * (1-t) + (current_tip_y - (r_feet[1]-p_feet[1])*t) * t)
+                    damped_origin = (damped_origin_x, damped_origin_y)
                     current_tip = (current_tip_x, current_tip_y)
                     
                     # Only draw if the arrow has some length
-                    if np.hypot(current_tip_x - p_feet[0], current_tip_y - p_feet[1]) > 5:
-                        draw_glow_arrow(image, p_feet, current_tip, color, alpha=0.8)
+                    if np.hypot(current_tip_x - damped_origin_x, current_tip_y - damped_origin_y) > 5:
+                        # Lower alpha to make it less invasive (0.35 instead of 0.8)
+                        draw_glow_arrow(image, damped_origin, current_tip, color, alpha=0.35)
 
             elif frame_idx <= end_idx:
                 # 2. Reception Phase: Twinkle 2 times, arrow removed
