@@ -87,7 +87,16 @@ def find_ball_carrier(
     roles = detections.class_id[pmask]
 
     # Always calculate pixel distance as a robust fallback
-    dist_px = np.hypot(feet_img[:, 0] - ball[0], feet_img[:, 1] - ball[1])
+    # To prevent aerial balls from triggering false possession, we heavily penalize 
+    # balls that are higher up on the screen (lower Y coordinate) than the player's feet.
+    dx = feet_img[:, 0] - ball[0]
+    dy = feet_img[:, 1] - ball[1]
+    
+    # If the ball is "above" the feet (dy > 0), we multiply the vertical distance penalty.
+    # This stretches the effective distance for aerial balls, preventing fly-bys.
+    dy_penalty = np.where(dy > 10, dy * 2.5, dy)
+    
+    dist_px = np.hypot(dx, dy_penalty)
     limit_px = np.full(len(dist_px), max_distance_px, dtype=np.float32)
     limit_px[roles == ROLE_GOALKEEPER] = max_distance_px * 2.5
 
