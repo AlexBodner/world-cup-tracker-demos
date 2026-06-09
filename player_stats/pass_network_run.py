@@ -80,31 +80,16 @@ def analyze_pass_network(
     frames: list[tuple[int, object]],
     *,
     metric: bool,
-    max_frames: int | None,
-    device: str,
-    pitch_confidence: float,
+    scorer: PassQualityScorer,
     config: PassDetectionConfig,
 ) -> PassNetwork:
     """Infer passes from materialized detections and build a collaboration snapshot."""
-    transformers = (
-        _pitch_transformers(
-            sequence,
-            max_frames=max_frames,
-            device=device,
-            pitch_confidence=pitch_confidence,
-        )
-        if metric
-        else {}
-    )
-    weights = PassWeights.metric() if metric else PassWeights()
-    scorer = PassQualityScorer(weights=weights, metric=metric, transformers=transformers)
-
     events = detect_pass_events(
         iter(frames),
         scorer=scorer,
         config=config,
         metric=metric,
-        transformers=transformers,
+        transformers=scorer._transformers,
     )
     return build_pass_network(sequence.name, events, metric=metric)
 
@@ -161,6 +146,11 @@ def main() -> None:
         action="store_true",
         help="Draw pitch keypoints on video + radar (green=used, red=rejected).",
     )
+    parser.add_argument(
+        "--show-predictions",
+        action="store_true",
+        help="Overlay real-time pass alternatives (predictions) alongside the pass network.",
+    )
     args = parser.parse_args()
 
     if args.video:
@@ -215,13 +205,14 @@ def main() -> None:
             locked_goals = warmup_goal_defenders(pitch_tracker, frames, frame_transforms)
             stabilize_goalkeeper_teams(frames, frame_transforms, locked_goals)
 
+    weights = PassWeights.metric() if args.metric else PassWeights()
+    scorer = PassQualityScorer(weights=weights, metric=args.metric, transformers=frame_transforms)
+
     network = analyze_pass_network(
         sequence,
         frames,
         metric=args.metric,
-        max_frames=args.max_frames,
-        device=args.device,
-        pitch_confidence=args.pitch_confidence,
+        scorer=scorer,
         config=config,
     )
     manifest = network.to_dict()
@@ -253,6 +244,8 @@ def main() -> None:
             pitch_tracker=pitch_tracker,
             stats_seconds=args.stats_seconds,
             debug_pitch_keypoints=args.debug_pitch_keypoints,
+            scorer=scorer,
+            show_predictions=args.show_predictions,
         )
         manifest["video"] = render_manifest["output"]
         json_path.write_text(json.dumps(manifest, indent=2))

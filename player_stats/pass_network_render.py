@@ -22,7 +22,11 @@ from world_cup_projects.common.visual import (
     draw_radar_minimap,
     draw_text_shadow,
 )
-from world_cup_projects.player_stats.pass_events import InferredPass
+from world_cup_projects.pass_alternatives.lane_visual import (
+    draw_blocking_rivals_on_frame,
+    draw_pass_corridors_on_frame,
+)
+from world_cup_projects.player_stats.pass_events import InferredPass, PassQualityScorer
 from world_cup_projects.player_stats.pass_network import PassNetwork
 
 TEAM_COLORS_BGR = [c.as_bgr() for c in TEAM_COLORS[:2]]
@@ -403,6 +407,8 @@ def render_pass_network_demo(
     pitch_tracker=None,
     stats_seconds: float = 5.0,
     debug_pitch_keypoints: bool = False,
+    scorer: PassQualityScorer | None = None,
+    show_predictions: bool = False,
 ) -> dict:
     """Render tracked clip plus a stats end-card."""
     locked_goals: tuple[int, int] | None = None
@@ -419,8 +425,32 @@ def render_pass_network_demo(
         if image is None:
             image = np.full((sequence.height, sequence.width, 3), 30, np.uint8)
 
+        kps = frame_keypoints.get(frame_idx) if frame_keypoints is not None else None
+        transformer = (
+            frame_transforms.get(frame_idx) if frame_transforms is not None else None
+        )
+        radar_transformer = (
+            frame_radar_transforms.get(frame_idx)
+            if frame_radar_transforms is not None
+            else transformer
+        )
+
         image = annotate_players(image, dets, show_tracker_ids=True)
         image = annotate_ball(image, dets)
+
+        if show_predictions and scorer is not None:
+            from world_cup_projects.common.possession import find_ball_carrier
+            carrier = find_ball_carrier(
+                dets,
+                transformer=transformer,
+            )
+            if carrier is not None:
+                options = scorer.top_options(frame_idx, dets, carrier, k=3)
+                if options and transformer is not None:
+                    image = draw_pass_corridors_on_frame(image, options, transformer)
+                    image = draw_blocking_rivals_on_frame(
+                        image, options, feet_xy=feet_xy(dets)
+                    )
 
         _draw_collaboration_web(image, dets, frame_idx, network.passes)
 
@@ -428,14 +458,6 @@ def render_pass_network_demo(
             image, dets, frame_idx, network.passes, sequence.frame_rate
         )
 
-        kps = frame_keypoints.get(frame_idx) if frame_keypoints is not None else None
-        transformer = (
-            frame_transforms.get(frame_idx) if frame_transforms is not None else None
-        )
-        radar_transformer = (
-            frame_radar_transforms.get(frame_idx) if frame_radar_transforms is not None else transformer
-        )
-        
         # Display a warning if homography failed and we rolled back to pixels
         if metric and transformer is None and frame_transforms is not None:
             draw_text_shadow(

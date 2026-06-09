@@ -33,6 +33,7 @@ from world_cup_projects.pass_alternatives.pass_options import (
     PassOption,
     PassWeights,
     score_pass_options,
+    top_pass_options,
 )
 
 DetectionIterator = Iterator[tuple[int, sv.Detections]]
@@ -88,6 +89,58 @@ class PassQualityScorer:
         self._weights = weights
         self._metric = metric
         self._transformers = transformers or {}
+
+    def top_options(
+        self,
+        frame_idx: int,
+        dets: sv.Detections,
+        carrier: Carrier,
+        k: int = 3,
+    ) -> list[PassOption]:
+        """Return the top K pass options for the current carrier."""
+        motion_dir = None
+        if self._weights.use_carrier_motion:
+            transformer = self._transformers.get(frame_idx)
+            motion_dir = carrier_kalman_direction(
+                dets,
+                carrier.index,
+                transformer=transformer if self._metric else None,
+            )
+
+        transformer = self._transformers.get(frame_idx)
+        if self._metric and transformer is not None:
+            feet_img = feet_xy(dets)
+            pitch_feet = image_to_pitch_m(feet_img, transformer)
+            pitch_cm = image_to_pitch_cm(feet_img, transformer)
+            body_pitch_m = image_to_pitch_m(bbox_center_xy(dets), transformer)
+            if pitch_feet is None or pitch_cm is None:
+                return []
+            attack_dir = pitch_attack_direction(
+                dets,
+                carrier.team,
+                transformer,
+                player_mask_fn=player_mask,
+                feet_fn=feet_xy,
+            )
+            return top_pass_options(
+                dets,
+                carrier,
+                k=k,
+                weights=self._weights,
+                attack_dir=attack_dir,
+                positions=pitch_feet,
+                carrier_motion_dir=motion_dir,
+                pitch_cm=pitch_cm,
+                body_pitch_m=body_pitch_m,
+            )
+        else:
+            return top_pass_options(
+                dets,
+                carrier,
+                k=k,
+                weights=self._weights,
+                carrier_motion_dir=motion_dir,
+            )
 
     def option_for_receiver(
         self,
