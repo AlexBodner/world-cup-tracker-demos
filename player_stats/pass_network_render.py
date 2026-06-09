@@ -25,11 +25,31 @@ from world_cup_projects.common.visual import (
 from world_cup_projects.pass_alternatives.lane_visual import (
     draw_blocking_rivals_on_frame,
     draw_pass_corridors_on_frame,
+    draw_pass_lane_legend,
+)
+from world_cup_projects.common.visual import (
+    ROBOFLOW_PURPLE_BGR,
+    TEAM_COLORS,
+    annotate_ball,
+    annotate_players,
+    draw_branding_tag,
+    draw_carrier_pulse,
+    draw_carrier_spotlight,
+    draw_glow_arrow,
+    draw_hud_bar,
+    draw_pass_analysis_panel,
+    draw_pitch_keypoints_debug,
+    draw_radar_minimap,
+    draw_score_chip,
+    draw_text_shadow,
+    ease_out_cubic,
 )
 from world_cup_projects.player_stats.pass_events import InferredPass, PassQualityScorer
 from world_cup_projects.player_stats.pass_network import PassNetwork
 
 TEAM_COLORS_BGR = [c.as_bgr() for c in TEAM_COLORS[:2]]
+RANK_COLORS_BGR = [(80, 220, 60), (40, 220, 240), (40, 140, 255)]
+RANK_LABELS = ["BEST", "2ND", "3RD"]
 NEUTRAL_BGR = (200, 200, 200)
 
 
@@ -420,86 +440,52 @@ def render_pass_network_demo(
         out_path, fourcc, sequence.frame_rate, (sequence.width, sequence.height)
     )
 
+    # Pre-map events for fast lookup
+    events_by_frame = {e.frame_idx: e for e in network.passes}
+    reveal_frames = 15 # Staggered reveal speed
+
     for frame_idx, dets in frames:
         image = frame_loader(frame_idx)
         if image is None:
             image = np.full((sequence.height, sequence.width, 3), 30, np.uint8)
 
-        kps = frame_keypoints.get(frame_idx) if frame_keypoints is not None else None
-        transformer = (
-            frame_transforms.get(frame_idx) if frame_transforms is not None else None
-        )
-        radar_transformer = (
-            frame_radar_transforms.get(frame_idx)
-            if frame_radar_transforms is not None
-            else transformer
-        )
-
+        # 1. Base Annotations
         image = annotate_players(image, dets, show_tracker_ids=True)
         image = annotate_ball(image, dets)
 
-        if show_predictions and scorer is not None:
-            from world_cup_projects.common.possession import find_ball_carrier
-            carrier = find_ball_carrier(
-                dets,
-                transformer=transformer,
-            )
-            if carrier is not None:
-                options = scorer.top_options(frame_idx, dets, carrier, k=3)
-                if options and transformer is not None:
-                    image = draw_pass_corridors_on_frame(image, options, transformer)
-                    image = draw_blocking_rivals_on_frame(
-                        image, options, feet_xy=feet_xy(dets)
-                    )
-
+        # 2. Historical Network (Collaboration Web)
         _draw_collaboration_web(image, dets, frame_idx, network.passes)
 
+        # 3. Active Pass Events (Highlights + Arrow)
         _draw_pass_highlights(
             image, dets, frame_idx, network.passes, sequence.frame_rate
         )
 
-        # Display a warning if homography failed and we rolled back to pixels
+        # 4. Predictive Freeze (If applicable)
+        if show_predictions and scorer is not None and frame_idx in events_by_frame:
+            event = events_by_frame[frame_idx]
+            from world_cup_projects.common.possession import find_ball_carrier
+            carrier = find_ball_carrier(dets, transformer=radar_transformer)
+            if carrier is not None:
+                options = scorer.top_options(frame_idx, dets, carrier, k=3)
+                
+                # Cinematic Freeze & Reveal
+                for revealed in range(1, len(options) + 1):
+                    for step in range(reveal_frames):
+                        progress = (step + 1) / reveal_frames
+                        # Dimming effect
+                        dim = (image.astype(np.float32) * 0.4).astype(np.uint8)
+                        # Draw corridors
+                        dim = draw_pass_corridors_on_frame(dim, options[:revealed], radar_transformer)
+                        # HUD
+                        dim = draw_hud_bar(dim, f"PREDICTING PASS - {RANK_LABELS[revealed-1]}")
+                        writer.write(dim)
+
+        # 5. Metadata/Debug
         if metric and transformer is None and frame_transforms is not None:
-            draw_text_shadow(
-                image,
-                "WARNING: Poor Pitch Detection (Metric Fallback to Pixels)",
-                (20, 40),
-                font_scale=0.6,
-                color_bgr=(50, 50, 255),  # Red
-                thickness=2,
-            )
-
-        if pitch_tracker is not None and transformer is not None and locked_goals is None:
-            omask = dets.class_id == ROLE_PLAYER
-            if omask.any():
-                pitch_m = image_to_pitch_m(feet_xy(dets)[omask], transformer)
-                if pitch_m is not None:
-                    teams = dets.data.get("team", np.zeros(len(dets), dtype=int))[omask]
-                    if pitch_tracker.register_reliable_goal_vote(pitch_m, teams):
-                        locked_goals = pitch_tracker.locked_goal_defenders
-
-        if debug_pitch_keypoints and kps is not None:
-            image = draw_pitch_keypoints_debug(
-                image, kps, confidence_threshold=pitch_confidence
-            )
-
-        if show_radar and metric and kps is not None and radar_transformer is not None:
-            image = draw_radar_minimap(
-                image,
-                dets,
-                kps,
-                pitch_confidence=pitch_confidence,
-                transformer=radar_transformer,
-                locked_goal_defenders=locked_goals,
-                debug_keypoints=debug_pitch_keypoints,
-            )
-
-        title = (
-            "PASS NETWORK  |  PITCH KP DEBUG"
-            if debug_pitch_keypoints
-            else "PASS NETWORK"
-        )
-        image = draw_hud_bar(image, title)
+            draw_text_shadow(image, "WARNING: Poor Pitch Detection", (20, 40), font_scale=0.6, color_bgr=(50, 50, 255), thickness=2)
+        
+        image = draw_hud_bar(image, "PASS NETWORK")
         image = draw_branding_tag(image)
         writer.write(image)
 
