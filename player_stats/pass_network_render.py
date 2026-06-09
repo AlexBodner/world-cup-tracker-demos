@@ -444,7 +444,7 @@ def render_pass_network_demo(
     frame_radar_transforms: dict | None = None,
     frame_keypoints: dict | None = None,
     pitch_confidence: float = 0.99,
-    pitch_tracker=None,
+    locked_goal_defenders: tuple[int, int] | None = None,
     stats_seconds: float = 5.0,
     debug_pitch_keypoints: bool = False,
     scorer: PassQualityScorer | None = None,
@@ -452,10 +452,6 @@ def render_pass_network_demo(
     freeze_quality_threshold: float = 0.0,
 ) -> dict:
     """Render tracked clip plus a stats end-card."""
-    locked_goals: tuple[int, int] | None = None
-    if pitch_tracker is not None and frame_transforms is not None:
-        locked_goals = warmup_goal_defenders(pitch_tracker, frames, frame_transforms)
-
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(
         out_path, fourcc, sequence.frame_rate, (sequence.width, sequence.height)
@@ -547,7 +543,7 @@ def render_pass_network_demo(
                             transformer=radar_transformer,
                             show_lane_debug=metric and kps is not None,
                             show_radar=show_radar,
-                            locked_goal_defenders=locked_goals,
+                            locked_goal_defenders=locked_goal_defenders,
                             debug_pitch_keypoints=debug_pitch_keypoints,
                         )
                         writer.write(overlay)
@@ -555,6 +551,17 @@ def render_pass_network_demo(
         # 5. Metadata/Debug
         if metric and transformer is None and frame_transforms is not None:
             draw_text_shadow(image, "WARNING: Poor Pitch Detection", (20, 40), font_scale=0.6, color_bgr=(50, 50, 255), thickness=2)
+            
+        if show_radar and metric and kps is not None and radar_transformer is not None:
+            image = draw_radar_minimap(
+                image,
+                dets,
+                kps,
+                pitch_confidence=pitch_confidence,
+                transformer=radar_transformer,
+                locked_goal_defenders=locked_goal_defenders,
+                debug_keypoints=debug_pitch_keypoints,
+            )
         
         image = draw_hud_bar(image, "PASS NETWORK")
         image = draw_branding_tag(image)

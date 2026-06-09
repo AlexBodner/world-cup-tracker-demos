@@ -194,21 +194,55 @@ def main() -> None:
         )
         from world_cup_projects.common.teams import stabilize_goalkeeper_teams
 
-        for frame_idx, speed_t, radar_t, kps, tracker in iter_pitch_transformers(
-            sequence,
-            device=args.device,
-            end=end,
-            confidence=args.pitch_confidence,
-            yield_keypoints=True,
-            yield_tracker=True,
-        ):
-            frame_transforms[frame_idx] = speed_t
-            frame_radar_transforms[frame_idx] = radar_t
-            frame_keypoints[frame_idx] = kps
-            pitch_tracker = tracker
+        # Check for cached pitch data
+        cache_dir = Path(".cache/pitch")
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_name = f"{sequence.name}_{args.device}_{end}_{args.pitch_confidence}.pkl"
+        cache_path = cache_dir / cache_name
+
+        if not args.refresh_detections_cache and cache_path.exists():
+            import pickle
+            with open(cache_path, "rb") as f:
+                cached_data = pickle.load(f)
+                frame_transforms = cached_data["transforms"]
+                frame_radar_transforms = cached_data["radar_transforms"]
+                frame_keypoints = cached_data["keypoints"]
+                locked_goals = cached_data.get("locked_goals")
+            print(f"Loaded cached pitch homography: {cache_path.name}")
+        else:
+            print(f"Running pitch homography model (will cache to {cache_path.name})...")
+            for frame_idx, speed_t, radar_t, kps, tracker in iter_pitch_transformers(
+                sequence,
+                device=args.device,
+                end=end,
+                confidence=args.pitch_confidence,
+                yield_keypoints=True,
+                yield_tracker=True,
+            ):
+                frame_transforms[frame_idx] = speed_t
+                frame_radar_transforms[frame_idx] = radar_t
+                frame_keypoints[frame_idx] = kps
+                pitch_tracker = tracker
+            
+            locked_goals = None
+            if args.source in ("football", "rfdetr"):
+                locked_goals = warmup_goal_defenders(pitch_tracker, frames, frame_transforms)
+
+            # Save to cache
+            import pickle
+            with open(cache_path, "wb") as f:
+                pickle.dump(
+                    {
+                        "transforms": frame_transforms,
+                        "radar_transforms": frame_radar_transforms,
+                        "keypoints": frame_keypoints,
+                        "locked_goals": locked_goals,
+                    },
+                    f,
+                )
+            print(f"Wrote pitch cache: {cache_path}")
 
         if args.source in ("football", "rfdetr"):
-            locked_goals = warmup_goal_defenders(pitch_tracker, frames, frame_transforms)
             stabilize_goalkeeper_teams(frames, frame_transforms, locked_goals)
 
     weights = PassWeights.metric() if args.metric else PassWeights()
@@ -247,7 +281,7 @@ def main() -> None:
             frame_radar_transforms=frame_radar_transforms,
             frame_keypoints=frame_keypoints,
             pitch_confidence=args.pitch_confidence,
-            pitch_tracker=pitch_tracker,
+            locked_goal_defenders=locked_goals,
             stats_seconds=args.stats_seconds,
             debug_pitch_keypoints=args.debug_pitch_keypoints,
             scorer=scorer,
