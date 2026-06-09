@@ -49,8 +49,8 @@ class PassDetectionConfig:
     # Tightened distance to require the ball to be closer to outfield feet
     carrier_max_distance_m: float = 0.8
     carrier_max_distance_px: float = 60.0
-    # Allow 1-touch passes, relying on distance/travel constraints to filter noise
-    min_consecutive_possession_frames: int = 1
+    # Allow 2-touch passes minimum, relying on dual-distance to catch them
+    min_consecutive_possession_frames: int = 2
 
 
 @dataclass(frozen=True)
