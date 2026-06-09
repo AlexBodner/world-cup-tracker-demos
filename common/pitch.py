@@ -1136,17 +1136,24 @@ class PitchHomographyTracker:
         """Return ``(speed_transformer, radar_transformer)`` — same gated per-frame H."""
         if keypoints is None:
             keypoints = detect_pitch_keypoints(frame, self.homography)
+            
+        def _fail():
+            # If no fresh homography, rollback metric to pixels (None), keep radar as is (_locked)
+            return None, self._locked
+
         if keypoints.xy.shape[0] == 0:
-            return self._locked, self._locked
+            return _fail()
 
         pair = self._frame_correspondences(keypoints)
         if pair is None:
-            return self._locked, self._locked
+            return _fail()
 
         src_now, dst_now = pair
         if len(src_now) < DISPLAY_MIN_KEYPOINTS:
-            return self._locked, self._locked
+            return _fail()
+
         fitted = self._fit_frame(src_now, dst_now, use_ransac=True)
+        fresh_h = None
         if fitted is not None:
             speed_cand, target = fitted
             err = _mean_reproj_px(speed_cand, src_now, target)
@@ -1154,13 +1161,18 @@ class PitchHomographyTracker:
                 if self._orientation_anchor is None:
                     self._orientation_anchor = speed_cand
                 self._locked = speed_cand
+                fresh_h = speed_cand
 
-        h = self._locked
-        if h is None:
+        if fresh_h is not None:
+            return fresh_h, self._locked
+            
+        # If ransac failed, see if a fallback fit works just for the radar, but still fail metrics
+        if self._locked is None:
             fallback = self._fit_frame(src_now, dst_now, use_ransac=False)
             if fallback is not None:
-                h = fallback[0]
-        return h, h
+                self._locked = fallback[0]
+        
+        return _fail()
 
 
 def warmup_goal_defenders(

@@ -397,6 +397,7 @@ def render_pass_network_demo(
     metric: bool = False,
     show_radar: bool = True,
     frame_transforms: dict | None = None,
+    frame_radar_transforms: dict | None = None,
     frame_keypoints: dict | None = None,
     pitch_confidence: float = 0.99,
     pitch_tracker=None,
@@ -431,6 +432,21 @@ def render_pass_network_demo(
         transformer = (
             frame_transforms.get(frame_idx) if frame_transforms is not None else None
         )
+        radar_transformer = (
+            frame_radar_transforms.get(frame_idx) if frame_radar_transforms is not None else transformer
+        )
+        
+        # Display a warning if homography failed and we rolled back to pixels
+        if metric and transformer is None and frame_transforms is not None:
+            draw_text_shadow(
+                image,
+                "WARNING: Poor Pitch Detection (Metric Fallback to Pixels)",
+                (20, 40),
+                font_scale=0.6,
+                color_bgr=(50, 50, 255),  # Red
+                thickness=2,
+            )
+
         if pitch_tracker is not None and transformer is not None and locked_goals is None:
             omask = dets.class_id == ROLE_PLAYER
             if omask.any():
@@ -445,13 +461,13 @@ def render_pass_network_demo(
                 image, kps, confidence_threshold=pitch_confidence
             )
 
-        if show_radar and metric and kps is not None:
+        if show_radar and metric and kps is not None and radar_transformer is not None:
             image = draw_radar_minimap(
                 image,
                 dets,
                 kps,
                 pitch_confidence=pitch_confidence,
-                transformer=transformer,
+                transformer=radar_transformer,
                 locked_goal_defenders=locked_goals,
                 debug_keypoints=debug_pitch_keypoints,
             )

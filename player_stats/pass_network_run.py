@@ -188,6 +188,7 @@ def main() -> None:
 
     # Perform pitch transformation and goalkeeper stabilization early
     frame_transforms: dict = {}
+    frame_radar_transforms: dict = {}
     frame_keypoints: dict = {}
     pitch_tracker = None
     if args.metric:
@@ -197,7 +198,7 @@ def main() -> None:
         )
         from world_cup_projects.common.teams import stabilize_goalkeeper_teams
 
-        for frame_idx, speed_t, _radar_t, kps, tracker in iter_pitch_transformers(
+        for frame_idx, speed_t, radar_t, kps, tracker in iter_pitch_transformers(
             sequence,
             device=args.device,
             end=end,
@@ -206,6 +207,7 @@ def main() -> None:
             yield_tracker=True,
         ):
             frame_transforms[frame_idx] = speed_t
+            frame_radar_transforms[frame_idx] = radar_t
             frame_keypoints[frame_idx] = kps
             pitch_tracker = tracker
 
@@ -245,6 +247,7 @@ def main() -> None:
             frame_loader=lambda fi: read_sequence_frame(sequence, fi),
             metric=args.metric,
             frame_transforms=frame_transforms,
+            frame_radar_transforms=frame_radar_transforms,
             frame_keypoints=frame_keypoints,
             pitch_confidence=args.pitch_confidence,
             pitch_tracker=pitch_tracker,
