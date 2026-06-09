@@ -136,15 +136,15 @@ def _draw_pass_highlights(
                     # Since we don't have the exact release frame's feet cached, we blend the current feet
                     # with the back-projected expected origin.
                     
-                    # For a smoother look, the arrow should point to the ball
-                    # We interpolate the tip heavily towards the ball position to hide detection jitter
+                    # For a smoother look, the arrow should point exactly to the ball when visible.
+                    # This prevents the arrow tip from lagging behind the live video.
                     expected_x = p_feet[0] + (r_feet[0] - p_feet[0]) * t
                     expected_y = p_feet[1] + (r_feet[1] - p_feet[1]) * t
                     
                     if ball_pos is not None:
-                        # 60% real ball, 40% expected trajectory to dampen noise
-                        current_tip_x = int(ball_pos[0] * 0.6 + expected_x * 0.4)
-                        current_tip_y = int(ball_pos[1] * 0.6 + expected_y * 0.4)
+                        # Follow the ball exactly to ensure it never lags
+                        current_tip_x = int(ball_pos[0])
+                        current_tip_y = int(ball_pos[1])
                     else:
                         current_tip_x = int(expected_x)
                         current_tip_y = int(expected_y)

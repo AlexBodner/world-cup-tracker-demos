@@ -258,9 +258,31 @@ def detect_pass_events(
 
     # Stores the latest frame where a confirmed carrier had the ball (release frame)
     confirmed_passer: tuple[int, sv.Detections, Carrier, int] | None = None
+    
+    # Tracks the first frame the ball entered a player's vicinity (~3m / 100px)
+    proximity_frames: dict[int, int] = {}
 
     for frame_idx, dets in detections_iter:
         transformer = transformers.get(frame_idx) if metric else None
+        
+        # Track ball proximity to backdate reception time
+        ball = ball_xy(dets)
+        if ball is not None:
+            pmask = player_mask(dets)
+            if pmask.any():
+                feet_img = feet_xy(dets)[pmask]
+                tids = dets.tracker_id[pmask]
+                dist_px = np.hypot(feet_img[:, 0] - ball[0], feet_img[:, 1] - ball[1])
+                for i, tid_raw in enumerate(tids):
+                    tid_val = int(tid_raw)
+                    if tid_val < 0: continue
+                    d = dist_px[i]
+                    if d < 100.0:  # Ball within ~3 meters (aerial reception / chesting)
+                        if tid_val not in proximity_frames:
+                            proximity_frames[tid_val] = frame_idx
+                    elif d > 150.0:  # Ball left vicinity
+                        proximity_frames.pop(tid_val, None)
+
         carrier = find_ball_carrier(
             dets,
             max_distance_px=config.carrier_max_distance_px,
@@ -284,7 +306,8 @@ def detect_pass_events(
         # 2. Update Candidate State
         if tid == current_candidate_tid:
             # Same player touches it again (or still has it)
-            candidate_frames += 1
+            # Allow possession counter to increment if it was paused by occlusion
+            candidate_frames += 1 + missing_ball_tolerance
             missing_ball_tolerance = 0  # Reset tolerance
         else:
             # New player touched the ball
@@ -300,16 +323,15 @@ def detect_pass_events(
         role = dets.class_id[carrier.index]
         required_frames = 1 if role == ROLE_GOALKEEPER else config.min_consecutive_possession_frames
 
-        if candidate_frames == required_frames:
-            # We confirmed possession for this player!
-            if current_candidate_tid == 20 or carrier.team == 1:
-                print(f"[DEBUG] Frame {frame_idx}: Confirmed possession for TID {current_candidate_tid} (Team {carrier.team})")
-                
+        if candidate_frames >= required_frames and (candidate_frames - missing_ball_tolerance) <= required_frames:
+            # We confirmed possession for this player on this exact frame!
             if confirmed_passer is not None:
                 p_frame, p_dets, p_carrier, p_tid = confirmed_passer
 
-                # Gap is from the passer's LAST touch to the receiver's FIRST touch
-                gap = candidate_first_frame - p_frame
+                # Backdate the reception to when the ball first entered the receiver's vicinity
+                recv_frame = proximity_frames.get(current_candidate_tid, candidate_first_frame)
+                recv_frame = max(p_frame + 1, min(recv_frame, candidate_first_frame))
+                gap = recv_frame - p_frame
 
                 if p_tid != current_candidate_tid and p_carrier.team == carrier.team:
                     if config.min_carrier_gap_frames <= gap <= config.max_pass_gap_frames:
@@ -324,9 +346,6 @@ def detect_pass_events(
                         )
                         min_travel = config.min_ball_travel_m if metric else config.min_ball_travel_px
                         if travel is not None and travel >= min_travel:
-                            if p_tid == 20 or current_candidate_tid == 20 or carrier.team == 1:
-                                print(f"[DEBUG] ACCEPTED pass {p_tid}->{current_candidate_tid} (gap: {gap}, travel: {travel:.2f}m)")
-                                
                             option = scorer.option_for_receiver(
                                 p_frame, p_dets, p_carrier, current_candidate_tid
                             )
@@ -346,12 +365,6 @@ def detect_pass_events(
                                     receiver_space=float(option.receiver_space) if option else 0.0,
                                 )
                             )
-                        else:
-                            if p_tid == 20 or current_candidate_tid == 20 or carrier.team == 1:
-                                print(f"[DEBUG] Rejected pass {p_tid}->{current_candidate_tid} due to short travel: {travel}")
-                    else:
-                        if p_tid == 20 or current_candidate_tid == 20 or carrier.team == 1:
-                            print(f"[DEBUG] Rejected pass {p_tid}->{current_candidate_tid} due to gap: {gap} frames")
 
             # Now that they are confirmed, they become the passer for the NEXT pass
             confirmed_passer = (frame_idx, dets, carrier, current_candidate_tid)
