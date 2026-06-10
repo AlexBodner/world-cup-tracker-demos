@@ -96,7 +96,7 @@ def main() -> None:
     parser.add_argument(
         "--pitch-confidence",
         type=float,
-        default=0.99,
+        default=0.9,
         help="Keypoint confidence threshold (overlay legend + homography filter).",
     )
     parser.add_argument(

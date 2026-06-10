@@ -58,9 +58,9 @@ class PassWeights:
     lane_width: float | None = None  # base rival corridor width in m (pitch) or px (image)
     lane_width_mid_threshold_m: float = 18.0  # stepped boosts below (metric only)
     lane_width_long_threshold_m: float = 28.0
-    lane_width_mid_boost_m: float = 0.5
-    lane_width_long_boost_m: float = 1.0
-    lane_width_max_m: float = 4.0
+    lane_width_mid_boost_m: float = 0.75
+    lane_width_long_boost_m: float = 1.5
+    lane_width_max_m: float = 4.5
     lane_in_image_space: bool = False  # metric default: pitch/radar corridor (meters)
     lane_use_body_center: bool = True  # min(feet, bbox center) for rival lane distance
     teammate_lane_width: float | None = None  # None -> 0.5 * lane_width when lane_width set

@@ -3,7 +3,7 @@
 Simple rule set (per team, frame by frame)
 ------------------------------------------
 1. **Valid touch** — ball is nearest this player's feet; reject aerial *control*
-   (reception at chest height is OK).
+   and reception fly-bys below the feet (chest-height receptions are OK).
 2. **Passer** — player who *released* the ball:
    - outfield: ``min_control_frames`` consecutive control frames, OR
    - goalkeeper: one control/reception frame, OR
@@ -23,7 +23,7 @@ Simple rule set (per team, frame by frame)
 
 Distance gates: tight *control* at the feet; looser *reception* for first
 contact / one-touch. Anchors survive in-flight stretches (ball visible but no
-player in range).
+player in range) and brief ball-detection dropouts (``missing_ball_tolerance``).
 """
 
 from __future__ import annotations
@@ -73,16 +73,17 @@ class PassDetectionConfig:
     """
 
     min_carrier_gap_frames: int = 1
-    max_pass_gap_frames: int = 50  # ~2 s at 25 fps
+    max_pass_gap_frames: int = 75  # ~3 s at 25 fps; tolerates ball-detection dropouts
     min_ball_travel_m: float = 1.0
     min_ball_travel_px: float = 25.0
     control_max_distance_m: float = 0.8
     control_max_distance_px: float = 55.0
     reception_max_distance_m: float = 1.8
     reception_max_distance_px: float = 120.0
-    missing_ball_tolerance: int = 3
+    missing_ball_tolerance: int = 10  # ~0.4 s at 25 fps; bridge intermittent ball loss
     dedupe_window_frames: int = 12
     min_arrival_frames: int = 3
+    min_reception_arrival_frames: int = 2
     min_control_frames: int = 3
     min_gk_control_frames: int = 1
     pre_flight_release_window: int = 10  # ~0.4 s before ball leaves range
@@ -107,6 +108,9 @@ class PassDetectionConfig:
             missing_ball_tolerance=max(1, round(self.missing_ball_tolerance * scale)),
             dedupe_window_frames=max(1, round(self.dedupe_window_frames * scale)),
             min_arrival_frames=max(1, round(self.min_arrival_frames * scale)),
+            min_reception_arrival_frames=max(
+                1, round(self.min_reception_arrival_frames * scale)
+            ),
             min_control_frames=max(1, round(self.min_control_frames * scale)),
             min_gk_control_frames=max(1, round(self.min_gk_control_frames * scale)),
             pre_flight_release_window=max(
@@ -128,6 +132,7 @@ class PassDetectionConfig:
             min_pass_gap_frames=self.min_carrier_gap_frames,
             max_pass_gap_frames=self.max_pass_gap_frames,
             min_arrival_frames=self.min_arrival_frames,
+            min_reception_arrival_frames=self.min_reception_arrival_frames,
             min_control_frames=self.min_control_frames,
             min_gk_control_frames=self.min_gk_control_frames,
             pre_flight_release_window=self.pre_flight_release_window,
@@ -147,12 +152,12 @@ class InferredPass:
     team: int
     gap_frames: int
     pass_length_m: float | None
-    quality_score: float
-    openness: float
-    forward_gain: float
-    rivals_in_lane: int
-    motion_alignment: float
-    receiver_space: float
+    quality_score: float | None
+    openness: float | None
+    forward_gain: float | None
+    rivals_in_lane: int | None
+    motion_alignment: float | None
+    receiver_space: float | None
     touch_kind: str = "control"
 
     def to_dict(self) -> dict:
@@ -444,12 +449,12 @@ def _try_emit_pass(
             team=int(release_carrier.team),
             gap_frames=gap,
             pass_length_m=_pass_length_m(option, metric),
-            quality_score=float(option.score) if option else 0.0,
-            openness=float(option.openness) if option else 0.0,
-            forward_gain=float(option.forward_gain) if option else 0.0,
-            rivals_in_lane=int(option.rivals_in_lane) if option else 0,
-            motion_alignment=float(option.motion_alignment) if option else 0.0,
-            receiver_space=float(option.receiver_space) if option else 0.0,
+            quality_score=float(option.score) if option else None,
+            openness=float(option.openness) if option else None,
+            forward_gain=float(option.forward_gain) if option else None,
+            rivals_in_lane=int(option.rivals_in_lane) if option else None,
+            motion_alignment=float(option.motion_alignment) if option else None,
+            receiver_space=float(option.receiver_space) if option else None,
             touch_kind=touch_kind,
         )
     )
@@ -531,6 +536,25 @@ def _is_aerial_touch(
     return abs(float(ball[1] - feet[1])) > threshold_px
 
 
+def _is_aerial_flyby_below_feet(
+    dets: sv.Detections,
+    carrier: Carrier,
+    *,
+    threshold_px: float,
+) -> bool:
+    """Ball visibly below the feet in image space (aerial fly-by, not chest reception)."""
+    ball = ball_xy(dets)
+    if ball is None:
+        return False
+    feet = feet_xy(dets)[carrier.index]
+    return float(ball[1] - feet[1]) > threshold_px
+
+
+def _reception_aerial_veto_threshold(config: PassDetectionConfig) -> float:
+    """Looser than control: chest receptions are above the feet (negative dy)."""
+    return config.aerial_dy_threshold_px * 2.0
+
+
 def _is_valid_possession_touch(
     dets: sv.Detections,
     carrier: Carrier,
@@ -540,10 +564,17 @@ def _is_valid_possession_touch(
 ) -> bool:
     """Reject aerial fly-bys and nearest-player mismatches.
 
-    Aerial veto applies to *control* only — chest-height receptions are common.
+    Control uses symmetric vertical offset; reception only vetoes fly-bys below
+    the feet so chest-height first contacts still count.
     """
     if touch_kind == "control" and _is_aerial_touch(
         dets, carrier, threshold_px=config.aerial_dy_threshold_px
+    ):
+        return False
+    if touch_kind == "reception" and _is_aerial_flyby_below_feet(
+        dets,
+        carrier,
+        threshold_px=_reception_aerial_veto_threshold(config),
     ):
         return False
     ball = carrier.ball
@@ -580,6 +611,30 @@ def _min_control_frames_for(
     return config.min_control_frames
 
 
+def _bridge_missing_ball(
+    team_states: dict[int, _TeamPossessionState],
+    *,
+    frame_idx: int,
+    config: PassDetectionConfig,
+) -> None:
+    """Brief ball dropout: keep release anchor and arrival streak (like in-flight)."""
+    for state in team_states.values():
+        if state.release is None and state.last_touch is None:
+            continue
+        if not state.in_flight:
+            _promote_pre_flight_release(state, frame_idx, config=config)
+        state.in_flight = True
+
+
+def _end_missing_ball_bridge(team_states: dict[int, _TeamPossessionState]) -> None:
+    """Ball gone too long — stop bridging and let stale-release expiry run."""
+    for state in team_states.values():
+        state.in_flight = False
+        state.arrival_candidate_tid = -1
+        state.arrival_streak = 0
+        state.arrival_control_streak = 0
+
+
 def _promote_pre_flight_release(
     state: _TeamPossessionState,
     frame_idx: int,
@@ -591,6 +646,13 @@ def _promote_pre_flight_release(
         return
     touch_frame, touch_dets, touch_carrier, touch_tid = state.last_touch
     if frame_idx - touch_frame > config.pre_flight_release_window:
+        return
+    aerial_limit = _reception_aerial_veto_threshold(config)
+    if _is_aerial_touch(
+        touch_dets, touch_carrier, threshold_px=config.aerial_dy_threshold_px
+    ) or _is_aerial_flyby_below_feet(
+        touch_dets, touch_carrier, threshold_px=aerial_limit
+    ):
         return
     state.release = (touch_frame, touch_dets, touch_carrier, touch_tid)
 
@@ -690,6 +752,21 @@ def _try_emit_turnover(
     return True
 
 
+def _min_arrival_frames_for(
+    *,
+    touch_kind: str,
+    gap_frames: int,
+    config: PassDetectionConfig,
+) -> int:
+    """Reception-only paths on longer gaps need fewer consecutive touches."""
+    if (
+        touch_kind == "reception"
+        and gap_frames >= config.adjacent_pass_max_gap_frames
+    ):
+        return config.min_reception_arrival_frames
+    return config.min_arrival_frames
+
+
 def _on_confirmed_possession(
     state: _TeamPossessionState,
     frame_idx: int,
@@ -698,6 +775,8 @@ def _on_confirmed_possession(
     tid: int,
 ) -> None:
     """Credit sustained possession on this team."""
+    if state.release is not None and state.release[3] != tid:
+        return
     _confirm_release(state, frame_idx, dets, carrier, tid)
 
 
@@ -749,6 +828,7 @@ def scan_possession_events(
         0: _TeamPossessionState(),
         1: _TeamPossessionState(),
     }
+    missing_ball_streak = 0
 
     def _expire_stale_releases(frame_idx: int) -> None:
         for state in team_states.values():
@@ -771,6 +851,12 @@ def scan_possession_events(
     for frame_idx, dets in detections_iter:
         frames_by_idx[frame_idx] = dets
         _expire_stale_releases(frame_idx)
+        ball = ball_xy(dets)
+        if ball is None:
+            missing_ball_streak += 1
+        else:
+            missing_ball_streak = 0
+
         transformer = transformers.get(frame_idx) if metric else None
         carrier, touch_kind = _active_carrier(
             dets, transformer=transformer, config=config
@@ -780,7 +866,7 @@ def scan_possession_events(
         if carrier is None or not _is_valid_possession_touch(
             dets, carrier, touch_kind=touch_kind, config=config
         ):
-            if ball_xy(dets) is not None:
+            if ball is not None:
                 for state in team_states.values():
                     if not state.in_flight:
                         _promote_pre_flight_release(
@@ -790,6 +876,12 @@ def scan_possession_events(
                     state.arrival_candidate_tid = -1
                     state.arrival_streak = 0
                     state.arrival_control_streak = 0
+            elif missing_ball_streak <= config.missing_ball_tolerance:
+                _bridge_missing_ball(
+                    team_states, frame_idx=frame_idx, config=config
+                )
+            else:
+                _end_missing_ball_bridge(team_states)
             continue
 
         tid = int(dets.tracker_id[carrier.index]) if dets.tracker_id is not None else -1
@@ -847,10 +939,13 @@ def scan_possession_events(
             state.arrival_streak = 1
             state.arrival_control_streak = 1 if touch_kind == "control" else 0
 
-        arrival_ready = state.arrival_streak >= config.min_arrival_frames
-        adjacent = (
-            frame_idx - release_frame
-        ) < config.adjacent_pass_max_gap_frames
+        gap_frames = frame_idx - release_frame
+        arrival_ready = state.arrival_streak >= _min_arrival_frames_for(
+            touch_kind=touch_kind,
+            gap_frames=gap_frames,
+            config=config,
+        )
+        adjacent = gap_frames < config.adjacent_pass_max_gap_frames
         if arrival_ready and adjacent:
             arrival_ready = (
                 state.arrival_control_streak >= config.min_control_frames
@@ -859,7 +954,7 @@ def scan_possession_events(
         if not arrival_ready:
             continue
 
-        if _opponent_control_between(
+        opponent_blocked = _opponent_control_between(
             frames_by_idx,
             start_frame=release_frame,
             end_frame=frame_idx,
@@ -867,7 +962,14 @@ def scan_possession_events(
             config=config,
             transformers=transformers,
             metric=metric,
-        ):
+        )
+        if opponent_blocked:
+            # Stale anchors survive opponent possession; credit the arriving teammate
+            # without emitting a pass through the press.
+            _confirm_release(state, frame_idx, dets, carrier, tid)
+            state.arrival_candidate_tid = -1
+            state.arrival_streak = 0
+            state.arrival_control_streak = 0
             continue
 
         if _try_emit_pass(

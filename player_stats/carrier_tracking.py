@@ -30,14 +30,15 @@ class CarrierTrackingConfig:
     reception_max_distance_m: float = 1.8
     reception_max_distance_px: float = 120.0
     min_pass_gap_frames: int = 1
-    max_pass_gap_frames: int = 50
+    max_pass_gap_frames: int = 75
     min_arrival_frames: int = 3
+    min_reception_arrival_frames: int = 2
     min_control_frames: int = 3
     min_gk_control_frames: int = 1
     pre_flight_release_window: int = 10
     adjacent_pass_max_gap_frames: int = 15
     aerial_dy_threshold_px: float = 20.0
-    missing_ball_tolerance: int = 3
+    missing_ball_tolerance: int = 10
 
 
 @dataclass(frozen=True)
@@ -138,6 +139,19 @@ def _is_aerial_touch(
     return abs(float(ball[1] - feet[1])) > threshold_px
 
 
+def _is_aerial_flyby_below_feet(
+    dets: sv.Detections,
+    carrier: Carrier,
+    *,
+    threshold_px: float,
+) -> bool:
+    ball = ball_xy(dets)
+    if ball is None:
+        return False
+    feet = feet_xy(dets)[carrier.index]
+    return float(ball[1] - feet[1]) > threshold_px
+
+
 def _is_valid_possession_touch(
     dets: sv.Detections,
     carrier: Carrier,
@@ -147,6 +161,12 @@ def _is_valid_possession_touch(
 ) -> bool:
     if touch_kind == "control" and _is_aerial_touch(
         dets, carrier, threshold_px=config.aerial_dy_threshold_px
+    ):
+        return False
+    if touch_kind == "reception" and _is_aerial_flyby_below_feet(
+        dets,
+        carrier,
+        threshold_px=config.aerial_dy_threshold_px * 2.0,
     ):
         return False
     nearest = _nearest_player(dets, carrier.ball)
@@ -216,10 +236,15 @@ def build_carrier_timeline(
             if frame_idx - state.release[0] > config.max_pass_gap_frames:
                 state.release = None
 
+    missing_ball_streak = 0
     for frame_idx, dets in detections_iter:
         _expire_stale_releases(frame_idx)
         transformer = transformers.get(frame_idx) if metric else None
         ball = ball_xy(dets)
+        if ball is None:
+            missing_ball_streak += 1
+        else:
+            missing_ball_streak = 0
         nearest = _nearest_player(dets, ball) if ball is not None else None
 
         control = (
@@ -289,8 +314,38 @@ def build_carrier_timeline(
                         and frame_idx - state.last_touch[0]
                         <= config.pre_flight_release_window
                     ):
+                        _, touch_dets, touch_carrier, _ = state.last_touch
+                        aerial_limit = config.aerial_dy_threshold_px * 2.0
+                        if not _is_aerial_touch(
+                            touch_dets,
+                            touch_carrier,
+                            threshold_px=config.aerial_dy_threshold_px,
+                        ) and not _is_aerial_flyby_below_feet(
+                            touch_dets,
+                            touch_carrier,
+                            threshold_px=aerial_limit,
+                        ):
+                            state.release = state.last_touch
+                    state.in_flight = True
+                    state.arrival_candidate_tid = -1
+                    state.arrival_streak = 0
+                    state.arrival_control_streak = 0
+            elif missing_ball_streak <= config.missing_ball_tolerance:
+                for state in team_states.values():
+                    if state.release is None and state.last_touch is None:
+                        continue
+                    if (
+                        not state.in_flight
+                        and state.release is None
+                        and state.last_touch is not None
+                        and frame_idx - state.last_touch[0]
+                        <= config.pre_flight_release_window
+                    ):
                         state.release = state.last_touch
                     state.in_flight = True
+            else:
+                for state in team_states.values():
+                    state.in_flight = False
                     state.arrival_candidate_tid = -1
                     state.arrival_streak = 0
                     state.arrival_control_streak = 0
@@ -316,7 +371,8 @@ def build_carrier_timeline(
                         state.possession_tid = tid
                         state.control_streak = 1
                     if state.control_streak >= min_control:
-                        state.release = (frame_idx, carrier, tid)
+                        if state.release is None or state.release[2] == tid:
+                            state.release = (frame_idx, carrier, tid)
                 else:
                     state.possession_tid = tid
                     state.control_streak = 0
@@ -343,12 +399,15 @@ def build_carrier_timeline(
                             state.arrival_control_streak = (
                                 1 if touch_kind == "control" else 0
                             )
-                        arrival_ready = (
-                            state.arrival_streak >= config.min_arrival_frames
+                        gap_frames = frame_idx - release_frame
+                        min_arrival = (
+                            config.min_reception_arrival_frames
+                            if touch_kind == "reception"
+                            and gap_frames >= config.adjacent_pass_max_gap_frames
+                            else config.min_arrival_frames
                         )
-                        adjacent = (
-                            frame_idx - release_frame
-                        ) < config.adjacent_pass_max_gap_frames
+                        arrival_ready = state.arrival_streak >= min_arrival
+                        adjacent = gap_frames < config.adjacent_pass_max_gap_frames
                         if arrival_ready and adjacent:
                             arrival_ready = (
                                 state.arrival_control_streak

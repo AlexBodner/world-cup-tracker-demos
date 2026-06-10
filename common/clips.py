@@ -38,7 +38,7 @@ PITCH_GAMEPLAY_AVOID_NOTES: dict[str, str] = {
     "SNMOT-127": "Play is often stopped (referee); homography is fine but little live game.",
 }
 
-# Best homography/radar reprojection among active-game test clips @ confidence 0.98.
+# Best homography/radar reprojection among active-game test clips @ confidence 0.9.
 PITCH_HOMOGRAPHY_DEMO_CLIP: str = "SNMOT-117"
 
 
@@ -209,7 +209,7 @@ def rank_clips(
     skip_names: frozenset[str] | None = None,
     assess_pitch: bool = False,
     pitch_device: str = "cpu",
-    pitch_confidence: float = 0.98,
+    pitch_confidence: float = 0.9,
     require_pitch_ok: bool = False,
     homography_demo: bool = False,
 ) -> list[ClipScore]:
@@ -256,7 +256,7 @@ def pick_homography_demo_clip(
     seq_dirs: list[Path],
     *,
     pitch_device: str = "cpu",
-    pitch_confidence: float = 0.98,
+    pitch_confidence: float = 0.9,
 ) -> ClipScore:
     """Prefer clips where keypoints reproject cleanly to the radar."""
     blocked = PITCH_KEYPOINT_AVOID | PITCH_GAMEPLAY_AVOID

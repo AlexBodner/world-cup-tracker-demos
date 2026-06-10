@@ -313,38 +313,43 @@ def draw_radar_minimap(
     *,
     scale_frac: float = 0.33,
     position: str = "bottom_right",
-    pitch_confidence: float = 0.98,
+    pitch_confidence: float = 0.9,
     use_ransac: bool = False,
     ransac_thresh: float = HOMOGRAPHY_RANSAC_REPROJ_THRESH,
     transformer: ViewTransformer | None = None,
+    clip_radar_transformer: ViewTransformer | None = None,
     locked_goal_defenders: tuple[int, int] | None = None,
     prebuilt_radar: np.ndarray | None = None,
     debug_keypoints: bool = False,
 ) -> np.ndarray:
-    """Sports-style radar minimap from per-frame model keypoints."""
+    """Sports-style radar minimap — prefer clip-wide H to avoid per-frame mirroring."""
     if prebuilt_radar is not None:
         radar = prebuilt_radar
-    elif keypoints is not None:
-        from world_cup_projects.common.pitch import render_radar_simple
-
-        radar = render_radar_simple(
-            dets,
-            keypoints,
-            confidence=pitch_confidence,
-            transformer=transformer,
-            locked_goal_defenders=locked_goal_defenders,
-            debug_keypoints=debug_keypoints,
-        )
-        if radar is None and transformer is not None:
-            radar = render_radar_from_transformer(
-                dets, transformer, locked_goal_defenders=locked_goal_defenders
-            )
-    elif transformer is not None:
-        radar = render_radar_from_transformer(
-            dets, transformer, locked_goal_defenders=locked_goal_defenders
-        )
     else:
-        return frame
+        radar_t = clip_radar_transformer or transformer
+        if radar_t is not None:
+            from world_cup_projects.common.pitch import render_radar_simple
+
+            radar = render_radar_simple(
+                dets,
+                keypoints if debug_keypoints else None,
+                confidence=pitch_confidence,
+                transformer=radar_t,
+                locked_goal_defenders=locked_goal_defenders,
+                debug_keypoints=debug_keypoints,
+            )
+        elif keypoints is not None:
+            from world_cup_projects.common.pitch import render_radar_simple
+
+            radar = render_radar_simple(
+                dets,
+                keypoints,
+                confidence=pitch_confidence,
+                locked_goal_defenders=locked_goal_defenders,
+                debug_keypoints=debug_keypoints,
+            )
+        else:
+            return frame
     if radar is None:
         return frame
 
@@ -496,8 +501,18 @@ def draw_pitch_keypoints_debug(
 
     xy = keypoints.xy[0]
     n = len(PITCH_CONFIG.vertices)
+    from world_cup_projects.common.pitch import (
+        pitch_keypoint_inlier_mask,
+        view_transformer_from_keypoints,
+    )
+
     conf = pitch_keypoint_confidence(keypoints, n_vertices=n)
-    accept = pitch_keypoint_accept_mask(xy, conf, confidence=confidence_threshold)
+    h_t = view_transformer_from_keypoints(
+        keypoints, confidence=confidence_threshold, use_ransac=True
+    )
+    accept = pitch_keypoint_inlier_mask(
+        xy, conf, h_t, confidence=confidence_threshold, max_reproj_px=8.0
+    )
 
     n_invalid = 0
     if draw_skeleton:
@@ -634,6 +649,29 @@ def draw_carrier_spotlight(
     mask = (mask[..., None] * strength).astype(np.float32)
     out = dimmed.astype(np.float32) * (1.0 - mask) + original.astype(np.float32) * mask
     return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def draw_carrier_halo(
+    frame: np.ndarray,
+    center: tuple[int, int],
+    *,
+    radius: int = 20,
+    strength: float = 0.24,
+) -> None:
+    """Soft white glow at the ball carrier's feet (drawn in-place)."""
+    h, w = frame.shape[:2]
+    cx, cy = int(center[0]), int(center[1])
+    mask = np.zeros((h, w), dtype=np.float32)
+    cv2.circle(mask, (cx, cy), radius, 1.0, -1, cv2.LINE_AA)
+    mask = cv2.GaussianBlur(mask, (0, 0), sigmaX=max(radius * 0.42, 1.0))
+    mask = (mask[..., None] * strength).astype(np.float32)
+    glow = frame.astype(np.float32).copy()
+    cv2.circle(glow, (cx, cy), max(radius - 4, 6), (255, 255, 255), -1, cv2.LINE_AA)
+    frame[:] = np.clip(
+        frame.astype(np.float32) * (1.0 - mask) + glow * mask,
+        0,
+        255,
+    ).astype(np.uint8)
 
 
 def draw_carrier_pulse(

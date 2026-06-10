@@ -56,6 +56,7 @@ from world_cup_projects.common.visual import (
     annotate_ball,
     annotate_players,
     draw_branding_tag,
+    draw_carrier_halo,
     draw_carrier_pulse,
     draw_carrier_spotlight,
     draw_glow_arrow,
@@ -209,7 +210,7 @@ def _pitch_transform_map(
     *,
     max_frames: int | None,
     pitch_device: str,
-    pitch_confidence: float = 0.99,
+    pitch_confidence: float = 0.9,
 ) -> dict[int, ViewTransformer | None]:
     return {
         frame_idx: speed_t
@@ -439,7 +440,7 @@ def _annotate_live(
     dets: sv.Detections,
     *,
     keypoints: sv.KeyPoints | None = None,
-    pitch_confidence: float = 0.99,
+    pitch_confidence: float = 0.9,
     metric: bool = False,
     show_radar: bool = True,
     radar_transformer: ViewTransformer | None = None,
@@ -458,6 +459,13 @@ def _annotate_live(
         show_tracker_ids=True,
     )
     frame = annotate_ball(frame, dets)
+    carrier = find_ball_carrier(
+        dets,
+        transformer=radar_transformer if metric else None,
+    )
+    if carrier is not None:
+        feet = feet_xy(dets)[carrier.index]
+        draw_carrier_halo(frame, (int(feet[0]), int(feet[1])))
     if show_radar and metric and keypoints is not None:
         frame = draw_radar_minimap(
             frame,
@@ -555,7 +563,7 @@ def _draw_pass_overlay(
     weights: PassWeights = PassWeights(),
     metric: bool = False,
     keypoints: sv.KeyPoints | None = None,
-    pitch_confidence: float = 0.99,
+    pitch_confidence: float = 0.9,
     transformer: ViewTransformer | None = None,
     show_lane_debug: bool = True,
     show_radar: bool = True,
@@ -726,7 +734,7 @@ def render_demo(
     carrier_max_distance_px: float = CARRIER_MAX_DISTANCE_PX,
     carrier_max_distance_m: float = CARRIER_MAX_DISTANCE_M,
     debug_pitch_keypoints: bool = False,
-    pitch_confidence: float = 0.99,
+    pitch_confidence: float = 0.9,
     show_radar: bool | None = None,
     facing_mode: Literal["motion", "kalman", "both"] = "kalman",
     tracker_kind: TrackerKind = "bytetrack",

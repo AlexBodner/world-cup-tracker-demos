@@ -12,7 +12,9 @@ dataset to avoid FIFA copyright-strike risk on real broadcast footage.
 
 1. **Pass Alternatives** - freeze the frame when a player has the ball and overlay the 3
    best passing lanes, scored by openness / forward-progress / receiver-space.
-2. **Player Speed & Distance** - per-player speed (km/h) + total distance covered, shown as
+2. **Pass Network** - infer completed passes and turnovers from tracking, score each pass
+   with the same lane model, and render a collaboration web + possession-lost banners.
+3. **Player Speed & Distance** - per-player speed (km/h) + total distance covered, shown as
    on-pitch labels, an end-of-clip leaderboard, and (v2) a top-down radar minimap.
 
 Status: **both demos are built and produce rendered MP4s.** v1 (no weights) and v2
@@ -67,7 +69,11 @@ PYTHONPATH=. python -m world_cup_projects.pass_alternatives.run --sequence SNMOT
 
 # v2 "from raw pixels" — DFL football-players-detection (ball/player/gk/referee)
 PYTHONPATH=. python -m world_cup_projects.pass_alternatives.run \
-    --video world_cup_projects/bundesliga_videos/08fd33_0.mp4 --metric --pitch-confidence 0.90
+    --video world_cup_projects/bundesliga_videos/08fd33_0.mp4 --metric
+
+# Pass network — inferred passes + turnovers + optional alternative freezes
+PYTHONPATH=. python -m world_cup_projects.player_stats.pass_network_run \
+    --video world_cup_projects/bundesliga_videos/08fd33_0.mp4 --metric --render --show-predictions
 
 # v2 fallback: generic COCO RF-DETR (poor team/role split; not recommended for video)
 RF_HOME=world_cup_projects/weights/rfdetr PYTHONPATH=. \
@@ -114,7 +120,7 @@ using `supervision` annotators:
 | Rank | Clip | Why |
 |------|------|-----|
 | 1 | **SNMOT-194** | ball visible 735/750, clear possession 604 frames, ~18 players, both teams |
-| 2 | **SNMOT-117** | homography/radar default — active play; center-circle frames OK, many frames weak @ 0.98 (DFL-trained pitch model) |
+| 2 | **SNMOT-117** | homography/radar default — active play; center-circle frames OK (DFL-trained pitch model) |
 | 3 | SNMOT-200 | ball 707/750, possession 529, ~14 players |
 
 We use **SNMOT-194** for pixel-space / possession auto-pick. **Homography demos**
@@ -196,6 +202,11 @@ world_cup_projects/
     render.py                  # freeze-frame overlay video
     run.py                     # CLI
   player_stats/
+    pass_events.py             # pass + turnover inference rules
+    pass_network.py            # collaboration graph aggregation
+    pass_network_render.py       # passes + alternatives + turnover video
+    pass_network_run.py          # CLI
+    carrier_tracking.py        # per-frame carrier debug timeline
     speed_distance.py          # per-track speed + cumulative distance
     render.py                  # speed labels + leaderboard + radar
     run.py                     # CLI
@@ -204,33 +215,209 @@ world_cup_projects/
   assets/                      # rendered mp4s / json / stills (gitignored)
 ```
 
+## Pass analytics — how we compute things
+
+Football intuition first, then the exact gates. Two pipelines share the same lane-scoring
+model (`pass_alternatives/pass_options.py`):
+
+| Pipeline | Question it answers | When it runs |
+|----------|---------------------|--------------|
+| **Pass alternatives** | *What could the carrier play right now?* | Freeze frames on good moments |
+| **Pass detection** | *Who actually passed to whom?* | Full-clip scan of carrier handoffs |
+| **Turnover detection** | *Who lost the ball to the opponent?* | Same scan, rule 5 below |
+
+---
+
+### Foundation — who has the ball?
+
+**Intuition:** possession means the ball is at someone's feet, not merely "close in 3D".
+Aerial balls project onto the pitch as if they were on the ground, so we must reject fly-bys.
+
+```
+ball = ground position of ball detection
+for each player:
+    dist_px = distance(ball, player.feet)   # Y-axis stretched when |dy| > 10px
+    dist_m  = homography distance (optional)
+    valid   = (dist_px <= limit_px OR dist_m <= limit_m) AND NOT aerial
+aerial    = |ball.y - feet.y| > 20px   # ball clearly above/below feet in image
+carrier   = nearest valid player
+```
+
+- **Control** (tight, ~0.8 m / 55 px): ball glued to feet — dribbling.
+- **Reception** (looser, ~1.8 m / 120 px): first contact / one-touch — wider gate.
+- **Why aerial veto:** without it, balls flying over a player still pass the metric
+  distance check and create false possession (e.g. #1 credited when ball passes below
+  their feet on a long switch).
+
+---
+
+### A. Scoring pass alternatives (hypothetical lanes)
+
+**Intuition:** a good pass option is *open along the line*, *forward*, and leaves the
+receiver *free of nearby rivals*. We score every teammate and show the top 3.
+
+For each teammate receiver `R` from carrier `C`:
+
+```
+length     = distance(C, R)
+corridor   = strip along segment C→R (see rival width below)
+
+openness   = min distance from any RIVAL inside corridor to the pass line
+             (uses min(feet, bbox center) so leaning defenders count)
+rivals     = count of opponents inside corridor
+
+space      = distance from R to nearest opponent (anywhere, not just on the line)
+forward    = dot(R - C, attack_direction)   # toward opponent goal in metric mode
+motion     = penalty if pass aims behind carrier's recent run (Kalman velocity)
+
+score = 0.45 * norm(openness) + 0.30 * norm(forward) + 0.25 * norm(space)
+        - teammate_lane_penalty   # narrow corridor, light ding
+        - backward_penalty
+skip if length < 2 m or > 45 m
+```
+
+**Rival corridor width** (metric, pitch space):
+
+| Pass length | Full width | Why |
+|-------------|------------|-----|
+| ≤ 18 m | 2.5 m | base — short passes are narrow |
+| 18–28 m | 3.25 m | stepped +0.75 m — long switches need slack |
+| > 28 m | 3.75 m | capped at 4.25 m — **not** proportional to distance |
+
+We use **fixed tiers** instead of `width ∝ length` because linear scaling over-widens
+very long balls and couples too tightly to homography error.
+
+**Teammate corridor:** 1.2 m (rivals use 2.5 m). Teammates can step aside; we only
+penalize obvious obstacles.
+
+**When to freeze** (`plan_events`): score every possession frame offline; pick frames
+that beat score thresholds, are local peaks (±12 frames), and are ≥ 90 frames apart.
+
+---
+
+### B. Detecting completed passes (retrospective)
+
+**Intuition:** a pass is a *release* by player A and a *confirmed arrival* by teammate B
+on the same team, with no opponent *control* in between. Each team keeps its own
+release anchor (not one global anchor).
+
+Per team, frame by frame (`player_stats/pass_events.py`):
+
+```
+RULE 1 — Valid touch
+  ball nearest this player's feet
+  reject aerial CONTROL (|ball.y - feet.y| > 20px)
+  reject aerial RECEPTION only when ball is below feet (ball.y - feet.y > 40px)
+  allow chest-height receptions (ball above feet)
+
+RULE 2 — Passer (release anchor)
+  outfield: 3 consecutive control frames, OR
+  goalkeeper: 1 control/reception frame, OR
+  any role: last valid touch within 10 frames when ball goes in-flight
+            (covers GK punts and one-touch releases)
+
+RULE 3 — Receiver
+  3 consecutive valid touches by default (filters deflections / fly-bys)
+  if gap passer→receiver ≥ 15 frames and touch is reception-only: 2 frames OK
+  if gap passer→receiver < 15 frames: receiver must show 3 control frames
+      (quick plays: reject ball skimming past a teammate)
+  do not move release anchor to receiver until pass is evaluated
+
+RULE 4 — Emit pass
+  same team, frame gap in [1, 75], ball travel ≥ 1 m
+  no opponent CONTROL between release and arrival
+  dedupe duplicate passer→receiver within 12 frames
+  score lane quality at release frame (same model as §A)
+```
+
+**Why each gate exists:**
+
+| Gate | Problem it fixes |
+|------|------------------|
+| Aerial control veto | Ball overhead / below feet → false carrier |
+| Reception below-feet veto | Long ball skimming under feet (#1 fly-by on #3→#27) |
+| Opponent-blocked arrival | Update release to interceptor without false pass |
+| Nearest-player check | Tracker assigns ball to wrong ID when two players close |
+| 3-frame arrival streak | Single-frame deflections counted as receptions |
+| Adjacent-pass control | One-touch passes (#3↔#27) need real control at receiver |
+| Pre-flight release window | GK punts (#18→#2) only show 1 control frame before boot |
+| Per-team anchors | Opponent anchor on team B was blocking team A passes |
+| Opponent-between check | Missed pass (#14) — don't credit teammate after interception |
+| In-flight anchor survival | Ball visible but no player in range — don't lose passer |
+| Missing-ball bridge | Ball not detected for ≤10 frames — keep release + arrival streak |
+| Defer receiver confirm | Receiver control must not overwrite passer anchor pre-emit |
+| Long-gap reception (2f) | Airborne receptions on gaps ≥15f (#8→#19 on 08fd33_8) |
+
+---
+
+### C. Detecting turnovers (interceptions)
+
+**Intuition:** team A released the ball intending a pass; an opponent touched it before
+any teammate of A arrived. Attribute the steal to the opponent's **first** valid touch.
+
+```
+RULE 5 — Emit turnover
+  team A has a pending release
+  on first opponent touch after release → snapshot (release_frame, passer_tid)
+  when that opponent later completes a pass to a teammate:
+      interception_frame = first valid touch by interceptor after snapshot
+      require opponent CONTROL between release and that touch
+      emit turnover(passer=#14, interceptor=#3, ...)
+      clear team A's release anchor
+```
+
+Teammate arrival streaks are **ignored** if an opponent controlled the ball in between
+(prevents advancing the release anchor on a failed reception after a steal).
+
+---
+
+### D. Scoring a detected pass
+
+Once a pass A→B is inferred, we re-run the lane scorer at the **release frame** with
+carrier = A and look up receiver B. Stored fields: `quality`, `openness`, `forward_gain`,
+`receiver_space`, `rivals_in_lane`, `length_m`.
+
+This is the same formula as §A — detected passes get a retrospective "how good was this
+lane?" score, not a separate model.
+
+---
+
 ## Demo 1 - Pass Alternatives
 
-1. **Find the carrier** - ball nearest a player's feet (`BOTTOM_CENTER` anchor); carrier's
-   team comes from the GT `team` field (or the color/Siglip classifier in v2).
-2. **Candidate receivers** - teammates other than the carrier.
-3. **Score each lane** carrier -> receiver (`pass_options.score_pass_options`):
-   - *openness*: nearest **rival** in a **2.5 m** corridor on the **pitch/radar**
-     (metric default). On freeze frames the corridor is drawn on the **main video**
-     (projected from pitch via ``H^-1``) and on the minimap; red **!** = rival inside.
-     Use ``--pass-lane-image`` to score in pixels instead.
-   - *teammate lane*: light penalty in a **narrower** image corridor (0.5 m scaled).
-   - *forward progress*: gain toward the attacking direction,
-   - *carrier motion*: penalizes passes **behind** the carrier's recent run (GT track
-     displacement over ~5 frames),
-   - *receiver space*: distance from the receiver to the nearest opponent,
-   - minus a range penalty for too-short/too-long passes.
-4. **Pick top 3**, draw ranked arrows (green=best -> yellow -> orange) with scores, dim the
-   background, hold the freeze ~1.5s. `plan_events` **detects** good pass moments offline:
-   every frame with possession is scored; freezes are frames that pass score thresholds,
-   are **local peaks** in that score (~±12 frames), and are at least ~90 frames apart.
-   No fixed count by default (`--max-events 0`); use `--max-events N` to cap.
-   Pitch keypoints use **`--pitch-confidence 0.98`** by default.
+CLI:
 
-In v1 the attacking direction is an image-space proxy (carrier-team centroid ->
-opponent-team centroid); v2 uses the pitch homography for a true direction-to-goal.
+```bash
+PYTHONPATH=. python -m world_cup_projects.pass_alternatives.run \
+    --video bundesliga_videos/08fd33_0.mp4 --metric
+```
 
-## Demo 2 - Player Speed & Distance
+See **§A** above for scoring. Renders ranked arrows (green → yellow → orange), corridor
+shading on video + minimap, red **!** on blocking rivals. Pitch keypoints default to
+`--pitch-confidence 0.9` (default).
+
+In v1 the attacking direction is an image-space proxy (carrier-team centroid →
+opponent-team centroid); v2 uses pitch homography for true direction-to-goal.
+
+## Demo 2 - Pass Network
+
+Infer passes + turnovers from tracking, build a collaboration graph, render highlights.
+
+```bash
+# from world_cup_projects/
+PYTHONPATH=. python -m player_stats.pass_network_run \
+    --video bundesliga_videos/08fd33_0.mp4 --metric --render --show-predictions
+```
+
+| Flag | Effect |
+|------|--------|
+| `--render` | MP4 with pass arrows, collaboration web, turnover banner |
+| `--show-predictions` | Also insert pass-alternative freeze frames (§A) |
+| `--debug-carrier` | HUD: active carrier, release anchor, arrival streak |
+
+Rules: **§B** (passes) and **§C** (turnovers). Output JSON lists `passes[]` and
+`turnovers[]` plus per-link counts in `collaboration_links`.
+
+## Demo 3 - Player Speed & Distance
 
 1. Track every player (GT in v1, RF-DETR + `ByteTrackTracker` in v2); accumulate the
    `BOTTOM_CENTER` feet position per frame.

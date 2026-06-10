@@ -111,7 +111,7 @@ def render_demo(
     show_radar: bool = True,
     frame_keypoints: dict | None = None,
     pitch_kp_debug: bool = False,
-    pitch_confidence: float = 0.98,
+    pitch_confidence: float = 0.9,
     pitch_tracker=None,
 ) -> dict:
     """Render the speed/distance MP4. ``frame_loader(frame_idx) -> bgr image``."""

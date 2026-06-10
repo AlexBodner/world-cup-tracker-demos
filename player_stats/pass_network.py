@@ -18,7 +18,7 @@ class CollaborationLink:
     receiver_tid: int
     team: int
     count: int
-    avg_quality: float
+    avg_quality: float | None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -32,8 +32,8 @@ class PlayerPassSummary:
     team: int
     passes_made: int
     passes_received: int
-    avg_quality_made: float
-    avg_quality_received: float
+    avg_quality_made: float | None
+    avg_quality_received: float | None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -72,21 +72,29 @@ def build_collaboration_links(events: list[InferredPass]) -> list[CollaborationL
     """Count directed A -> B passes and average lane quality per link."""
     counts: dict[tuple[int, int, int], int] = defaultdict(int)
     quality_sums: dict[tuple[int, int, int], float] = defaultdict(float)
+    quality_counts: dict[tuple[int, int, int], int] = defaultdict(int)
 
     for event in events:
         key = (event.passer_tid, event.receiver_tid, event.team)
         counts[key] += 1
-        quality_sums[key] += event.quality_score
+        if event.quality_score is not None:
+            quality_sums[key] += event.quality_score
+            quality_counts[key] += 1
 
     links: list[CollaborationLink] = []
     for (passer, receiver, team), count in counts.items():
+        scored = quality_counts[(passer, receiver, team)]
         links.append(
             CollaborationLink(
                 passer_tid=passer,
                 receiver_tid=receiver,
                 team=team,
                 count=count,
-                avg_quality=quality_sums[(passer, receiver, team)] / count,
+                avg_quality=(
+                    quality_sums[(passer, receiver, team)] / scored
+                    if scored
+                    else None
+                ),
             )
         )
     links.sort(key=lambda link: link.count, reverse=True)
@@ -98,16 +106,18 @@ def build_player_summaries(events: list[InferredPass]) -> list[PlayerPassSummary
     teams: dict[int, int] = {}
     made_counts: dict[int, int] = defaultdict(int)
     recv_counts: dict[int, int] = defaultdict(int)
-    made_quality: dict[int, list[float]] = defaultdict(list)
-    recv_quality: dict[int, list[float]] = defaultdict(list)
+    made_quality: dict[int, list[float | None]] = defaultdict(list)
+    recv_quality: dict[int, list[float | None]] = defaultdict(list)
 
     for event in events:
         teams[event.passer_tid] = event.team
         teams[event.receiver_tid] = event.team
         made_counts[event.passer_tid] += 1
         recv_counts[event.receiver_tid] += 1
-        made_quality[event.passer_tid].append(event.quality_score)
-        recv_quality[event.receiver_tid].append(event.quality_score)
+        if event.quality_score is not None:
+            made_quality[event.passer_tid].append(event.quality_score)
+        if event.quality_score is not None:
+            recv_quality[event.receiver_tid].append(event.quality_score)
 
     summaries: list[PlayerPassSummary] = []
     for tid in sorted(teams):
@@ -125,8 +135,8 @@ def build_player_summaries(events: list[InferredPass]) -> list[PlayerPassSummary
     return summaries
 
 
-def _mean(values: list[float]) -> float:
-    return float(np.mean(values)) if values else 0.0
+def _mean(values: list[float]) -> float | None:
+    return float(np.mean(values)) if values else None
 
 
 def build_pass_network(

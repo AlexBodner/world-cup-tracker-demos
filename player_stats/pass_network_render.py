@@ -7,7 +7,7 @@ import numpy as np
 import supervision as sv
 
 from world_cup_projects.common.pitch import image_to_pitch_m, warmup_goal_defenders
-from world_cup_projects.common.possession import bbox_center_xy, feet_xy
+from world_cup_projects.common.possession import bbox_center_xy, feet_xy, find_ball_carrier
 from world_cup_projects.common.soccernet import ROLE_PLAYER, SoccerNetSequence
 from world_cup_projects.common.visual import (
     ROBOFLOW_PURPLE_BGR,
@@ -33,6 +33,7 @@ from world_cup_projects.common.visual import (
     annotate_ball,
     annotate_players,
     draw_branding_tag,
+    draw_carrier_halo,
     draw_carrier_pulse,
     draw_carrier_spotlight,
     draw_glow_arrow,
@@ -44,6 +45,10 @@ from world_cup_projects.common.visual import (
     draw_text_shadow,
     ease_out_cubic,
 )
+def _format_quality(value: float | None) -> str:
+    return "n/a" if value is None else f"{value:.2f}"
+
+
 from world_cup_projects.player_stats.carrier_tracking import CarrierFrameState
 from world_cup_projects.player_stats.pass_events import (
     InferredPass,
@@ -478,7 +483,7 @@ def _stats_end_card(size: tuple[int, int], network: PassNetwork) -> np.ndarray:
         color = _team_color(link.team)
         line = (
             f"{rank}.  #{link.passer_tid} -> #{link.receiver_tid}"
-            f"   {link.count} passes  |  Avg Quality: {link.avg_quality:.2f}"
+            f"   {link.count} passes  |  Avg Quality: {_format_quality(link.avg_quality)}"
         )
         draw_text_shadow(
             card,
@@ -503,7 +508,7 @@ def _stats_end_card(size: tuple[int, int], network: PassNetwork) -> np.ndarray:
         line = (
             f"{rank}.  #{player.tracker_id}"
             f"   Made: {player.passes_made}  |  Received: {player.passes_received}"
-            f"  |  Avg Quality Made: {player.avg_quality_made:.2f}"
+            f"  |  Avg Quality Made: {_format_quality(player.avg_quality_made)}"
         )
         draw_text_shadow(
             card,
@@ -527,7 +532,7 @@ def _stats_end_card(size: tuple[int, int], network: PassNetwork) -> np.ndarray:
         draw_text_shadow(
             card,
             f"STRONGEST LINK:  #{best.passer_tid} -> #{best.receiver_tid}"
-            f"  ({best.count} passes, Avg Quality: {best.avg_quality:.2f})",
+            f"  ({best.count} passes, Avg Quality: {_format_quality(best.avg_quality)})",
             (44, h - 80),
             font_scale=0.72,
             color_bgr=(255, 220, 80),
@@ -636,7 +641,7 @@ def render_pass_network_demo(
     frame_transforms: dict | None = None,
     frame_radar_transforms: dict | None = None,
     frame_keypoints: dict | None = None,
-    pitch_confidence: float = 0.99,
+    pitch_confidence: float = 0.9,
     locked_goal_defenders: tuple[int, int] | None = None,
     stats_seconds: float = 5.0,
     debug_pitch_keypoints: bool = False,
@@ -645,6 +650,7 @@ def render_pass_network_demo(
     freeze_quality_threshold: float = 0.0,
     debug_carrier: bool = False,
     carrier_timeline: dict[int, CarrierFrameState] | None = None,
+    radar_anchor=None,
 ) -> dict:
     """Render tracked clip plus a stats end-card."""
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
@@ -674,6 +680,13 @@ def render_pass_network_demo(
         # 1. Base Annotations
         image = annotate_players(image, dets, show_tracker_ids=True)
         image = annotate_ball(image, dets)
+        carrier = find_ball_carrier(
+            dets,
+            transformer=radar_transformer if metric else None,
+        )
+        if carrier is not None:
+            feet = feet_xy(dets)[carrier.index]
+            draw_carrier_halo(image, (int(feet[0]), int(feet[1])))
 
         # 2. Historical Network (Collaboration Web)
         _draw_collaboration_web(image, dets, frame_idx, network.passes)
@@ -694,10 +707,10 @@ def render_pass_network_demo(
             show_predictions 
             and scorer is not None 
             and frame_idx in events_by_frame 
-            and events_by_frame[frame_idx].quality_score >= freeze_quality_threshold
+            and (qs := events_by_frame[frame_idx].quality_score) is not None
+            and qs >= freeze_quality_threshold
         ):
             event = events_by_frame[frame_idx]
-            from world_cup_projects.common.possession import find_ball_carrier
             carrier = find_ball_carrier(dets, transformer=radar_transformer)
             if carrier is not None:
                 options = scorer.top_options(frame_idx, dets, carrier, k=3)
@@ -759,13 +772,16 @@ def render_pass_network_demo(
         if metric and transformer is None and frame_transforms is not None:
             draw_text_shadow(image, "WARNING: Poor Pitch Detection", (20, 40), font_scale=0.6, color_bgr=(50, 50, 255), thickness=2)
             
-        if show_radar and metric and kps is not None and radar_transformer is not None:
+        if show_radar and metric and (
+            radar_anchor is not None or radar_transformer is not None
+        ):
             image = draw_radar_minimap(
                 image,
                 dets,
                 kps,
                 pitch_confidence=pitch_confidence,
                 transformer=radar_transformer,
+                clip_radar_transformer=radar_anchor,
                 locked_goal_defenders=locked_goal_defenders,
                 debug_keypoints=debug_pitch_keypoints,
             )
