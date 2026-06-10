@@ -1,10 +1,15 @@
 """Run v1 pass-network analysis (inferred passes + collaboration links).
 
-Metric analysis on a Bundesliga clip::
+From the monorepo root::
 
     PYTHONPATH=. python -m world_cup_projects.player_stats.pass_network_run \\
         --video world_cup_projects/bundesliga_videos/08fd33_0.mp4 \\
         --metric --source football --tracker botsort
+
+From inside ``world_cup_projects/``::
+
+    PYTHONPATH=. python -m player_stats.pass_network_run \\
+        --video bundesliga_videos/08fd33_0.mp4 --metric --render --debug-carrier
 
 SoccerNet GT tracks::
 
@@ -13,6 +18,17 @@ SoccerNet GT tracks::
 """
 
 from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+# Allow ``python -m player_stats.pass_network_run`` from the package directory
+# without ``pip install -e .`` (adds the parent repo root to sys.path).
+_pkg_root = Path(__file__).resolve().parents[1]
+_repo_root = _pkg_root.parent
+if (_repo_root / "world_cup_projects" / "__init__.py").is_file():
+    if str(_repo_root) not in sys.path:
+        sys.path.insert(0, str(_repo_root))
 
 import argparse
 import json
@@ -30,7 +46,8 @@ from world_cup_projects.pass_alternatives.pass_options import PassWeights
 from world_cup_projects.player_stats.pass_events import (
     PassDetectionConfig,
     PassQualityScorer,
-    detect_pass_events,
+    build_pass_carrier_timeline,
+    scan_possession_events,
 )
 from world_cup_projects.player_stats.pass_network import PassNetwork, build_pass_network
 from world_cup_projects.player_stats.pass_network_render import render_pass_network_demo
@@ -83,15 +100,20 @@ def analyze_pass_network(
     scorer: PassQualityScorer,
     config: PassDetectionConfig,
 ) -> PassNetwork:
-    """Infer passes from materialized detections and build a collaboration snapshot."""
-    events = detect_pass_events(
+    """Infer passes and turnovers; build a collaboration snapshot."""
+    scan = scan_possession_events(
         iter(frames),
         scorer=scorer,
         config=config,
         metric=metric,
         transformers=scorer._transformers,
     )
-    return build_pass_network(sequence.name, events, metric=metric)
+    return build_pass_network(
+        sequence.name,
+        list(scan.passes),
+        list(scan.turnovers),
+        metric=metric,
+    )
 
 
 def main() -> None:
@@ -109,9 +131,22 @@ def main() -> None:
     parser.add_argument("--pitch-confidence", type=float, default=0.99)
     parser.add_argument("--refresh-detections-cache", action="store_true")
     parser.add_argument(
-        "--carrier-max-m",
+        "--control-max-m",
         type=float,
-        default=PassDetectionConfig.carrier_max_distance_m,
+        default=PassDetectionConfig.control_max_distance_m,
+        help="Tight feet distance for sustained control.",
+    )
+    parser.add_argument(
+        "--reception-max-m",
+        type=float,
+        default=PassDetectionConfig.reception_max_distance_m,
+        help="Looser distance for one-touch reception.",
+    )
+    parser.add_argument(
+        "--min-ball-travel-m",
+        type=float,
+        default=PassDetectionConfig.min_ball_travel_m,
+        help="Minimum ball travel between passer and receiver.",
     )
     parser.add_argument(
         "--min-pass-gap",
@@ -157,6 +192,23 @@ def main() -> None:
         default=0.0,
         help="Only freeze for passes with quality score above this threshold.",
     )
+    parser.add_argument(
+        "--min-arrival-frames",
+        type=int,
+        default=PassDetectionConfig.min_arrival_frames,
+        help="Frames a receiver must hold the ball after in-flight before pass counts.",
+    )
+    parser.add_argument(
+        "--min-control-frames",
+        type=int,
+        default=PassDetectionConfig.min_control_frames,
+        help="Consecutive control frames before crediting a player as passer.",
+    )
+    parser.add_argument(
+        "--debug-carrier",
+        action="store_true",
+        help="Overlay per-frame ball-carrier HUD (control/reception, anchor, in-flight).",
+    )
     args = parser.parse_args()
 
     if args.video:
@@ -176,8 +228,12 @@ def main() -> None:
     config = PassDetectionConfig(
         min_carrier_gap_frames=args.min_pass_gap,
         max_pass_gap_frames=args.max_pass_gap,
-        carrier_max_distance_m=args.carrier_max_m,
-    )
+        control_max_distance_m=args.control_max_m,
+        reception_max_distance_m=args.reception_max_m,
+        min_ball_travel_m=args.min_ball_travel_m,
+        min_arrival_frames=args.min_arrival_frames,
+        min_control_frames=args.min_control_frames,
+    ).for_frame_rate(sequence.frame_rate)
     detections_source = _load_detections_source(args, sequence)
     end = args.max_frames if args.max_frames is not None else sequence.length
     frames = list(detections_source(sequence, start=1, end=end))
@@ -262,8 +318,22 @@ def main() -> None:
     tag = args.source + ("_metric" if args.metric else "")
     if args.debug_pitch_keypoints:
         tag += "_pitch_kp_debug"
+    if args.debug_carrier:
+        tag += "_carrier_debug"
     json_path = out_dir / f"pass_network_{tag}_{sequence.name}.json"
     json_path.write_text(json.dumps(manifest, indent=2))
+
+    carrier_timeline = None
+    if args.debug_carrier:
+        carrier_timeline = {
+            state.frame_idx: state
+            for state in build_pass_carrier_timeline(
+                iter(frames),
+                config=config,
+                metric=args.metric,
+                transformers=frame_transforms if args.metric else None,
+            )
+        }
 
     should_render = args.render or (args.video is not None and not args.no_render)
     if should_render:
@@ -287,6 +357,8 @@ def main() -> None:
             scorer=scorer,
             show_predictions=args.show_predictions,
             freeze_quality_threshold=args.freeze_quality_threshold,
+            debug_carrier=args.debug_carrier,
+            carrier_timeline=carrier_timeline,
         )
         manifest["video"] = render_manifest["output"]
         json_path.write_text(json.dumps(manifest, indent=2))

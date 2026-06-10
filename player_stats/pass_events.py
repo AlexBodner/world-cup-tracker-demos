@@ -1,8 +1,29 @@
 """Infer pass events from per-frame ball-carrier handoffs.
 
-A pass is detected when possession moves from teammate A to teammate B on the
-same team within a short frame window. Each event is scored with the same lane
-openness model used by the pass-alternatives demo.
+Simple rule set (per team, frame by frame)
+------------------------------------------
+1. **Valid touch** — ball is nearest this player's feet; reject aerial *control*
+   (reception at chest height is OK).
+2. **Passer** — player who *released* the ball:
+   - outfield: ``min_control_frames`` consecutive control frames, OR
+   - goalkeeper: one control/reception frame, OR
+   - any role: last valid touch within ``pre_flight_release_window`` when the
+     ball goes in-flight (covers punts and one-touch releases).
+3. **Receiver** — teammate who gets the ball after a gap:
+   - ``min_arrival_frames`` consecutive valid touches (filters deflections).
+   - if gap passer→receiver < ``adjacent_pass_max_gap_frames``, receiver must
+     also show brief control (filters fly-by false receptions on quick plays).
+4. **Emit pass** — same team, frame gap in range, min ball travel, no opponent
+   *control* between passer and receiver, dedupe nearby duplicates.
+5. **Emit turnover** — team A releases the ball; an opponent touches it before
+   any teammate of A arrives (snapshot release on first opponent touch). When
+   that opponent later completes a pass, attribute the turnover to their
+   first touch frame. Teammate arrivals are ignored if an opponent controlled
+   the ball in between.
+
+Distance gates: tight *control* at the feet; looser *reception* for first
+contact / one-touch. Anchors survive in-flight stretches (ball visible but no
+player in range).
 """
 
 from __future__ import annotations
@@ -19,8 +40,6 @@ from world_cup_projects.common.pitch import (
     pitch_attack_direction,
 )
 from world_cup_projects.common.possession import (
-    CARRIER_MAX_DISTANCE_M,
-    CARRIER_MAX_DISTANCE_PX,
     Carrier,
     ball_xy,
     bbox_center_xy,
@@ -28,6 +47,7 @@ from world_cup_projects.common.possession import (
     find_ball_carrier,
     player_mask,
 )
+from world_cup_projects.common.soccernet import ROLE_GOALKEEPER
 from world_cup_projects.common.tracking_facing import carrier_kalman_direction
 from world_cup_projects.pass_alternatives.pass_options import (
     PassOption,
@@ -35,25 +55,86 @@ from world_cup_projects.pass_alternatives.pass_options import (
     score_pass_options,
     top_pass_options,
 )
+from world_cup_projects.player_stats.carrier_tracking import (
+    CarrierFrameState,
+    CarrierTrackingConfig,
+    build_carrier_timeline,
+)
 
 DetectionIterator = Iterator[tuple[int, sv.Detections]]
 
 
 @dataclass(frozen=True)
 class PassDetectionConfig:
-    """Heuristic gates for carrier-to-carrier pass inference."""
+    """Heuristic gates for carrier-to-carrier pass inference.
 
-    min_carrier_gap_frames: int = 2
-    max_pass_gap_frames: int = 120
-    min_ball_travel_m: float = 3.0
-    min_ball_travel_px: float = 40.0
-    # Tightened distance to require the ball to be extremely close to outfield feet
-    # This prevents aerial passes from triggering false possession during pixel-fallback
-    carrier_max_distance_m: float = 0.5
-    carrier_max_distance_px: float = 35.0
-    # Allow 2-touch passes minimum, relying on dual-distance to catch them
-    min_consecutive_possession_frames: int = 2
+    Defaults assume ~25 fps. Frame counts can be scaled via
+    :meth:`for_frame_rate` when working at a different rate.
+    """
 
+    min_carrier_gap_frames: int = 1
+    max_pass_gap_frames: int = 50  # ~2 s at 25 fps
+    min_ball_travel_m: float = 1.0
+    min_ball_travel_px: float = 25.0
+    control_max_distance_m: float = 0.8
+    control_max_distance_px: float = 55.0
+    reception_max_distance_m: float = 1.8
+    reception_max_distance_px: float = 120.0
+    missing_ball_tolerance: int = 3
+    dedupe_window_frames: int = 12
+    min_arrival_frames: int = 3
+    min_control_frames: int = 3
+    min_gk_control_frames: int = 1
+    pre_flight_release_window: int = 10  # ~0.4 s before ball leaves range
+    adjacent_pass_max_gap_frames: int = 15  # quick plays need control at receiver
+    aerial_dy_threshold_px: float = 20.0
+    max_plausible_travel_m: float = 40.0
+
+    def for_frame_rate(self, fps: float, *, base_fps: float = 25.0) -> PassDetectionConfig:
+        """Scale time-based frame counts for a different video frame rate."""
+        if fps <= 0:
+            return self
+        scale = fps / base_fps
+        return PassDetectionConfig(
+            min_carrier_gap_frames=self.min_carrier_gap_frames,
+            max_pass_gap_frames=max(1, round(self.max_pass_gap_frames * scale)),
+            min_ball_travel_m=self.min_ball_travel_m,
+            min_ball_travel_px=self.min_ball_travel_px,
+            control_max_distance_m=self.control_max_distance_m,
+            control_max_distance_px=self.control_max_distance_px,
+            reception_max_distance_m=self.reception_max_distance_m,
+            reception_max_distance_px=self.reception_max_distance_px,
+            missing_ball_tolerance=max(1, round(self.missing_ball_tolerance * scale)),
+            dedupe_window_frames=max(1, round(self.dedupe_window_frames * scale)),
+            min_arrival_frames=max(1, round(self.min_arrival_frames * scale)),
+            min_control_frames=max(1, round(self.min_control_frames * scale)),
+            min_gk_control_frames=max(1, round(self.min_gk_control_frames * scale)),
+            pre_flight_release_window=max(
+                1, round(self.pre_flight_release_window * scale)
+            ),
+            adjacent_pass_max_gap_frames=max(
+                1, round(self.adjacent_pass_max_gap_frames * scale)
+            ),
+            aerial_dy_threshold_px=self.aerial_dy_threshold_px,
+            max_plausible_travel_m=self.max_plausible_travel_m,
+        )
+
+    def tracking_config(self) -> CarrierTrackingConfig:
+        return CarrierTrackingConfig(
+            control_max_distance_m=self.control_max_distance_m,
+            control_max_distance_px=self.control_max_distance_px,
+            reception_max_distance_m=self.reception_max_distance_m,
+            reception_max_distance_px=self.reception_max_distance_px,
+            min_pass_gap_frames=self.min_carrier_gap_frames,
+            max_pass_gap_frames=self.max_pass_gap_frames,
+            min_arrival_frames=self.min_arrival_frames,
+            min_control_frames=self.min_control_frames,
+            min_gk_control_frames=self.min_gk_control_frames,
+            pre_flight_release_window=self.pre_flight_release_window,
+            adjacent_pass_max_gap_frames=self.adjacent_pass_max_gap_frames,
+            aerial_dy_threshold_px=self.aerial_dy_threshold_px,
+            missing_ball_tolerance=self.missing_ball_tolerance,
+        )
 
 
 @dataclass(frozen=True)
@@ -72,9 +153,34 @@ class InferredPass:
     rivals_in_lane: int
     motion_alignment: float
     receiver_space: float
+    touch_kind: str = "control"
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+
+@dataclass(frozen=True)
+class InferredTurnover:
+    """Possession lost: passer released the ball, opponent received it in-flight."""
+
+    release_frame: int
+    interception_frame: int
+    passer_tid: int
+    passer_team: int
+    interceptor_tid: int
+    interceptor_team: int
+    gap_frames: int
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class PossessionScanResult:
+    """Completed passes and interceptions from one scan of the clip."""
+
+    passes: tuple[InferredPass, ...]
+    turnovers: tuple[InferredTurnover, ...]
 
 
 class PassQualityScorer:
@@ -134,14 +240,13 @@ class PassQualityScorer:
                 pitch_cm=pitch_cm,
                 body_pitch_m=body_pitch_m,
             )
-        else:
-            return top_pass_options(
-                dets,
-                carrier,
-                k=k,
-                weights=self._weights,
-                carrier_motion_dir=motion_dir,
-            )
+        return top_pass_options(
+            dets,
+            carrier,
+            k=k,
+            weights=self._weights,
+            carrier_motion_dir=motion_dir,
+        )
 
     def option_for_receiver(
         self,
@@ -216,17 +321,139 @@ def _ball_travel(
     metric: bool,
     transformer_from,
     transformer_to,
-    min_travel_m: float,
-    min_travel_px: float,
 ) -> float | None:
     """Distance the ball moved between two carrier frames (m or px)."""
+    travel_px = float(np.linalg.norm(ball_to - ball_from))
     if metric and transformer_from is not None and transformer_to is not None:
         p0 = image_to_pitch_m(np.array([ball_from], dtype=np.float32), transformer_from)
         p1 = image_to_pitch_m(np.array([ball_to], dtype=np.float32), transformer_to)
         if p0 is not None and p1 is not None:
-            return float(np.linalg.norm(p1[0] - p0[0]))
+            travel_m = float(np.linalg.norm(p1[0] - p0[0]))
+            return travel_m
+        return travel_px
+    return travel_px
+
+
+def _effective_ball_travel(
+    ball_from: np.ndarray,
+    ball_to: np.ndarray,
+    *,
+    metric: bool,
+    transformer_from,
+    transformer_to,
+    config: PassDetectionConfig,
+) -> float | None:
+    """Ball travel with pixel fallback when pitch projection is unreliable."""
+    travel = _ball_travel(
+        ball_from,
+        ball_to,
+        metric=metric,
+        transformer_from=transformer_from,
+        transformer_to=transformer_to,
+    )
+    if travel is None:
         return None
-    return float(np.linalg.norm(ball_to - ball_from))
+    if metric and travel > config.max_plausible_travel_m:
+        travel_px = float(np.linalg.norm(ball_to - ball_from))
+        return travel_px
+    return travel
+
+
+def _opponent_control_between(
+    frames_by_idx: dict[int, sv.Detections],
+    *,
+    start_frame: int,
+    end_frame: int,
+    passer_team: int,
+    config: PassDetectionConfig,
+    transformers: dict[int, object],
+    metric: bool,
+) -> bool:
+    """True if an opponent had sustained control between two teammate touches."""
+    for frame_idx in range(start_frame + 1, end_frame):
+        dets = frames_by_idx.get(frame_idx)
+        if dets is None:
+            continue
+        transformer = transformers.get(frame_idx) if metric else None
+        carrier, touch_kind = _active_carrier(
+            dets, transformer=transformer, config=config
+        )
+        if (
+            carrier is not None
+            and touch_kind == "control"
+            and int(carrier.team) != passer_team
+        ):
+            return True
+    return False
+
+
+def _min_travel_threshold(config: PassDetectionConfig, *, metric: bool) -> float:
+    return config.min_ball_travel_m if metric else config.min_ball_travel_px
+
+
+def _try_emit_pass(
+    events: list[InferredPass],
+    *,
+    release_frame: int,
+    release_dets: sv.Detections,
+    release_carrier: Carrier,
+    passer_tid: int,
+    receiver_tid: int,
+    arrival_frame: int,
+    arrival_carrier: Carrier,
+    touch_kind: str,
+    scorer: PassQualityScorer,
+    config: PassDetectionConfig,
+    metric: bool,
+    transformers: dict[int, object],
+) -> bool:
+    """Append one inferred pass if all gates pass."""
+    gap = arrival_frame - release_frame
+    if gap < config.min_carrier_gap_frames or gap > config.max_pass_gap_frames:
+        return False
+
+    travel = _effective_ball_travel(
+        release_carrier.ball,
+        arrival_carrier.ball,
+        metric=metric,
+        transformer_from=transformers.get(release_frame),
+        transformer_to=transformers.get(arrival_frame),
+        config=config,
+    )
+    min_travel = _min_travel_threshold(config, metric=metric)
+    if travel is None or travel < min_travel:
+        return False
+
+    if _recent_duplicate(
+        events,
+        passer_tid,
+        receiver_tid,
+        release_frame,
+        window=config.dedupe_window_frames,
+    ):
+        return False
+
+    option = scorer.option_for_receiver(
+        release_frame, release_dets, release_carrier, receiver_tid
+    )
+    events.append(
+        InferredPass(
+            frame_idx=release_frame,
+            passer_tid=passer_tid,
+            receiver_tid=receiver_tid,
+            team=int(release_carrier.team),
+            gap_frames=gap,
+            pass_length_m=_pass_length_m(option, metric),
+            quality_score=float(option.score) if option else 0.0,
+            openness=float(option.openness) if option else 0.0,
+            forward_gain=float(option.forward_gain) if option else 0.0,
+            rivals_in_lane=int(option.rivals_in_lane) if option else 0,
+            motion_alignment=float(option.motion_alignment) if option else 0.0,
+            receiver_space=float(option.receiver_space) if option else 0.0,
+            touch_kind=touch_kind,
+        )
+    )
+    return True
 
 
 def _pass_length_m(option: PassOption | None, metric: bool) -> float | None:
@@ -237,6 +464,480 @@ def _pass_length_m(option: PassOption | None, metric: bool) -> float | None:
     return None
 
 
+def _control_carrier(
+    dets: sv.Detections,
+    *,
+    transformer,
+    config: PassDetectionConfig,
+) -> Carrier | None:
+    return find_ball_carrier(
+        dets,
+        max_distance_px=config.control_max_distance_px,
+        transformer=transformer,
+        max_distance_m=config.control_max_distance_m,
+    )
+
+
+def _reception_carrier(
+    dets: sv.Detections,
+    *,
+    transformer,
+    config: PassDetectionConfig,
+) -> Carrier | None:
+    return find_ball_carrier(
+        dets,
+        max_distance_px=config.reception_max_distance_px,
+        transformer=transformer,
+        max_distance_m=config.reception_max_distance_m,
+    )
+
+
+def _active_carrier(
+    dets: sv.Detections,
+    *,
+    transformer,
+    config: PassDetectionConfig,
+) -> tuple[Carrier | None, str | None]:
+    control = _control_carrier(dets, transformer=transformer, config=config)
+    if control is not None:
+        return control, "control"
+    reception = _reception_carrier(dets, transformer=transformer, config=config)
+    if reception is not None:
+        return reception, "reception"
+    return None, None
+
+
+def _nearest_player_tid(dets: sv.Detections, ball: np.ndarray) -> int | None:
+    pmask = player_mask(dets)
+    if not pmask.any() or dets.tracker_id is None:
+        return None
+    feet = feet_xy(dets)[pmask]
+    tids = dets.tracker_id[pmask]
+    dist = np.hypot(feet[:, 0] - ball[0], feet[:, 1] - ball[1])
+    tid = int(tids[int(np.argmin(dist))])
+    return tid if tid >= 0 else None
+
+
+def _is_aerial_touch(
+    dets: sv.Detections,
+    carrier: Carrier,
+    *,
+    threshold_px: float,
+) -> bool:
+    ball = ball_xy(dets)
+    if ball is None:
+        return False
+    feet = feet_xy(dets)[carrier.index]
+    return abs(float(ball[1] - feet[1])) > threshold_px
+
+
+def _is_valid_possession_touch(
+    dets: sv.Detections,
+    carrier: Carrier,
+    *,
+    touch_kind: str,
+    config: PassDetectionConfig,
+) -> bool:
+    """Reject aerial fly-bys and nearest-player mismatches.
+
+    Aerial veto applies to *control* only — chest-height receptions are common.
+    """
+    if touch_kind == "control" and _is_aerial_touch(
+        dets, carrier, threshold_px=config.aerial_dy_threshold_px
+    ):
+        return False
+    ball = carrier.ball
+    tid = int(dets.tracker_id[carrier.index]) if dets.tracker_id is not None else -1
+    nearest_tid = _nearest_player_tid(dets, ball)
+    return nearest_tid is not None and nearest_tid == tid
+
+
+@dataclass
+class _TeamPossessionState:
+    release: tuple[int, sv.Detections, Carrier, int] | None = None
+    last_touch: tuple[int, sv.Detections, Carrier, int] | None = None
+    possession_tid: int = -1
+    control_streak: int = 0
+    in_flight: bool = False
+    arrival_candidate_tid: int = -1
+    arrival_streak: int = 0
+    arrival_control_streak: int = 0
+    turnover_snapshot: tuple[int, int] | None = None
+
+
+def _is_goalkeeper(dets: sv.Detections, carrier_index: int) -> bool:
+    return int(dets.class_id[carrier_index]) == ROLE_GOALKEEPER
+
+
+def _min_control_frames_for(
+    dets: sv.Detections,
+    carrier: Carrier,
+    *,
+    config: PassDetectionConfig,
+) -> int:
+    if _is_goalkeeper(dets, carrier.index):
+        return config.min_gk_control_frames
+    return config.min_control_frames
+
+
+def _promote_pre_flight_release(
+    state: _TeamPossessionState,
+    frame_idx: int,
+    *,
+    config: PassDetectionConfig,
+) -> None:
+    """Credit a brief touch as the passer when the ball immediately goes in-flight."""
+    if state.release is not None or state.last_touch is None:
+        return
+    touch_frame, touch_dets, touch_carrier, touch_tid = state.last_touch
+    if frame_idx - touch_frame > config.pre_flight_release_window:
+        return
+    state.release = (touch_frame, touch_dets, touch_carrier, touch_tid)
+
+
+def _recent_duplicate(
+    events: list[InferredPass],
+    passer_tid: int,
+    receiver_tid: int,
+    frame_idx: int,
+    *,
+    window: int,
+) -> bool:
+    for event in reversed(events):
+        if frame_idx - event.frame_idx > window:
+            break
+        if event.passer_tid == passer_tid and event.receiver_tid == receiver_tid:
+            return True
+    return False
+
+
+def _confirm_release(
+    state: _TeamPossessionState,
+    frame_idx: int,
+    dets: sv.Detections,
+    carrier: Carrier,
+    tid: int,
+) -> None:
+    state.release = (frame_idx, dets, carrier, tid)
+
+
+def _recent_turnover_duplicate(
+    events: list[InferredTurnover],
+    passer_tid: int,
+    interceptor_tid: int,
+    release_frame: int,
+    *,
+    window: int,
+) -> bool:
+    for event in reversed(events):
+        if release_frame - event.release_frame > window:
+            break
+        if (
+            event.passer_tid == passer_tid
+            and event.interceptor_tid == interceptor_tid
+        ):
+            return True
+    return False
+
+
+def _try_emit_turnover(
+    losing_state: _TeamPossessionState,
+    *,
+    interceptor_tid: int,
+    interceptor_team: int,
+    interception_frame: int,
+    turnovers: list[InferredTurnover],
+    config: PassDetectionConfig,
+    release_frame: int | None = None,
+    passer_tid: int | None = None,
+) -> bool:
+    """Rule 5: opponent takes the ball while our release is still pending."""
+    if release_frame is None or passer_tid is None:
+        release = losing_state.release
+        if release is None:
+            return False
+        release_frame, _, _, passer_tid = release
+    gap = interception_frame - release_frame
+    if gap < config.min_carrier_gap_frames or gap > config.max_pass_gap_frames:
+        return False
+
+    if _recent_turnover_duplicate(
+        turnovers,
+        passer_tid,
+        interceptor_tid,
+        release_frame,
+        window=config.dedupe_window_frames,
+    ):
+        return False
+
+    turnovers.append(
+        InferredTurnover(
+            release_frame=release_frame,
+            interception_frame=interception_frame,
+            passer_tid=passer_tid,
+            passer_team=1 - interceptor_team,
+            interceptor_tid=interceptor_tid,
+            interceptor_team=interceptor_team,
+            gap_frames=gap,
+        )
+    )
+    losing_state.release = None
+    losing_state.in_flight = False
+    losing_state.arrival_candidate_tid = -1
+    losing_state.arrival_streak = 0
+    losing_state.arrival_control_streak = 0
+    losing_state.turnover_snapshot = None
+    return True
+
+
+def _on_confirmed_possession(
+    state: _TeamPossessionState,
+    frame_idx: int,
+    dets: sv.Detections,
+    carrier: Carrier,
+    tid: int,
+) -> None:
+    """Credit sustained possession on this team."""
+    _confirm_release(state, frame_idx, dets, carrier, tid)
+
+
+def _first_valid_touch_frame(
+    frames_by_idx: dict[int, sv.Detections],
+    *,
+    player_tid: int,
+    start_frame: int,
+    end_frame: int,
+    config: PassDetectionConfig,
+    transformers: dict[int, object],
+    metric: bool,
+) -> int | None:
+    """First frame in ``(start_frame, end_frame)`` where ``player_tid`` has a valid touch."""
+    for frame_idx in range(start_frame + 1, end_frame):
+        dets = frames_by_idx.get(frame_idx)
+        if dets is None:
+            continue
+        transformer = transformers.get(frame_idx) if metric else None
+        carrier, touch_kind = _active_carrier(
+            dets, transformer=transformer, config=config
+        )
+        touch_kind = touch_kind or "reception"
+        if carrier is None or not _is_valid_possession_touch(
+            dets, carrier, touch_kind=touch_kind, config=config
+        ):
+            continue
+        if dets.tracker_id is None:
+            continue
+        if int(dets.tracker_id[carrier.index]) == player_tid:
+            return frame_idx
+    return None
+
+
+def scan_possession_events(
+    detections_iter: DetectionIterator,
+    *,
+    scorer: PassQualityScorer,
+    config: PassDetectionConfig = PassDetectionConfig(),
+    metric: bool = True,
+    transformers: dict[int, object] | None = None,
+) -> PossessionScanResult:
+    """Scan tracked detections for passes (rule 4) and turnovers (rule 5)."""
+    transformers = transformers or {}
+    passes: list[InferredPass] = []
+    turnovers: list[InferredTurnover] = []
+    frames_by_idx: dict[int, sv.Detections] = {}
+    team_states: dict[int, _TeamPossessionState] = {
+        0: _TeamPossessionState(),
+        1: _TeamPossessionState(),
+    }
+
+    def _expire_stale_releases(frame_idx: int) -> None:
+        for state in team_states.values():
+            if state.release is None or state.in_flight:
+                continue
+            release_frame = state.release[0]
+            if frame_idx - release_frame > config.max_pass_gap_frames:
+                state.release = None
+                state.arrival_candidate_tid = -1
+                state.arrival_streak = 0
+                state.arrival_control_streak = 0
+
+    def _update_control_streak(state: _TeamPossessionState, tid: int) -> None:
+        if tid == state.possession_tid:
+            state.control_streak += 1
+        else:
+            state.possession_tid = tid
+            state.control_streak = 1
+
+    for frame_idx, dets in detections_iter:
+        frames_by_idx[frame_idx] = dets
+        _expire_stale_releases(frame_idx)
+        transformer = transformers.get(frame_idx) if metric else None
+        carrier, touch_kind = _active_carrier(
+            dets, transformer=transformer, config=config
+        )
+
+        touch_kind = touch_kind or "reception"
+        if carrier is None or not _is_valid_possession_touch(
+            dets, carrier, touch_kind=touch_kind, config=config
+        ):
+            if ball_xy(dets) is not None:
+                for state in team_states.values():
+                    if not state.in_flight:
+                        _promote_pre_flight_release(
+                            state, frame_idx, config=config
+                        )
+                    state.in_flight = True
+                    state.arrival_candidate_tid = -1
+                    state.arrival_streak = 0
+                    state.arrival_control_streak = 0
+            continue
+
+        tid = int(dets.tracker_id[carrier.index]) if dets.tracker_id is not None else -1
+        team = int(carrier.team)
+        if tid < 0 or team not in (0, 1):
+            continue
+
+        state = team_states[team]
+        other_state = team_states[1 - team]
+        if (
+            other_state.release is not None
+            and frame_idx > other_state.release[0]
+            and other_state.turnover_snapshot is None
+        ):
+            other_state.turnover_snapshot = (
+                other_state.release[0],
+                other_state.release[3],
+            )
+
+        state.in_flight = False
+        state.last_touch = (frame_idx, dets, carrier, tid)
+        min_control = _min_control_frames_for(dets, carrier, config=config)
+
+        if touch_kind == "control":
+            _update_control_streak(state, tid)
+            if state.control_streak >= min_control:
+                _on_confirmed_possession(state, frame_idx, dets, carrier, tid)
+        else:
+            state.possession_tid = tid
+            state.control_streak = 0
+            if _is_goalkeeper(dets, carrier.index):
+                _on_confirmed_possession(state, frame_idx, dets, carrier, tid)
+
+        release = state.release
+        if release is None:
+            continue
+
+        release_frame, release_dets, release_carrier, release_tid = release
+
+        if tid == release_tid:
+            state.release = (frame_idx, dets, carrier, tid)
+            state.arrival_candidate_tid = -1
+            state.arrival_streak = 0
+            state.arrival_control_streak = 0
+            continue
+
+        if tid == state.arrival_candidate_tid:
+            state.arrival_streak += 1
+            if touch_kind == "control":
+                state.arrival_control_streak += 1
+            else:
+                state.arrival_control_streak = 0
+        else:
+            state.arrival_candidate_tid = tid
+            state.arrival_streak = 1
+            state.arrival_control_streak = 1 if touch_kind == "control" else 0
+
+        arrival_ready = state.arrival_streak >= config.min_arrival_frames
+        adjacent = (
+            frame_idx - release_frame
+        ) < config.adjacent_pass_max_gap_frames
+        if arrival_ready and adjacent:
+            arrival_ready = (
+                state.arrival_control_streak >= config.min_control_frames
+            )
+
+        if not arrival_ready:
+            continue
+
+        if _opponent_control_between(
+            frames_by_idx,
+            start_frame=release_frame,
+            end_frame=frame_idx,
+            passer_team=team,
+            config=config,
+            transformers=transformers,
+            metric=metric,
+        ):
+            continue
+
+        if _try_emit_pass(
+            passes,
+            release_frame=release_frame,
+            release_dets=release_dets,
+            release_carrier=release_carrier,
+            passer_tid=release_tid,
+            receiver_tid=tid,
+            arrival_frame=frame_idx,
+            arrival_carrier=carrier,
+            touch_kind=touch_kind,
+            scorer=scorer,
+            config=config,
+            metric=metric,
+            transformers=transformers,
+        ):
+            losing = other_state
+            snapshot = losing.turnover_snapshot
+            if snapshot is not None:
+                losing_release_frame, losing_passer_tid = snapshot
+                intercept_frame = _first_valid_touch_frame(
+                    frames_by_idx,
+                    player_tid=tid,
+                    start_frame=losing_release_frame,
+                    end_frame=frame_idx,
+                    config=config,
+                    transformers=transformers,
+                    metric=metric,
+                )
+                if intercept_frame is not None and _opponent_control_between(
+                    frames_by_idx,
+                    start_frame=losing_release_frame,
+                    end_frame=intercept_frame,
+                    passer_team=1 - team,
+                    config=config,
+                    transformers=transformers,
+                    metric=metric,
+                ):
+                    _try_emit_turnover(
+                        losing,
+                        interceptor_tid=tid,
+                        interceptor_team=team,
+                        interception_frame=intercept_frame,
+                        turnovers=turnovers,
+                        config=config,
+                        release_frame=losing_release_frame,
+                        passer_tid=losing_passer_tid,
+                    )
+        _confirm_release(state, frame_idx, dets, carrier, tid)
+        if not _opponent_control_between(
+            frames_by_idx,
+            start_frame=release_frame,
+            end_frame=frame_idx,
+            passer_team=team,
+            config=config,
+            transformers=transformers,
+            metric=metric,
+        ):
+            state.turnover_snapshot = None
+        state.arrival_candidate_tid = -1
+        state.arrival_streak = 0
+        state.arrival_control_streak = 0
+
+    return PossessionScanResult(
+        passes=tuple(passes),
+        turnovers=tuple(turnovers),
+    )
+
+
 def detect_pass_events(
     detections_iter: DetectionIterator,
     *,
@@ -245,138 +946,29 @@ def detect_pass_events(
     metric: bool = True,
     transformers: dict[int, object] | None = None,
 ) -> list[InferredPass]:
-    """Scan tracked detections and infer directed pass events."""
-    transformers = transformers or {}
-    
-    events: list[InferredPass] = []
-    
-    current_candidate_tid = -1
-    candidate_frames = 0
-    candidate_first_frame = -1
-    candidate_first_carrier = None
-    candidate_first_dets = None
-    missing_ball_tolerance = 0  # Allow a few frames of occlusion without dropping possession
+    """Return completed passes only (see :func:`scan_possession_events` for turnovers)."""
+    return list(
+        scan_possession_events(
+            detections_iter,
+            scorer=scorer,
+            config=config,
+            metric=metric,
+            transformers=transformers,
+        ).passes
+    )
 
-    # Stores the latest frame where a confirmed carrier had the ball (release frame)
-    confirmed_passer: tuple[int, sv.Detections, Carrier, int] | None = None
-    
-    # Tracks the first frame the ball entered a player's vicinity (~3m / 100px)
-    proximity_frames: dict[int, int] = {}
 
-    for frame_idx, dets in detections_iter:
-        transformer = transformers.get(frame_idx) if metric else None
-        
-        # Track ball proximity to backdate reception time
-        ball = ball_xy(dets)
-        if ball is not None:
-            pmask = player_mask(dets)
-            if pmask.any():
-                feet_img = feet_xy(dets)[pmask]
-                tids = dets.tracker_id[pmask]
-                dist_px = np.hypot(feet_img[:, 0] - ball[0], feet_img[:, 1] - ball[1])
-                for i, tid_raw in enumerate(tids):
-                    tid_val = int(tid_raw)
-                    if tid_val < 0: continue
-                    d = dist_px[i]
-                    if d < 100.0:  # Ball within ~3 meters (aerial reception / chesting)
-                        if tid_val not in proximity_frames:
-                            proximity_frames[tid_val] = frame_idx
-                    elif d > 150.0:  # Ball left vicinity
-                        proximity_frames.pop(tid_val, None)
-
-        carrier = find_ball_carrier(
-            dets,
-            max_distance_px=config.carrier_max_distance_px,
-            transformer=transformer,
-            max_distance_m=config.carrier_max_distance_m,
-        )
-        
-        # 1. Occlusion Tolerance: Ball or Carrier missing
-        if carrier is None:
-            if current_candidate_tid >= 0:
-                missing_ball_tolerance += 1
-                if missing_ball_tolerance > 3:  # Drop candidate after ~100ms of no ball
-                    current_candidate_tid = -1
-                    candidate_frames = 0
-            continue
-
-        tid = int(dets.tracker_id[carrier.index]) if dets.tracker_id is not None else -1
-        if tid < 0 or carrier.team not in (0, 1):
-            continue
-
-        # 2. Update Candidate State
-        from world_cup_projects.common.soccernet import ROLE_GOALKEEPER
-        role = dets.class_id[carrier.index]
-        required_frames = 1 if role == ROLE_GOALKEEPER else config.min_consecutive_possession_frames
-
-        if tid == current_candidate_tid:
-            # Same player touches it again (or still has it)
-            if missing_ball_tolerance > 0 and candidate_frames < required_frames:
-                # Possession was broken before being confirmed; restart the consecutive count.
-                candidate_frames = 1
-            else:
-                # Allow possession counter to increment if it was paused by occlusion
-                candidate_frames += 1 + missing_ball_tolerance
-            missing_ball_tolerance = 0  # Reset tolerance
-        else:
-            # New player touched the ball
-            current_candidate_tid = tid
-            candidate_frames = 1
-            missing_ball_tolerance = 0
-            candidate_first_frame = frame_idx
-            candidate_first_carrier = carrier
-            candidate_first_dets = dets
-
-        # 3. Check for Confirmation
-        if candidate_frames >= required_frames and (candidate_frames - missing_ball_tolerance) <= required_frames:
-            # We confirmed possession for this player on this exact frame!
-            if confirmed_passer is not None:
-                p_frame, p_dets, p_carrier, p_tid = confirmed_passer
-
-                # Backdate the reception to when the ball first entered the receiver's vicinity
-                recv_frame = proximity_frames.get(current_candidate_tid, candidate_first_frame)
-                recv_frame = max(p_frame + 1, min(recv_frame, candidate_first_frame))
-                gap = recv_frame - p_frame
-
-                if p_tid != current_candidate_tid and p_carrier.team == carrier.team:
-                    if config.min_carrier_gap_frames <= gap <= config.max_pass_gap_frames:
-                        travel = _ball_travel(
-                            p_carrier.ball,
-                            candidate_first_carrier.ball,
-                            metric=metric,
-                            transformer_from=transformers.get(p_frame),
-                            transformer_to=transformers.get(candidate_first_frame),
-                            min_travel_m=config.min_ball_travel_m,
-                            min_travel_px=config.min_ball_travel_px,
-                        )
-                        min_travel = config.min_ball_travel_m if metric else config.min_ball_travel_px
-                        if travel is not None and travel >= min_travel:
-                            option = scorer.option_for_receiver(
-                                p_frame, p_dets, p_carrier, current_candidate_tid
-                            )
-                            events.append(
-                                InferredPass(
-                                    frame_idx=p_frame,
-                                    passer_tid=p_tid,
-                                    receiver_tid=current_candidate_tid,
-                                    team=int(p_carrier.team),
-                                    gap_frames=gap,
-                                    pass_length_m=_pass_length_m(option, metric),
-                                    quality_score=float(option.score) if option else 0.0,
-                                    openness=float(option.openness) if option else 0.0,
-                                    forward_gain=float(option.forward_gain) if option else 0.0,
-                                    rivals_in_lane=int(option.rivals_in_lane) if option else 0,
-                                    motion_alignment=float(option.motion_alignment) if option else 0.0,
-                                    receiver_space=float(option.receiver_space) if option else 0.0,
-                                )
-                            )
-
-            # Now that they are confirmed, they become the passer for the NEXT pass
-            confirmed_passer = (frame_idx, dets, carrier, current_candidate_tid)
-
-        elif candidate_frames > required_frames:
-            # They are still holding it. Update their "last touch" frame for accurate release timing.
-            confirmed_passer = (frame_idx, dets, carrier, current_candidate_tid)
-
-    return events
-
+def build_pass_carrier_timeline(
+    detections_iter: DetectionIterator,
+    *,
+    config: PassDetectionConfig = PassDetectionConfig(),
+    metric: bool = True,
+    transformers: dict[int, object] | None = None,
+) -> list[CarrierFrameState]:
+    """Per-frame carrier signals for debug overlays."""
+    return build_carrier_timeline(
+        detections_iter,
+        config=config.tracking_config(),
+        metric=metric,
+        transformers=transformers,
+    )

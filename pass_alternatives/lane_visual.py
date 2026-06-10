@@ -19,9 +19,9 @@ _RADAR_PADDING = 50
 _CORRIDOR_ALPHA_RADAR = 0.45
 _CORRIDOR_ALPHA_VIDEO = 0.38
 _RANK_COLORS = [
-    sv.Color.from_hex("#3CDC3C"),  # best
-    sv.Color.from_hex("#28DCE8"),
-    sv.Color.from_hex("#FF8C28"),
+    sv.Color.from_hex("#3CDC3C"),  # best (Green)
+    sv.Color.from_hex("#FFD700"),  # 2nd (Yellow instead of Cyan/blue shadow)
+    sv.Color.from_hex("#FF8C28"),  # 3rd (Orange)
 ]
 _RANK_BGR = [c.as_bgr() for c in _RANK_COLORS]
 _BLOCKER_BGR = (40, 40, 255)
@@ -162,7 +162,7 @@ def draw_blocking_rivals_on_frame(
 def draw_pass_lane_legend(frame: np.ndarray) -> np.ndarray:
     """Legend for pass-lane debug overlays."""
     lines = [
-        "shaded = pass corridor (pitch/radar, ~2.5 m)",
+        "shaded = pass corridor (pitch/radar; wider on long passes)",
         "green/cyan/orange = BEST / 2ND / 3RD",
         "red ! = rival inside corridor",
     ]

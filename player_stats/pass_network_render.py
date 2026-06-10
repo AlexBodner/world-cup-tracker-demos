@@ -44,13 +44,19 @@ from world_cup_projects.common.visual import (
     draw_text_shadow,
     ease_out_cubic,
 )
-from world_cup_projects.player_stats.pass_events import InferredPass, PassQualityScorer
+from world_cup_projects.player_stats.carrier_tracking import CarrierFrameState
+from world_cup_projects.player_stats.pass_events import (
+    InferredPass,
+    InferredTurnover,
+    PassQualityScorer,
+)
 from world_cup_projects.player_stats.pass_network import PassNetwork
 
 TEAM_COLORS_BGR = [c.as_bgr() for c in TEAM_COLORS[:2]]
 RANK_COLORS_BGR = [(80, 220, 60), (40, 220, 240), (40, 140, 255)]
 RANK_LABELS = ["BEST", "2ND", "3RD"]
 NEUTRAL_BGR = (200, 200, 200)
+TURNOVER_ACCENT_BGR = (72, 72, 255)
 
 
 def _team_color(team: int) -> tuple[int, int, int]:
@@ -89,6 +95,99 @@ def _draw_ground_highlight(
     overlay_outline = image.copy()
     cv2.ellipse(overlay_outline, (cx, cy), (w, h), 0, 0, 360, color_bgr, 3, cv2.LINE_AA)
     cv2.addWeighted(overlay_outline, alpha, image, 1.0 - alpha, 0, image)
+
+
+def _draw_centered_label(
+    image: np.ndarray,
+    text: str,
+    *,
+    center_x: int,
+    y: int,
+    font_scale: float,
+    color_bgr: tuple[int, int, int],
+    thickness: int = 2,
+) -> None:
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    (tw, _), _ = cv2.getTextSize(text, font, font_scale, thickness)
+    draw_text_shadow(
+        image,
+        text,
+        (center_x - tw // 2, y),
+        font_scale=font_scale,
+        color_bgr=color_bgr,
+        thickness=thickness,
+    )
+
+
+def _draw_turnover_notice(
+    image: np.ndarray,
+    dets: sv.Detections,
+    turnover: InferredTurnover,
+    frame_idx: int,
+    frame_rate: float,
+) -> None:
+    """Banner + player highlights when possession is lost to the opponent."""
+    hold_frames = max(12, int(round(1.6 * frame_rate)))
+    start = turnover.interception_frame
+    if frame_idx < start or frame_idx > start + hold_frames:
+        return
+
+    elapsed = frame_idx - start
+    fade = 1.0 - ease_out_cubic(min(1.0, elapsed / max(hold_frames, 1)))
+    h, w = image.shape[:2]
+    panel_h = 78
+
+    overlay = image.copy()
+    cv2.rectangle(overlay, (0, 0), (w, panel_h), (18, 18, 24), -1)
+    cv2.addWeighted(overlay, 0.88 * fade, image, 1.0 - 0.88 * fade, 0, image)
+    cv2.line(image, (0, panel_h), (w, panel_h), TURNOVER_ACCENT_BGR, 2)
+
+    cx = w // 2
+    _draw_centered_label(
+        image,
+        "POSSESSION LOST",
+        center_x=cx,
+        y=30,
+        font_scale=0.78,
+        color_bgr=TURNOVER_ACCENT_BGR,
+        thickness=2,
+    )
+    detail = f"#{turnover.passer_tid}  intercepted by  #{turnover.interceptor_tid}"
+    _draw_centered_label(
+        image,
+        detail,
+        center_x=cx,
+        y=58,
+        font_scale=0.52,
+        color_bgr=(220, 220, 220),
+        thickness=1,
+    )
+
+    pulse = 0.55 + 0.35 * np.sin(elapsed / max(frame_rate / 6, 1) * np.pi)
+    passer_box = _get_player_box(dets, turnover.passer_tid)
+    interceptor_box = _get_player_box(dets, turnover.interceptor_tid)
+    if passer_box is not None:
+        _draw_ground_highlight(
+            image,
+            passer_box,
+            _team_color(turnover.passer_team),
+            alpha=0.45 * fade,
+            scale=1.05,
+        )
+    if interceptor_box is not None:
+        _draw_ground_highlight(
+            image,
+            interceptor_box,
+            _team_color(turnover.interceptor_team),
+            alpha=pulse * fade,
+            scale=1.15,
+        )
+        pcx = int((interceptor_box[0] + interceptor_box[2]) / 2)
+        pcy = int(interceptor_box[3])
+        draw_carrier_pulse(
+            image, (pcx, pcy), min(1.0, elapsed / max(frame_rate * 0.25, 1)),
+            color_bgr=TURNOVER_ACCENT_BGR,
+        )
 
 
 def _draw_pass_highlights(
@@ -359,7 +458,7 @@ def _stats_end_card(size: tuple[int, int], network: PassNetwork) -> np.ndarray:
     mode = "metric lanes" if network.metric else "image-space lanes"
     draw_text_shadow(
         card,
-        f"{network.n_passes} inferred passes  |  {mode}",
+        f"{network.n_passes} passes  |  {network.n_turnovers} turnovers  |  {mode}",
         (42, 108),
         font_scale=0.55,
         color_bgr=(170, 170, 170),
@@ -438,6 +537,93 @@ def _stats_end_card(size: tuple[int, int], network: PassNetwork) -> np.ndarray:
     return draw_branding_tag(card)
 
 
+def _draw_carrier_debug(
+    image: np.ndarray,
+    dets: sv.Detections,
+    state: CarrierFrameState,
+) -> None:
+    """HUD + highlights showing how possession is resolved on this frame."""
+    h, w = image.shape[:2]
+    lines: list[str] = [f"FRAME {state.frame_idx}"]
+
+    if not state.ball_present:
+        lines.append("BALL: missing")
+    else:
+        lines.append("BALL: present")
+
+    if state.nearest_tid is not None:
+        lines.append(
+            f"NEAREST: #{state.nearest_tid}  ({state.nearest_dist_px:.0f}px)"
+        )
+    else:
+        lines.append("NEAREST: none")
+
+    if state.control_tid is not None:
+        dist = f"{state.control_dist:.2f}m" if state.control_dist is not None else "?"
+        lines.append(f"CONTROL: #{state.control_tid}  ({dist})")
+        box = _get_player_box(dets, state.control_tid)
+        if box is not None:
+            _draw_ground_highlight(image, box, (60, 220, 60), alpha=0.9, scale=1.1)
+
+    if state.reception_tid is not None and state.reception_tid != state.control_tid:
+        dist = f"{state.reception_dist:.2f}m" if state.reception_dist is not None else "?"
+        lines.append(f"RECEPTION: #{state.reception_tid}  ({dist})")
+        box = _get_player_box(dets, state.reception_tid)
+        if box is not None:
+            _draw_ground_highlight(image, box, (40, 200, 255), alpha=0.7, scale=0.95)
+
+    if state.active_tid is not None:
+        lines.append(f"ACTIVE: #{state.active_tid}  [{state.active_kind}]")
+        box = _get_player_box(dets, state.active_tid)
+        if box is not None:
+            cx = int((box[0] + box[2]) / 2)
+            cy = int(box[3])
+            t = (state.frame_idx % 30) / 30.0
+            draw_carrier_pulse(image, (cx, cy), t, color_bgr=(80, 255, 120))
+    else:
+        flight = " (IN FLIGHT)" if state.in_flight else ""
+        lines.append(f"ACTIVE: none{flight}")
+
+    if state.possession_anchor_tid is not None:
+        lines.append(f"ANCHOR: #{state.possession_anchor_tid}")
+    elif state.last_release_tid is not None:
+        lines.append(f"ANCHOR: #{state.last_release_tid}")
+
+    if state.nearest_teammate_tid is not None:
+        lines.append(f"NEAREST TM: #{state.nearest_teammate_tid}")
+
+    if state.arrival_candidate_tid is not None and state.arrival_streak > 0:
+        lines.append(
+            f"ARRIVAL: #{state.arrival_candidate_tid}  streak={state.arrival_streak}"
+        )
+
+    if state.pass_emitted:
+        lines.append(
+            f"PASS SIGNAL: #{state.pass_from_tid} -> #{state.pass_to_tid}"
+        )
+
+    panel_h = 28 + 22 * len(lines)
+    overlay = image.copy()
+    cv2.rectangle(overlay, (12, 52), (min(w - 12, 520), 52 + panel_h), (20, 20, 20), -1)
+    cv2.addWeighted(overlay, 0.75, image, 0.25, 0, image)
+    cv2.rectangle(image, (12, 52), (min(w - 12, 520), 52 + panel_h), (80, 80, 80), 1)
+
+    y = 74
+    for i, line in enumerate(lines):
+        color = (255, 220, 80) if line.startswith("PASS SIGNAL") else (230, 230, 230)
+        if line.startswith("ACTIVE:") and state.active_tid is not None:
+            color = (80, 255, 120)
+        draw_text_shadow(
+            image,
+            line,
+            (24, y),
+            font_scale=0.52,
+            color_bgr=color,
+            thickness=1,
+        )
+        y += 22
+
+
 def render_pass_network_demo(
     sequence: SoccerNetSequence,
     frames: list[tuple[int, sv.Detections]],
@@ -457,6 +643,8 @@ def render_pass_network_demo(
     scorer: PassQualityScorer | None = None,
     show_predictions: bool = False,
     freeze_quality_threshold: float = 0.0,
+    debug_carrier: bool = False,
+    carrier_timeline: dict[int, CarrierFrameState] | None = None,
 ) -> dict:
     """Render tracked clip plus a stats end-card."""
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
@@ -464,9 +652,8 @@ def render_pass_network_demo(
         out_path, fourcc, sequence.frame_rate, (sequence.width, sequence.height)
     )
 
-    # Pre-map events for fast lookup
     events_by_frame = {e.frame_idx: e for e in network.passes}
-    reveal_frames = 15 # Staggered reveal speed
+    reveal_frames = 15
 
     for frame_idx, dets in frames:
         image = frame_loader(frame_idx)
@@ -496,7 +683,13 @@ def render_pass_network_demo(
             image, dets, frame_idx, network.passes, sequence.frame_rate
         )
 
-        # 4. Predictive Freeze (If applicable)
+        # 4. Turnovers (possession lost)
+        for turnover in network.turnovers:
+            _draw_turnover_notice(
+                image, dets, turnover, frame_idx, sequence.frame_rate
+            )
+
+        # 5. Predictive Freeze (If applicable)
         if (
             show_predictions 
             and scorer is not None 
@@ -509,53 +702,60 @@ def render_pass_network_demo(
             if carrier is not None:
                 options = scorer.top_options(frame_idx, dets, carrier, k=3)
                 
-                # Cinematic Freeze & Reveal (using original Pass Alternatives styling)
-                from world_cup_projects.pass_alternatives.render import _draw_pass_overlay, PassEvent
-                
-                # Create a mock PassEvent for the renderer
-                freeze_event = PassEvent(
-                    frame_idx=frame_idx,
-                    carrier=carrier,
-                    options=options,
-                    top_score=options[0].score if options else 0.0,
-                )
-                
-                n_options = min(3, len(options))
-                reveal_frames = max(4, int(round(0.6 * sequence.frame_rate))) # 0.6 seconds per option
-                
-                phases: list[tuple[int, int]] = [(0, reveal_frames)]
-                phases.extend((i, reveal_frames) for i in range(1, n_options + 1))
-                
-                # Extra hold at the end
-                min_freeze = sum(h for _, h in phases)
-                extra_hold = max(0, int(round(2.5 * sequence.frame_rate)) - min_freeze)
-                final_extra = max(4, int(round(1.0 * sequence.frame_rate)))
-                if phases:
-                    phases[-1] = (phases[-1][0], phases[-1][1] + extra_hold + final_extra)
+                if options:
+                    # Cinematic Freeze & Reveal (using original Pass Alternatives styling)
+                    from world_cup_projects.pass_alternatives.render import _draw_pass_overlay, PassEvent
+                    
+                    # Create a mock PassEvent for the renderer
+                    freeze_event = PassEvent(
+                        frame_idx=frame_idx,
+                        carrier=carrier,
+                        options=options,
+                        top_score=options[0].score,
+                    )
+                    
+                    n_options = min(3, len(options))
+                    reveal_frames = max(4, int(round(0.6 * sequence.frame_rate))) # 0.6 seconds per option
+                    
+                    phases: list[tuple[int, int]] = [(0, reveal_frames)]
+                    phases.extend((i, reveal_frames) for i in range(1, n_options + 1))
+                    
+                    # Extra hold at the end
+                    min_freeze = sum(h for _, h in phases)
+                    extra_hold = max(0, int(round(2.5 * sequence.frame_rate)) - min_freeze)
+                    final_extra = max(4, int(round(1.0 * sequence.frame_rate)))
+                    if phases:
+                        phases[-1] = (phases[-1][0], phases[-1][1] + extra_hold + final_extra)
 
-                for revealed, phase_hold in phases:
-                    for step in range(phase_hold):
-                        progress = (step + 1) / max(phase_hold, 1)
-                        # We pass `image` because `_draw_pass_overlay` dims it internally
-                        overlay = _draw_pass_overlay(
-                            image,
-                            dets,
-                            freeze_event,
-                            revealed_options=revealed,
-                            reveal_progress=progress,
-                            weights=scorer._weights,
-                            metric=metric,
-                            keypoints=kps,
-                            pitch_confidence=pitch_confidence,
-                            transformer=radar_transformer,
-                            show_lane_debug=metric and kps is not None,
-                            show_radar=show_radar,
-                            locked_goal_defenders=locked_goal_defenders,
-                            debug_pitch_keypoints=debug_pitch_keypoints,
-                        )
-                        writer.write(overlay)
+                    for revealed, phase_hold in phases:
+                        for step in range(phase_hold):
+                            progress = (step + 1) / max(phase_hold, 1)
+                            # We pass `image` because `_draw_pass_overlay` dims it internally
+                            overlay = _draw_pass_overlay(
+                                image,
+                                dets,
+                                freeze_event,
+                                revealed_options=revealed,
+                                reveal_progress=progress,
+                                weights=scorer._weights,
+                                metric=metric,
+                                keypoints=kps,
+                                pitch_confidence=pitch_confidence,
+                                transformer=radar_transformer,
+                                show_lane_debug=metric and kps is not None,
+                                show_radar=show_radar,
+                                locked_goal_defenders=locked_goal_defenders,
+                                debug_pitch_keypoints=debug_pitch_keypoints,
+                            )
+                            writer.write(overlay)
 
-        # 5. Metadata/Debug
+        # 6. Carrier debug overlay
+        if debug_carrier and carrier_timeline is not None:
+            state = carrier_timeline.get(frame_idx)
+            if state is not None:
+                _draw_carrier_debug(image, dets, state)
+
+        # 7. Metadata/Debug
         if metric and transformer is None and frame_transforms is not None:
             draw_text_shadow(image, "WARNING: Poor Pitch Detection", (20, 40), font_scale=0.6, color_bgr=(50, 50, 255), thickness=2)
             
@@ -584,6 +784,7 @@ def render_pass_network_demo(
         "output": out_path,
         "metric": metric,
         "n_passes": network.n_passes,
+        "n_turnovers": network.n_turnovers,
         "top_collaborators": [link.to_dict() for link in network.links[:5]],
         "top_players": [player.to_dict() for player in network.players[:5]],
     }

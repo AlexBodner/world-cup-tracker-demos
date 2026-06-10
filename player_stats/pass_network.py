@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass
 
 import numpy as np
 
-from world_cup_projects.player_stats.pass_events import InferredPass
+from world_cup_projects.player_stats.pass_events import InferredPass, InferredTurnover
 
 
 @dataclass(frozen=True)
@@ -46,7 +46,9 @@ class PassNetwork:
     sequence: str
     metric: bool
     n_passes: int
+    n_turnovers: int
     passes: tuple[InferredPass, ...]
+    turnovers: tuple[InferredTurnover, ...]
     links: tuple[CollaborationLink, ...]
     players: tuple[PlayerPassSummary, ...]
 
@@ -55,7 +57,9 @@ class PassNetwork:
             "sequence": self.sequence,
             "metric": self.metric,
             "n_passes": self.n_passes,
+            "n_turnovers": self.n_turnovers,
             "passes": [p.to_dict() for p in self.passes],
+            "turnovers": [t.to_dict() for t in self.turnovers],
             "collaboration_links": [link.to_dict() for link in self.links],
             "player_summaries": [player.to_dict() for player in self.players],
             "top_collaborators": [
@@ -128,17 +132,21 @@ def _mean(values: list[float]) -> float:
 def build_pass_network(
     sequence_name: str,
     events: list[InferredPass],
+    turnovers: list[InferredTurnover] | None = None,
     *,
     metric: bool,
 ) -> PassNetwork:
     """Build the v1 collaboration snapshot from inferred pass events."""
+    turnovers = turnovers or []
     links = build_collaboration_links(events)
     players = build_player_summaries(events)
     return PassNetwork(
         sequence=sequence_name,
         metric=metric,
         n_passes=len(events),
+        n_turnovers=len(turnovers),
         passes=tuple(events),
+        turnovers=tuple(turnovers),
         links=tuple(links),
         players=tuple(players),
     )

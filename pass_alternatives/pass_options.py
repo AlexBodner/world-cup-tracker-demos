@@ -2,7 +2,8 @@
 
 Each candidate lane (carrier -> teammate) is scored on three football-sense axes:
 
-* **openness** - nearest **rival** in the pass corridor (``lane_width``, strict).
+* **openness** - nearest **rival** in the pass corridor (``lane_width``, strict; widens
+  in fixed length tiers on long passes, not proportional to distance).
 * **teammate lane** - optional light penalty if a teammate blocks the corridor (narrower
   width than rivals; they can let the ball through so we only ding obvious obstacles).
 * **forward progress** - gain toward the attacking direction.
@@ -54,7 +55,12 @@ class PassWeights:
     use_lane_openness: bool = True
     lane_t_min: float = 0.0
     lane_t_max: float = 1.0
-    lane_width: float | None = None  # corridor full width in m (pitch) or px (image lane)
+    lane_width: float | None = None  # base rival corridor width in m (pitch) or px (image)
+    lane_width_mid_threshold_m: float = 18.0  # stepped boosts below (metric only)
+    lane_width_long_threshold_m: float = 28.0
+    lane_width_mid_boost_m: float = 0.5
+    lane_width_long_boost_m: float = 1.0
+    lane_width_max_m: float = 4.0
     lane_in_image_space: bool = False  # metric default: pitch/radar corridor (meters)
     lane_use_body_center: bool = True  # min(feet, bbox center) for rival lane distance
     teammate_lane_width: float | None = None  # None -> 0.5 * lane_width when lane_width set
@@ -146,6 +152,19 @@ class PassOption:
     lane_debug: PassLaneDebug | None = None
 
 
+def _rival_lane_width_steps(
+    base: float,
+    pass_length_m: float,
+    weights: PassWeights,
+) -> float:
+    """Widen rival corridor on longer passes using fixed tiers (not proportional to distance)."""
+    if pass_length_m <= weights.lane_width_mid_threshold_m:
+        return base
+    if pass_length_m <= weights.lane_width_long_threshold_m:
+        return min(weights.lane_width_max_m, base + weights.lane_width_mid_boost_m)
+    return min(weights.lane_width_max_m, base + weights.lane_width_long_boost_m)
+
+
 def _lane_width_for_pass(
     weights: PassWeights,
     *,
@@ -157,6 +176,8 @@ def _lane_width_for_pass(
         return None
     if weights.lane_in_image_space and pass_length_px is not None and pass_length > 1e-3:
         return weights.lane_width * (pass_length_px / pass_length)
+    if not weights.lane_in_image_space:
+        return _rival_lane_width_steps(weights.lane_width, pass_length, weights)
     return weights.lane_width
 
 
