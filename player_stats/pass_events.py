@@ -44,8 +44,22 @@ from world_cup_projects.common.possession import (
     ball_xy,
     bbox_center_xy,
     feet_xy,
-    find_ball_carrier,
+    find_active_carrier,
     player_mask,
+)
+from world_cup_projects.common.possession_config import (
+    AERIAL_DY_THRESHOLD_PX,
+    CONTROL_MAX_DISTANCE_M,
+    CONTROL_MAX_DISTANCE_PX,
+    RECEPTION_MAX_DISTANCE_M,
+    RECEPTION_MAX_DISTANCE_PX,
+)
+from world_cup_projects.common.possession_touch import (
+    TouchValidationConfig,
+    is_aerial_flyby_below_feet,
+    is_aerial_touch,
+    is_valid_possession_touch,
+    reception_aerial_veto_threshold,
 )
 from world_cup_projects.common.soccernet import ROLE_GOALKEEPER
 from world_cup_projects.common.tracking_facing import carrier_kalman_direction
@@ -76,10 +90,10 @@ class PassDetectionConfig:
     max_pass_gap_frames: int = 75  # ~3 s at 25 fps; tolerates ball-detection dropouts
     min_ball_travel_m: float = 1.0
     min_ball_travel_px: float = 25.0
-    control_max_distance_m: float = 0.8
-    control_max_distance_px: float = 55.0
-    reception_max_distance_m: float = 1.8
-    reception_max_distance_px: float = 120.0
+    control_max_distance_m: float = CONTROL_MAX_DISTANCE_M
+    control_max_distance_px: float = CONTROL_MAX_DISTANCE_PX
+    reception_max_distance_m: float = RECEPTION_MAX_DISTANCE_M
+    reception_max_distance_px: float = RECEPTION_MAX_DISTANCE_PX
     missing_ball_tolerance: int = 10  # ~0.4 s at 25 fps; bridge intermittent ball loss
     dedupe_window_frames: int = 12
     min_arrival_frames: int = 3
@@ -88,7 +102,7 @@ class PassDetectionConfig:
     min_gk_control_frames: int = 1
     pre_flight_release_window: int = 10  # ~0.4 s before ball leaves range
     adjacent_pass_max_gap_frames: int = 15  # quick plays need control at receiver
-    aerial_dy_threshold_px: float = 20.0
+    aerial_dy_threshold_px: float = AERIAL_DY_THRESHOLD_PX
     max_plausible_travel_m: float = 40.0
 
     def for_frame_rate(self, fps: float, *, base_fps: float = 25.0) -> PassDetectionConfig:
@@ -122,6 +136,9 @@ class PassDetectionConfig:
             aerial_dy_threshold_px=self.aerial_dy_threshold_px,
             max_plausible_travel_m=self.max_plausible_travel_m,
         )
+
+    def touch_validation_config(self) -> TouchValidationConfig:
+        return TouchValidationConfig(aerial_dy_threshold_px=self.aerial_dy_threshold_px)
 
     def tracking_config(self) -> CarrierTrackingConfig:
         return CarrierTrackingConfig(
@@ -469,118 +486,20 @@ def _pass_length_m(option: PassOption | None, metric: bool) -> float | None:
     return None
 
 
-def _control_carrier(
-    dets: sv.Detections,
-    *,
-    transformer,
-    config: PassDetectionConfig,
-) -> Carrier | None:
-    return find_ball_carrier(
-        dets,
-        max_distance_px=config.control_max_distance_px,
-        transformer=transformer,
-        max_distance_m=config.control_max_distance_m,
-    )
-
-
-def _reception_carrier(
-    dets: sv.Detections,
-    *,
-    transformer,
-    config: PassDetectionConfig,
-) -> Carrier | None:
-    return find_ball_carrier(
-        dets,
-        max_distance_px=config.reception_max_distance_px,
-        transformer=transformer,
-        max_distance_m=config.reception_max_distance_m,
-    )
-
-
 def _active_carrier(
     dets: sv.Detections,
     *,
     transformer,
     config: PassDetectionConfig,
 ) -> tuple[Carrier | None, str | None]:
-    control = _control_carrier(dets, transformer=transformer, config=config)
-    if control is not None:
-        return control, "control"
-    reception = _reception_carrier(dets, transformer=transformer, config=config)
-    if reception is not None:
-        return reception, "reception"
-    return None, None
-
-
-def _nearest_player_tid(dets: sv.Detections, ball: np.ndarray) -> int | None:
-    pmask = player_mask(dets)
-    if not pmask.any() or dets.tracker_id is None:
-        return None
-    feet = feet_xy(dets)[pmask]
-    tids = dets.tracker_id[pmask]
-    dist = np.hypot(feet[:, 0] - ball[0], feet[:, 1] - ball[1])
-    tid = int(tids[int(np.argmin(dist))])
-    return tid if tid >= 0 else None
-
-
-def _is_aerial_touch(
-    dets: sv.Detections,
-    carrier: Carrier,
-    *,
-    threshold_px: float,
-) -> bool:
-    ball = ball_xy(dets)
-    if ball is None:
-        return False
-    feet = feet_xy(dets)[carrier.index]
-    return abs(float(ball[1] - feet[1])) > threshold_px
-
-
-def _is_aerial_flyby_below_feet(
-    dets: sv.Detections,
-    carrier: Carrier,
-    *,
-    threshold_px: float,
-) -> bool:
-    """Ball visibly below the feet in image space (aerial fly-by, not chest reception)."""
-    ball = ball_xy(dets)
-    if ball is None:
-        return False
-    feet = feet_xy(dets)[carrier.index]
-    return float(ball[1] - feet[1]) > threshold_px
-
-
-def _reception_aerial_veto_threshold(config: PassDetectionConfig) -> float:
-    """Looser than control: chest receptions are above the feet (negative dy)."""
-    return config.aerial_dy_threshold_px * 2.0
-
-
-def _is_valid_possession_touch(
-    dets: sv.Detections,
-    carrier: Carrier,
-    *,
-    touch_kind: str,
-    config: PassDetectionConfig,
-) -> bool:
-    """Reject aerial fly-bys and nearest-player mismatches.
-
-    Control uses symmetric vertical offset; reception only vetoes fly-bys below
-    the feet so chest-height first contacts still count.
-    """
-    if touch_kind == "control" and _is_aerial_touch(
-        dets, carrier, threshold_px=config.aerial_dy_threshold_px
-    ):
-        return False
-    if touch_kind == "reception" and _is_aerial_flyby_below_feet(
+    return find_active_carrier(
         dets,
-        carrier,
-        threshold_px=_reception_aerial_veto_threshold(config),
-    ):
-        return False
-    ball = carrier.ball
-    tid = int(dets.tracker_id[carrier.index]) if dets.tracker_id is not None else -1
-    nearest_tid = _nearest_player_tid(dets, ball)
-    return nearest_tid is not None and nearest_tid == tid
+        transformer=transformer,
+        control_max_distance_px=config.control_max_distance_px,
+        control_max_distance_m=config.control_max_distance_m,
+        reception_max_distance_px=config.reception_max_distance_px,
+        reception_max_distance_m=config.reception_max_distance_m,
+    )
 
 
 @dataclass
@@ -647,11 +566,13 @@ def _promote_pre_flight_release(
     touch_frame, touch_dets, touch_carrier, touch_tid = state.last_touch
     if frame_idx - touch_frame > config.pre_flight_release_window:
         return
-    aerial_limit = _reception_aerial_veto_threshold(config)
-    if _is_aerial_touch(
-        touch_dets, touch_carrier, threshold_px=config.aerial_dy_threshold_px
-    ) or _is_aerial_flyby_below_feet(
-        touch_dets, touch_carrier, threshold_px=aerial_limit
+    touch_cfg = config.touch_validation_config()
+    if is_aerial_touch(
+        touch_dets, touch_carrier, threshold_px=touch_cfg.aerial_dy_threshold_px
+    ) or is_aerial_flyby_below_feet(
+        touch_dets,
+        touch_carrier,
+        threshold_px=reception_aerial_veto_threshold(touch_cfg),
     ):
         return
     state.release = (touch_frame, touch_dets, touch_carrier, touch_tid)
@@ -800,8 +721,8 @@ def _first_valid_touch_frame(
             dets, transformer=transformer, config=config
         )
         touch_kind = touch_kind or "reception"
-        if carrier is None or not _is_valid_possession_touch(
-            dets, carrier, touch_kind=touch_kind, config=config
+        if carrier is None or not is_valid_possession_touch(
+            dets, carrier, touch_kind=touch_kind, config=config.touch_validation_config()
         ):
             continue
         if dets.tracker_id is None:
@@ -863,8 +784,8 @@ def scan_possession_events(
         )
 
         touch_kind = touch_kind or "reception"
-        if carrier is None or not _is_valid_possession_touch(
-            dets, carrier, touch_kind=touch_kind, config=config
+        if carrier is None or not is_valid_possession_touch(
+            dets, carrier, touch_kind=touch_kind, config=config.touch_validation_config()
         ):
             if ball is not None:
                 for state in team_states.values():

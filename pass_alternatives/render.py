@@ -38,14 +38,16 @@ from world_cup_projects.pass_alternatives.lane_visual import (
 )
 from world_cup_projects.pass_alternatives.pass_options import PassWeights, top_pass_options
 from world_cup_projects.common.possession import (
-    CARRIER_MAX_DISTANCE_M,
-    CARRIER_MAX_DISTANCE_PX,
     Carrier,
     ball_xy,
     bbox_center_xy,
     feet_xy,
-    find_ball_carrier,
+    find_control_carrier,
     player_mask,
+)
+from world_cup_projects.common.possession_config import (
+    CONTROL_MAX_DISTANCE_M,
+    CONTROL_MAX_DISTANCE_PX,
 )
 from world_cup_projects.common.soccernet import (
     SoccerNetSequence,
@@ -359,8 +361,8 @@ def plan_events(
     *,
     max_events: int | None = None,
     min_gap_frames: int = 90,
-    carrier_max_distance_px: float = CARRIER_MAX_DISTANCE_PX,
-    carrier_max_distance_m: float = CARRIER_MAX_DISTANCE_M,
+    carrier_max_distance_px: float = CONTROL_MAX_DISTANCE_PX,
+    carrier_max_distance_m: float = CONTROL_MAX_DISTANCE_M,
     weights: PassWeights = PassWeights(),
     detections_source: DetectionSource = iter_gt_detections,
     max_frames: int | None = None,
@@ -392,7 +394,7 @@ def plan_events(
                 hist_xy = pitch_feet
         history.record_frame(frame_idx, dets, hist_xy)
 
-        carrier = find_ball_carrier(
+        carrier = find_control_carrier(
             dets,
             max_distance_px=carrier_max_distance_px,
             transformer=transformer,
@@ -461,7 +463,7 @@ def _annotate_live(
         show_tracker_ids=True,
     )
     frame = annotate_ball(frame, dets)
-    carrier = find_ball_carrier(
+    carrier = find_control_carrier(
         dets,
         transformer=radar_transformer if metric else None,
     )
@@ -744,8 +746,8 @@ def render_demo(
     pitch_device: str = "cpu",
     version_tag: str = "v1",
     frame_transforms: dict | None = None,
-    carrier_max_distance_px: float = CARRIER_MAX_DISTANCE_PX,
-    carrier_max_distance_m: float = CARRIER_MAX_DISTANCE_M,
+    carrier_max_distance_px: float = CONTROL_MAX_DISTANCE_PX,
+    carrier_max_distance_m: float = CONTROL_MAX_DISTANCE_M,
     debug_pitch_keypoints: bool = False,
     pitch_confidence: float = 0.9,
     show_radar: bool | None = None,

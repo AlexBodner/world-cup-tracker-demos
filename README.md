@@ -158,7 +158,7 @@ brief bad homography doesn’t drop possession — but **metric is vetoed when `
 assign the ball to the wrong player for one frame, and we throw out fly-bys where the ball
 skims under someone’s feet or floats above them.
 
-**In code** (`_is_valid_possession_touch`):
+**In code** (`common.possession_touch.is_valid_possession_touch`):
 
 A touch by player `tid` counts only if **all** of:
 

@@ -12,8 +12,22 @@ from world_cup_projects.common.possession import (
     Carrier,
     ball_xy,
     feet_xy,
+    find_active_carrier,
     find_ball_carrier,
     player_mask,
+)
+from world_cup_projects.common.possession_config import (
+    AERIAL_DY_THRESHOLD_PX,
+    CONTROL_MAX_DISTANCE_M,
+    CONTROL_MAX_DISTANCE_PX,
+    RECEPTION_MAX_DISTANCE_M,
+    RECEPTION_MAX_DISTANCE_PX,
+)
+from world_cup_projects.common.possession_touch import (
+    TouchValidationConfig,
+    is_aerial_flyby_below_feet,
+    is_aerial_touch,
+    is_valid_possession_touch,
 )
 from world_cup_projects.common.soccernet import ROLE_GOALKEEPER
 
@@ -25,10 +39,10 @@ DetectionIterator = Iterator[tuple[int, sv.Detections]]
 class CarrierTrackingConfig:
     """Distance gates for control vs one-touch reception."""
 
-    control_max_distance_m: float = 0.8
-    control_max_distance_px: float = 55.0
-    reception_max_distance_m: float = 1.8
-    reception_max_distance_px: float = 120.0
+    control_max_distance_m: float = CONTROL_MAX_DISTANCE_M
+    control_max_distance_px: float = CONTROL_MAX_DISTANCE_PX
+    reception_max_distance_m: float = RECEPTION_MAX_DISTANCE_M
+    reception_max_distance_px: float = RECEPTION_MAX_DISTANCE_PX
     min_pass_gap_frames: int = 1
     max_pass_gap_frames: int = 75
     min_arrival_frames: int = 3
@@ -37,7 +51,7 @@ class CarrierTrackingConfig:
     min_gk_control_frames: int = 1
     pre_flight_release_window: int = 10
     adjacent_pass_max_gap_frames: int = 15
-    aerial_dy_threshold_px: float = 20.0
+    aerial_dy_threshold_px: float = AERIAL_DY_THRESHOLD_PX
     missing_ball_tolerance: int = 10
 
 
@@ -107,73 +121,18 @@ def _active_carrier_kind(
     transformer,
     config: CarrierTrackingConfig,
 ) -> tuple[Carrier | None, str | None]:
-    control = _carrier_at_threshold(
+    return find_active_carrier(
         dets,
         transformer=transformer,
-        max_distance_m=config.control_max_distance_m,
-        max_distance_px=config.control_max_distance_px,
+        control_max_distance_px=config.control_max_distance_px,
+        control_max_distance_m=config.control_max_distance_m,
+        reception_max_distance_px=config.reception_max_distance_px,
+        reception_max_distance_m=config.reception_max_distance_m,
     )
-    if control is not None:
-        return control, "control"
-    reception = _carrier_at_threshold(
-        dets,
-        transformer=transformer,
-        max_distance_m=config.reception_max_distance_m,
-        max_distance_px=config.reception_max_distance_px,
-    )
-    if reception is not None:
-        return reception, "reception"
-    return None, None
 
 
-def _is_aerial_touch(
-    dets: sv.Detections,
-    carrier: Carrier,
-    *,
-    threshold_px: float,
-) -> bool:
-    ball = ball_xy(dets)
-    if ball is None:
-        return False
-    feet = feet_xy(dets)[carrier.index]
-    return abs(float(ball[1] - feet[1])) > threshold_px
-
-
-def _is_aerial_flyby_below_feet(
-    dets: sv.Detections,
-    carrier: Carrier,
-    *,
-    threshold_px: float,
-) -> bool:
-    ball = ball_xy(dets)
-    if ball is None:
-        return False
-    feet = feet_xy(dets)[carrier.index]
-    return float(ball[1] - feet[1]) > threshold_px
-
-
-def _is_valid_possession_touch(
-    dets: sv.Detections,
-    carrier: Carrier,
-    *,
-    touch_kind: str,
-    config: CarrierTrackingConfig,
-) -> bool:
-    if touch_kind == "control" and _is_aerial_touch(
-        dets, carrier, threshold_px=config.aerial_dy_threshold_px
-    ):
-        return False
-    if touch_kind == "reception" and _is_aerial_flyby_below_feet(
-        dets,
-        carrier,
-        threshold_px=config.aerial_dy_threshold_px * 2.0,
-    ):
-        return False
-    nearest = _nearest_player(dets, carrier.ball)
-    if nearest is None:
-        return False
-    tid = int(dets.tracker_id[carrier.index]) if dets.tracker_id is not None else -1
-    return nearest[0] == tid
+def _touch_validation_config(config: CarrierTrackingConfig) -> TouchValidationConfig:
+    return TouchValidationConfig(aerial_dy_threshold_px=config.aerial_dy_threshold_px)
 
 
 @dataclass
@@ -302,8 +261,11 @@ def build_carrier_timeline(
             dets, transformer=transformer, config=config
         )
         touch_kind = touch_kind or "reception"
-        if carrier is None or not _is_valid_possession_touch(
-            dets, carrier, touch_kind=touch_kind, config=config
+        if carrier is None or not is_valid_possession_touch(
+            dets,
+            carrier,
+            touch_kind=touch_kind,
+            config=_touch_validation_config(config),
         ):
             if ball is not None:
                 for state in team_states.values():
@@ -315,15 +277,15 @@ def build_carrier_timeline(
                         <= config.pre_flight_release_window
                     ):
                         _, touch_dets, touch_carrier, _ = state.last_touch
-                        aerial_limit = config.aerial_dy_threshold_px * 2.0
-                        if not _is_aerial_touch(
+                        touch_cfg = _touch_validation_config(config)
+                        if not is_aerial_touch(
                             touch_dets,
                             touch_carrier,
-                            threshold_px=config.aerial_dy_threshold_px,
-                        ) and not _is_aerial_flyby_below_feet(
+                            threshold_px=touch_cfg.aerial_dy_threshold_px,
+                        ) and not is_aerial_flyby_below_feet(
                             touch_dets,
                             touch_carrier,
-                            threshold_px=aerial_limit,
+                            threshold_px=touch_cfg.aerial_dy_threshold_px * 2.0,
                         ):
                             state.release = state.last_touch
                     state.in_flight = True

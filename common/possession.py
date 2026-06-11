@@ -12,16 +12,19 @@ from dataclasses import dataclass
 import numpy as np
 import supervision as sv
 
+from world_cup_projects.common.possession_config import (
+    CARRIER_MAX_DISTANCE_M,
+    CARRIER_MAX_DISTANCE_PX,
+    CONTROL_MAX_DISTANCE_M,
+    CONTROL_MAX_DISTANCE_PX,
+    RECEPTION_MAX_DISTANCE_M,
+    RECEPTION_MAX_DISTANCE_PX,
+)
 from world_cup_projects.common.soccernet import (
     ROLE_BALL,
     ROLE_GOALKEEPER,
     ROLE_PLAYER,
 )
-
-# Nearest-feet-to-ball thresholds for "in possession" (not a pass detector).
-CARRIER_MAX_DISTANCE_PX = 80.0
-# ~1 m on the pitch: tight control at the feet; GT box + ball annotation add slack vs true 0.5 m.
-CARRIER_MAX_DISTANCE_M = 1.0
 
 
 def feet_xy(detections: sv.Detections) -> np.ndarray:
@@ -136,3 +139,64 @@ def find_ball_carrier(
     global_idx = int(global_indices[local])
     team = int(detections.data["team"][global_idx])
     return Carrier(global_idx, team, float(dist_to_use[local]), ball)
+
+
+def find_control_carrier(
+    detections: sv.Detections,
+    *,
+    transformer=None,
+    max_distance_px: float = CONTROL_MAX_DISTANCE_PX,
+    max_distance_m: float = CONTROL_MAX_DISTANCE_M,
+) -> Carrier | None:
+    """Nearest player within tight dribble range (pass passer / lane-scoring gate)."""
+    return find_ball_carrier(
+        detections,
+        max_distance_px=max_distance_px,
+        transformer=transformer,
+        max_distance_m=max_distance_m,
+    )
+
+
+def find_reception_carrier(
+    detections: sv.Detections,
+    *,
+    transformer=None,
+    max_distance_px: float = RECEPTION_MAX_DISTANCE_PX,
+    max_distance_m: float = RECEPTION_MAX_DISTANCE_M,
+) -> Carrier | None:
+    """Nearest player within looser first-touch range (pass detection only)."""
+    return find_ball_carrier(
+        detections,
+        max_distance_px=max_distance_px,
+        transformer=transformer,
+        max_distance_m=max_distance_m,
+    )
+
+
+def find_active_carrier(
+    detections: sv.Detections,
+    *,
+    transformer=None,
+    control_max_distance_px: float = CONTROL_MAX_DISTANCE_PX,
+    control_max_distance_m: float = CONTROL_MAX_DISTANCE_M,
+    reception_max_distance_px: float = RECEPTION_MAX_DISTANCE_PX,
+    reception_max_distance_m: float = RECEPTION_MAX_DISTANCE_M,
+) -> tuple[Carrier | None, str | None]:
+    """Control carrier if any, else reception; matches pass-detection possession logic."""
+    control = find_control_carrier(
+        detections,
+        transformer=transformer,
+        max_distance_px=control_max_distance_px,
+        max_distance_m=control_max_distance_m,
+    )
+    if control is not None:
+        return control, "control"
+    reception = find_reception_carrier(
+        detections,
+        transformer=transformer,
+        max_distance_px=reception_max_distance_px,
+        max_distance_m=reception_max_distance_m,
+    )
+    if reception is not None:
+        return reception, "reception"
+    return None, None

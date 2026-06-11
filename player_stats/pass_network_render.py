@@ -7,7 +7,11 @@ import numpy as np
 import supervision as sv
 
 from world_cup_projects.common.pitch import image_to_pitch_m, warmup_goal_defenders
-from world_cup_projects.common.possession import bbox_center_xy, feet_xy, find_ball_carrier
+from world_cup_projects.common.possession import (
+    bbox_center_xy,
+    feet_xy,
+    find_control_carrier,
+)
 from world_cup_projects.common.soccernet import ROLE_PLAYER, SoccerNetSequence
 from world_cup_projects.common.visual import (
     ROBOFLOW_PURPLE_BGR,
@@ -683,7 +687,7 @@ def render_pass_network_demo(
         # 1. Base Annotations
         image = annotate_players(image, dets, show_tracker_ids=True)
         image = annotate_ball(image, dets)
-        carrier = find_ball_carrier(
+        carrier = find_control_carrier(
             dets,
             transformer=radar_transformer if metric else None,
         )
@@ -714,7 +718,7 @@ def render_pass_network_demo(
             and qs >= freeze_quality_threshold
         ):
             event = events_by_frame[frame_idx]
-            carrier = find_ball_carrier(dets, transformer=radar_transformer)
+            carrier = find_control_carrier(dets, transformer=radar_transformer)
             if carrier is not None:
                 options = scorer.top_options(frame_idx, dets, carrier, k=3)
                 

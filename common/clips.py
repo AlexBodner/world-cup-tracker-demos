@@ -15,9 +15,10 @@ import numpy as np
 
 from world_cup_projects.common.possession import (
     ball_xy,
-    find_ball_carrier,
+    find_control_carrier,
     player_mask,
 )
+from world_cup_projects.common.possession_config import CONTROL_MAX_DISTANCE_PX
 from world_cup_projects.common.soccernet import iter_gt_detections, load_sequence
 
 # Clips where pitch keypoints are often unusable (broken radar / homography).
@@ -104,7 +105,12 @@ class ClipScore:
         )
 
 
-def score_sequence(seq_dir: Path, *, carrier_max_distance: float = 80.0) -> ClipScore:
+def score_sequence(
+    seq_dir: Path,
+    *,
+    carrier_max_distance: float | None = None,
+) -> ClipScore:
+    max_px = CONTROL_MAX_DISTANCE_PX if carrier_max_distance is None else carrier_max_distance
     seq = load_sequence(seq_dir)
     ball_frames = carrier_frames = 0
     player_counts: list[int] = []
@@ -112,7 +118,7 @@ def score_sequence(seq_dir: Path, *, carrier_max_distance: float = 80.0) -> Clip
 
     for _, dets in iter_gt_detections(seq):
         player_counts.append(int(player_mask(dets).sum()))
-        if find_ball_carrier(dets, max_distance_px=carrier_max_distance) is not None:
+        if find_control_carrier(dets, max_distance_px=max_px) is not None:
             carrier_frames += 1
         if ball_xy(dets) is not None:
             ball_frames += 1

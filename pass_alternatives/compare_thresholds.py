@@ -1,7 +1,7 @@
 """Compare pass-demo possession thresholds across SoccerNet sequences.
 
 Counts carrier frames, pass-scoring candidates, and final freeze events for each
-``--carrier-max-m`` (metric / homography) and the pixel baseline (80 px).
+``--carrier-max-m`` (metric / homography) and the pixel control baseline (55 px).
 
 Example::
 
@@ -20,9 +20,10 @@ import json
 from pathlib import Path
 
 from world_cup_projects.common.clips import rank_clips
-from world_cup_projects.common.possession import (
-    CARRIER_MAX_DISTANCE_PX,
-    find_ball_carrier,
+from world_cup_projects.common.possession import find_control_carrier
+from world_cup_projects.common.possession_config import (
+    CONTROL_MAX_DISTANCE_M,
+    CONTROL_MAX_DISTANCE_PX,
 )
 from world_cup_projects import DEFAULT_ASSETS_DIR
 from world_cup_projects.common.soccernet import (
@@ -69,11 +70,13 @@ def _count_frames(
                 hist_xy = pitch_feet
         history.record_frame(frame_idx, dets, hist_xy)
 
-        carrier = find_ball_carrier(
+        carrier = find_control_carrier(
             dets,
             max_distance_px=carrier_max_px,
             transformer=transformer,
-            max_distance_m=carrier_max_m if carrier_max_m is not None else 1.0,
+            max_distance_m=carrier_max_m
+            if carrier_max_m is not None
+            else CONTROL_MAX_DISTANCE_M,
         )
         if carrier is None:
             continue
@@ -118,19 +121,19 @@ def compare_sequence(
         max_frames=max_frames,
         transformers=transformers,
         carrier_max_m=None,
-        carrier_max_px=CARRIER_MAX_DISTANCE_PX,
+        carrier_max_px=CONTROL_MAX_DISTANCE_PX,
         metric=False,
     )
     events_px = plan_events(
         sequence,
         max_frames=max_frames,
         metric=False,
-        carrier_max_distance_px=CARRIER_MAX_DISTANCE_PX,
+        carrier_max_distance_px=CONTROL_MAX_DISTANCE_PX,
     )
     rows.append(
         {
             "mode": "pixel",
-            "threshold": f"{CARRIER_MAX_DISTANCE_PX:g}px",
+            "threshold": f"{CONTROL_MAX_DISTANCE_PX:g}px",
             "threshold_m": None,
             **px_counts,
             "freeze_events": len(events_px),
@@ -144,7 +147,7 @@ def compare_sequence(
             max_frames=max_frames,
             transformers=transformers,
             carrier_max_m=m,
-            carrier_max_px=CARRIER_MAX_DISTANCE_PX,
+            carrier_max_px=CONTROL_MAX_DISTANCE_PX,
             metric=True,
         )
         events = plan_events(
@@ -215,7 +218,7 @@ def main() -> None:
     report = {
         "sequences": names,
         "thresholds_m": thresholds_m,
-        "pixel_baseline_px": CARRIER_MAX_DISTANCE_PX,
+        "pixel_baseline_px": CONTROL_MAX_DISTANCE_PX,
         "max_frames": args.max_frames,
         "results": [],
     }

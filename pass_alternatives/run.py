@@ -29,7 +29,10 @@ from world_cup_projects.common.clips import (
     pitch_keypoints_unreliable,
     rank_clips,
 )
-from world_cup_projects.common.possession import CARRIER_MAX_DISTANCE_M, CARRIER_MAX_DISTANCE_PX
+from world_cup_projects.common.possession_config import (
+    CONTROL_MAX_DISTANCE_M,
+    CONTROL_MAX_DISTANCE_PX,
+)
 from world_cup_projects import DEFAULT_ASSETS_DIR
 from world_cup_projects.common.soccernet import (
     DEFAULT_TRACKING_ROOT,
@@ -74,14 +77,14 @@ def main() -> None:
     parser.add_argument(
         "--carrier-max-px",
         type=float,
-        default=CARRIER_MAX_DISTANCE_PX,
-        help="Ball-to-feet limit in pixels when not using --metric (default 80).",
+        default=CONTROL_MAX_DISTANCE_PX,
+        help="Ball-to-feet control limit in pixels when not using --metric (default 55).",
     )
     parser.add_argument(
         "--carrier-max-m",
         type=float,
-        default=CARRIER_MAX_DISTANCE_M,
-        help="Ball-to-feet limit in meters on the pitch when using --metric (default 1.0).",
+        default=CONTROL_MAX_DISTANCE_M,
+        help="Ball-to-feet control limit in meters on the pitch when using --metric (default 0.8).",
     )
     parser.add_argument(
         "--rank-only",
