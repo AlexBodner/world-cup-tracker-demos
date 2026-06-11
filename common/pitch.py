@@ -225,14 +225,13 @@ class PitchHomography:
 
     def detect_keypoints(self, frame_bgr: np.ndarray) -> sv.KeyPoints:
         result = self.model.infer(frame_bgr, confidence=0.3)[0]
-        return sv.KeyPoints.from_inference(result)
+        return keypoints_from_inference_field(result, n_vertices=len(self._targets))
 
     def __call__(self, frame_bgr: np.ndarray) -> ViewTransformer | None:
         kps = self.detect_keypoints(frame_bgr)
         if kps.xy.shape[0] == 0:
             return None
-        xy = kps.xy[0]
-        conf = pitch_keypoint_confidence(kps, n_vertices=len(xy))
+        xy, conf = align_pitch_keypoints(kps, n_vertices=len(self._targets))
         mask = pitch_keypoint_accept_mask(xy, conf, confidence=self.confidence)
         if mask.sum() < 4:
             return None
@@ -398,8 +397,8 @@ def homography_from_keypoints_radar(
     """Per-frame minimap H aligned with roboflow/sports (no mirror), confidence-gated."""
     if keypoints is None or keypoints.xy.shape[0] == 0:
         return None
-    xy = keypoints.xy[0]
-    conf = pitch_keypoint_confidence(keypoints, n_vertices=len(xy))
+    n = pitch_vertex_count(config)
+    xy, conf = align_pitch_keypoints(keypoints, n_vertices=n)
     mask = pitch_keypoint_accept_mask(xy, conf, confidence=confidence)
     if mask.sum() < min_keypoints:
         return None
@@ -432,8 +431,8 @@ def homography_from_keypoints_simple(
     )
     if t is None:
         return None
-    xy = keypoints.xy[0]
-    conf = pitch_keypoint_confidence(keypoints, n_vertices=len(xy))
+    n = pitch_vertex_count(config)
+    xy, conf = align_pitch_keypoints(keypoints, n_vertices=n)
     mask = pitch_keypoint_accept_mask(xy, conf, confidence=confidence)
     if mask.sum() < min_keypoints:
         return None
@@ -461,9 +460,8 @@ def draw_radar_pitch_keypoints_debug(
     """Warp all detected pitch keypoints onto the minimap (accepted vs rejected)."""
     if keypoints.xy.shape[0] == 0:
         return radar
-    xy = keypoints.xy[0]
-    n = len(config.vertices)
-    conf = pitch_keypoint_confidence(keypoints, n_vertices=n)
+    n = pitch_vertex_count(config)
+    xy, conf = align_pitch_keypoints(keypoints, n_vertices=n)
     accept = pitch_keypoint_inlier_mask(
         xy, conf, transformer, confidence=confidence, max_reproj_px=8.0
     )
@@ -514,6 +512,19 @@ def draw_radar_pitch_keypoints_debug(
             radius=radius,
             pitch=radar,
         )
+    # Legend (radar coords)
+    lx, ly = padding + 8, padding + 18
+    cv2.putText(
+        radar, "kp", (lx, ly), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (220, 220, 220), 1, cv2.LINE_AA
+    )
+    cv2.circle(radar, (lx + 28, ly - 4), 5, (50, 220, 80), -1, cv2.LINE_AA)
+    cv2.putText(
+        radar, "in", (lx + 38, ly), cv2.FONT_HERSHEY_SIMPLEX, 0.32, (200, 200, 200), 1, cv2.LINE_AA
+    )
+    cv2.circle(radar, (lx + 58, ly - 4), 4, (255, 80, 80), -1, cv2.LINE_AA)
+    cv2.putText(
+        radar, "out", (lx + 68, ly), cv2.FONT_HERSHEY_SIMPLEX, 0.32, (200, 200, 200), 1, cv2.LINE_AA
+    )
     return radar
 
 
@@ -783,11 +794,15 @@ def detect_pitch_keypoints(frame: np.ndarray, model: PitchHomography) -> sv.KeyP
     return model.detect_keypoints(frame)
 
 
+def pitch_vertex_count(config: SoccerPitchConfiguration = PITCH_CONFIG) -> int:
+    return len(config.vertices)
+
+
 def pitch_keypoint_confidence(
     keypoints: sv.KeyPoints, n_vertices: int | None = None
 ) -> np.ndarray:
     """Per-vertex confidence; missing entries are 0."""
-    n = n_vertices or len(PITCH_CONFIG.vertices)
+    n = n_vertices or pitch_vertex_count()
     if keypoints is None or keypoints.xy.shape[0] == 0:
         return np.zeros(n, dtype=np.float32)
     xy = keypoints.xy[0]
@@ -800,6 +815,63 @@ def pitch_keypoint_confidence(
     return conf[:n]
 
 
+def keypoints_from_inference_field(
+    inference_result,
+    *,
+    n_vertices: int | None = None,
+) -> sv.KeyPoints:
+    """Map Roboflow Inference keypoints into fixed pitch vertex slots by ``class_id``.
+
+    ``sv.KeyPoints.from_inference`` packs only the returned keypoints in list order.
+    Inference omits low-confidence vertices, so sequential packing mis-aligns landmarks
+    after the first missing point and homography drifts frame-to-frame.
+    """
+    n = n_vertices or pitch_vertex_count()
+    if hasattr(inference_result, "model_dump"):
+        inference_result = inference_result.model_dump(by_alias=True, exclude_none=True)
+    elif hasattr(inference_result, "dict"):
+        inference_result = inference_result.dict(exclude_none=True, by_alias=True)
+
+    predictions = inference_result.get("predictions") or []
+    if not predictions:
+        return sv.KeyPoints.empty()
+
+    prediction = max(predictions, key=lambda p: float(p.get("confidence", 0.0)))
+    xy = np.zeros((1, n, 2), dtype=np.float32)
+    conf = np.zeros((1, n), dtype=np.float32)
+
+    for keypoint in prediction.get("keypoints") or []:
+        idx = int(keypoint.get("class_id", -1))
+        if idx < 0 or idx >= n:
+            continue
+        xy[0, idx, 0] = float(keypoint["x"])
+        xy[0, idx, 1] = float(keypoint["y"])
+        conf[0, idx] = float(keypoint.get("confidence", 0.0))
+
+    return sv.KeyPoints(xy=xy, confidence=conf)
+
+
+def align_pitch_keypoints(
+    keypoints: sv.KeyPoints,
+    *,
+    n_vertices: int | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Normalize keypoint arrays to the pitch template vertex count (pad/truncate)."""
+    n = n_vertices or pitch_vertex_count()
+    if keypoints.xy.shape[0] == 0:
+        return (
+            np.zeros((n, 2), dtype=np.float32),
+            np.zeros(n, dtype=np.float32),
+        )
+    xy = keypoints.xy[0].astype(np.float32)
+    conf = pitch_keypoint_confidence(keypoints, n_vertices=n)
+    if xy.shape[0] < n:
+        xy = np.pad(xy, ((0, n - xy.shape[0]), (0, 0)), constant_values=0)
+    elif xy.shape[0] > n:
+        xy = xy[:n]
+    return xy, conf
+
+
 def pitch_keypoint_accept_mask(
     xy: np.ndarray,
     conf: np.ndarray,
@@ -807,10 +879,14 @@ def pitch_keypoint_accept_mask(
     confidence: float = 0.5,
 ) -> np.ndarray:
     """True where a keypoint is used for homography (same rule as ``PitchHomography``)."""
-    n = min(len(xy), len(conf))
+    n = len(conf)
     if n == 0:
         return np.zeros(0, dtype=bool)
-    return (conf[:n] > confidence) & (xy[:n, 0] > 1) & (xy[:n, 1] > 1)
+    if len(xy) < n:
+        xy = np.pad(xy.astype(np.float32), ((0, n - len(xy)), (0, 0)), constant_values=0)
+    elif len(xy) > n:
+        xy = xy[:n]
+    return (conf > confidence) & (xy[:, 0] > 1) & (xy[:, 1] > 1)
 
 
 def pitch_keypoint_reprojection_errors(
@@ -866,8 +942,8 @@ def view_transformer_from_keypoints(
     """Per-frame H from model keypoints (tries plain + mirrored pitch like the tracker)."""
     if keypoints is None or keypoints.xy.shape[0] == 0:
         return None
-    xy = keypoints.xy[0]
-    conf = pitch_keypoint_confidence(keypoints, n_vertices=len(xy))
+    n = pitch_vertex_count(config)
+    xy, conf = align_pitch_keypoints(keypoints, n_vertices=n)
     mask = pitch_keypoint_accept_mask(xy, conf, confidence=confidence)
     if mask.sum() < 4:
         return None
@@ -959,8 +1035,8 @@ def resolve_radar_anchor(
         kps = keypoints_by_frame.get(int(frame_idx))
         if kps is None or kps.xy.shape[0] == 0:
             continue
-        xy = kps.xy[0]
-        conf = pitch_keypoint_confidence(kps, n_vertices=len(xy))
+        n = pitch_vertex_count(config)
+        xy, conf = align_pitch_keypoints(kps, n_vertices=n)
         mask = pitch_keypoint_accept_mask(xy, conf, confidence=confidence)
         if mask.sum() < DISPLAY_MIN_KEYPOINTS:
             continue
@@ -1157,8 +1233,9 @@ class PitchHomographyTracker:
     def _frame_correspondences(
         self, keypoints: sv.KeyPoints
     ) -> tuple[np.ndarray, np.ndarray] | None:
-        xy = keypoints.xy[0]
-        conf = pitch_keypoint_confidence(keypoints, n_vertices=len(self._targets))
+        xy, conf = align_pitch_keypoints(
+            keypoints, n_vertices=len(self._targets)
+        )
         mask = pitch_keypoint_accept_mask(xy, conf, confidence=self.confidence)
         if mask.sum() < 4:
             return None

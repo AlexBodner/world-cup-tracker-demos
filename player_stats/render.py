@@ -167,7 +167,7 @@ def render_demo(
                 kps,
                 pitch_confidence=pitch_confidence,
                 locked_goal_defenders=locked_goals,
-                debug_keypoints=pitch_kp_debug,
+                debug_keypoints=True,
             )
         if pitch_kp_debug and frame_keypoints is not None:
             image = draw_pitch_keypoints_debug(

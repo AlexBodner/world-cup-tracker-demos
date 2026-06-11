@@ -475,7 +475,7 @@ def _annotate_live(
             keypoints,
             pitch_confidence=pitch_confidence,
             locked_goal_defenders=locked_goal_defenders,
-            debug_keypoints=debug_pitch_keypoints,
+            debug_keypoints=True,
         )
     if debug_pitch_keypoints and keypoints is not None:
         frame = draw_pitch_keypoints_debug(
@@ -697,7 +697,7 @@ def _draw_pass_overlay(
             confidence=pitch_confidence,
             transformer=radar_h,
             locked_goal_defenders=locked_goal_defenders,
-            debug_keypoints=debug_pitch_keypoints,
+            debug_keypoints=True,
         )
         if radar is not None and show_lane_debug and visible and radar_h is not None:
             feet_img = feet_xy(dets)

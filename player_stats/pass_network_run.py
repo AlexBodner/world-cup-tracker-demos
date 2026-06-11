@@ -179,7 +179,7 @@ def main() -> None:
     parser.add_argument(
         "--debug-pitch-keypoints",
         action="store_true",
-        help="Draw pitch keypoints on video + radar (green=used, red=rejected).",
+        help="Draw pitch keypoints on main video (indices + skeleton). Radar always shows kp in --metric.",
     )
     parser.add_argument(
         "--show-predictions",

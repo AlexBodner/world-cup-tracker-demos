@@ -775,6 +775,13 @@ def render_pass_network_demo(
         if metric and transformer is None and frame_transforms is not None:
             draw_text_shadow(image, "WARNING: Poor Pitch Detection", (20, 40), font_scale=0.6, color_bgr=(50, 50, 255), thickness=2)
             
+        if debug_pitch_keypoints and kps is not None:
+            image = draw_pitch_keypoints_debug(
+                image,
+                kps,
+                confidence_threshold=pitch_confidence,
+            )
+
         if show_radar and metric and kps is not None:
             image = draw_radar_minimap(
                 image,
@@ -782,7 +789,7 @@ def render_pass_network_demo(
                 kps,
                 pitch_confidence=pitch_confidence,
                 locked_goal_defenders=locked_goal_defenders,
-                debug_keypoints=debug_pitch_keypoints,
+                debug_keypoints=True,
             )
         
         image = draw_hud_bar(image, "PASS NETWORK")
