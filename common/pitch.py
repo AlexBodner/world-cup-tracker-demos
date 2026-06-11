@@ -5,10 +5,9 @@ are vendored (lightly trimmed) from roboflow/sports
 (https://github.com/roboflow/sports, Apache-2.0) so the demos do not depend on the
 unpublished `sports` package.
 
-`PitchHomography` wraps a YOLOv8-pose pitch-keypoint model (the
-``football-pitch-detection.pt`` weights from roboflow/sports) to estimate a per-frame
-homography that maps image points to real pitch coordinates (centimeters). The weights
-live on Google Drive; see the README "weights" note if the auto-download is blocked.
+`PitchHomography` runs the Roboflow Inference keypoint model
+``football-field-detection-f07vi/15`` (Universe) to estimate a per-frame homography that
+maps image points to real pitch coordinates (centimeters). Requires ``ROBOFLOW_API_KEY``.
 """
 
 from __future__ import annotations
@@ -186,34 +185,50 @@ def draw_points_on_pitch(
 # --------------------------------------------------------------------------- #
 # Pitch keypoint model -> per-frame homography
 # --------------------------------------------------------------------------- #
+PITCH_INFERENCE_MODEL_ID = "football-field-detection-f07vi/15"
+
+
 class PitchHomography:
-    """Estimate image->pitch homography from a YOLOv8-pose pitch-keypoint model.
+    """Estimate image->pitch homography via Roboflow Inference keypoint detection.
 
     Args:
-        weights_path: path to ``football-pitch-detection.pt`` (roboflow/sports).
+        model_id: Universe model id (default v15 of football-field-detection-f07vi).
+        api_key: Roboflow API key; defaults to ``ROBOFLOW_API_KEY`` env var.
         config: pitch configuration whose ``vertices`` are the target points.
-        device: torch device string.
-        confidence: keypoint confidence threshold.
+        confidence: keypoint confidence threshold for homography fitting.
+        device: unused; kept for call-site compatibility with older loaders.
     """
 
     def __init__(
         self,
-        weights_path: str,
+        *,
+        model_id: str = PITCH_INFERENCE_MODEL_ID,
+        api_key: str | None = None,
         config: SoccerPitchConfiguration | None = None,
-        device: str = "cpu",
         confidence: float = 0.5,
+        device: str = "cpu",
     ) -> None:
-        from ultralytics import YOLO  # local import: heavy + optional
+        import os
 
-        self.model = YOLO(weights_path)
+        from inference import get_model
+
+        key = api_key or os.environ.get("ROBOFLOW_API_KEY")
+        if not key:
+            raise RuntimeError(
+                f"Set ROBOFLOW_API_KEY for pitch keypoint inference ({model_id})."
+            )
+        self.model = get_model(model_id=model_id, api_key=key)
         self.config = config or SoccerPitchConfiguration()
-        self.device = device
         self.confidence = confidence
+        self.device = device
         self._targets = np.array(self.config.vertices, dtype=np.float32)
 
+    def detect_keypoints(self, frame_bgr: np.ndarray) -> sv.KeyPoints:
+        result = self.model.infer(frame_bgr, confidence=0.3)[0]
+        return sv.KeyPoints.from_inference(result)
+
     def __call__(self, frame_bgr: np.ndarray) -> ViewTransformer | None:
-        result = self.model(frame_bgr, device=self.device, verbose=False)[0]
-        kps = sv.KeyPoints.from_ultralytics(result)
+        kps = self.detect_keypoints(frame_bgr)
         if kps.xy.shape[0] == 0:
             return None
         xy = kps.xy[0]
@@ -372,6 +387,30 @@ DISPLAY_MIN_KEYPOINTS = 4
 DISPLAY_MAX_REPROJ_PX = 10.0
 
 
+def homography_from_keypoints_radar(
+    keypoints: sv.KeyPoints | None,
+    *,
+    config: SoccerPitchConfiguration = PITCH_CONFIG,
+    confidence: float = 0.5,
+    min_keypoints: int = DISPLAY_MIN_KEYPOINTS,
+    use_ransac: bool = False,
+) -> ViewTransformer | None:
+    """Per-frame minimap H aligned with roboflow/sports (no mirror), confidence-gated."""
+    if keypoints is None or keypoints.xy.shape[0] == 0:
+        return None
+    xy = keypoints.xy[0]
+    conf = pitch_keypoint_confidence(keypoints, n_vertices=len(xy))
+    mask = pitch_keypoint_accept_mask(xy, conf, confidence=confidence)
+    if mask.sum() < min_keypoints:
+        return None
+    src = xy[mask].astype(np.float32)
+    dst = np.array(config.vertices, dtype=np.float32)[mask]
+    try:
+        return ViewTransformer(source=src, target=dst, use_ransac=use_ransac)
+    except ValueError:
+        return None
+
+
 def homography_from_keypoints_simple(
     keypoints: sv.KeyPoints | None,
     *,
@@ -498,7 +537,7 @@ def render_radar_simple(
 
     t = transformer
     if t is None:
-        t = homography_from_keypoints_simple(
+        t = homography_from_keypoints_radar(
             keypoints, config=config, confidence=confidence
         )
     if t is None:
@@ -702,44 +741,46 @@ def render_radar_sports(
     use_ransac: bool = False,
     ransac_thresh: float = HOMOGRAPHY_RANSAC_REPROJ_THRESH,
 ) -> np.ndarray | None:
-    """Build minimap from per-frame keypoints (simple homography by default)."""
-    del use_ransac, ransac_thresh  # kept for call-site compatibility
+    """Build minimap from per-frame keypoints (sports H + confidence gate)."""
+    t = homography_from_keypoints_radar(
+        keypoints, config=config, confidence=confidence, use_ransac=use_ransac
+    )
     return render_radar_simple(
-        detections, keypoints, config=config, confidence=confidence
+        detections,
+        keypoints,
+        config=config,
+        confidence=confidence,
+        transformer=t,
     )
 
 
-_MODEL_DIR = __import__("pathlib").Path(__file__).resolve().parent.parent / ".cache" / "models"
-_PITCH_MODEL_PATH = _MODEL_DIR / "football-pitch-detection.pt"
-_PITCH_MODEL_GDRIVE_ID = "1Ma5Kt86tgpdjCTKfum79YMgNnSjcoOyf"
+def ensure_pitch_model() -> None:
+    """Verify ``ROBOFLOW_API_KEY`` is set (Inference caches weights on first run)."""
+    import os
+
+    if not os.environ.get("ROBOFLOW_API_KEY"):
+        raise RuntimeError(
+            f"Set ROBOFLOW_API_KEY for pitch keypoint inference ({PITCH_INFERENCE_MODEL_ID})."
+        )
 
 
-def ensure_pitch_model() -> "Path":
-    """Download the football pitch keypoint model if missing."""
-    from pathlib import Path
-
-    _MODEL_DIR.mkdir(parents=True, exist_ok=True)
-    if _PITCH_MODEL_PATH.is_file():
-        return _PITCH_MODEL_PATH
-
-    try:
-        import gdown
-    except ImportError as exc:
-        raise ImportError("Install gdown to download pitch model weights.") from exc
-
-    url = f"https://drive.google.com/uc?id={_PITCH_MODEL_GDRIVE_ID}"
-    gdown.download(url, str(_PITCH_MODEL_PATH), quiet=False)
-    return _PITCH_MODEL_PATH
-
-
-def load_pitch_model(device: str = "cpu") -> PitchHomography:
-    path = ensure_pitch_model()
-    return PitchHomography(str(path), config=PITCH_CONFIG, device=device)
+def load_pitch_model(
+    device: str = "cpu",
+    *,
+    api_key: str | None = None,
+    model_id: str = PITCH_INFERENCE_MODEL_ID,
+) -> PitchHomography:
+    ensure_pitch_model()
+    return PitchHomography(
+        model_id=model_id,
+        api_key=api_key,
+        config=PITCH_CONFIG,
+        device=device,
+    )
 
 
 def detect_pitch_keypoints(frame: np.ndarray, model: PitchHomography) -> sv.KeyPoints:
-    result = model.model(frame, device=model.device, verbose=False)[0]
-    return sv.KeyPoints.from_ultralytics(result)
+    return model.detect_keypoints(frame)
 
 
 def pitch_keypoint_confidence(
@@ -1251,14 +1292,101 @@ class PitchHomographyTracker:
         return _fail()
 
 
+def _goal_warmup_ready(
+    pitch_m: np.ndarray,
+    teams: np.ndarray,
+    *,
+    min_players: int = 8,
+    min_x_spread_m: float = 14.0,
+) -> bool:
+    """Enough players on a plausible pitch layout to vote defending teams."""
+    if pitch_m is None or len(pitch_m) < min_players:
+        return False
+    if not np.isfinite(pitch_m).all():
+        return False
+    if not (np.any(teams == 0) and np.any(teams == 1)):
+        return False
+    x_spread = float(
+        np.percentile(pitch_m[:, 0], 90) - np.percentile(pitch_m[:, 0], 10)
+    )
+    return x_spread >= min_x_spread_m
+
+
+def _goal_defenders_from_spread(
+    pitch_m: np.ndarray,
+    teams: np.ndarray,
+) -> tuple[int, int] | None:
+    """Map jersey clusters to goals by mean pitch X (same frame as the minimap)."""
+    if not (np.any(teams == 0) and np.any(teams == 1)):
+        return None
+    m0 = float(pitch_m[teams == 0, 0].mean())
+    m1 = float(pitch_m[teams == 1, 0].mean())
+    if m0 <= m1:
+        return 0, 1
+    return 1, 0
+
+
+def warmup_goal_defenders_radar(
+    frames_with_dets,
+    keypoints_by_frame: dict[int, sv.KeyPoints | None],
+    *,
+    confidence: float = 0.9,
+    sample_step: int = 8,
+    min_votes: int = 5,
+) -> tuple[int, int] | None:
+    """Lock left/right defending teams using the same sports-radar H as the minimap."""
+    from world_cup_projects.common.possession import feet_xy, player_mask
+
+    votes: list[tuple[int, int]] = []
+    for frame_idx, dets in frames_with_dets:
+        if int(frame_idx) % sample_step != 0:
+            continue
+        kps = keypoints_by_frame.get(int(frame_idx))
+        transformer = homography_from_keypoints_radar(kps, confidence=confidence)
+        if transformer is None:
+            continue
+        pmask = player_mask(dets)
+        if not pmask.any():
+            continue
+        pitch_m = image_to_pitch_m(feet_xy(dets)[pmask], transformer)
+        if pitch_m is None:
+            continue
+        teams = dets.data.get("team", np.zeros(len(dets), dtype=int))[pmask]
+        if not _goal_warmup_ready(pitch_m, teams):
+            continue
+        pair = _goal_defenders_from_spread(pitch_m, teams)
+        if pair is not None:
+            votes.append(pair)
+    if not votes:
+        return None
+    counts: dict[tuple[int, int], int] = {}
+    for pair in votes:
+        counts[pair] = counts.get(pair, 0) + 1
+    return max(counts, key=counts.get)
+
+
 def warmup_goal_defenders(
     pitch_tracker: PitchHomographyTracker | None,
     frames_with_dets,
     frame_transforms: dict[int, ViewTransformer | None],
     *,
+    keypoints_by_frame: dict[int, sv.KeyPoints | None] | None = None,
+    confidence: float = 0.9,
     sample_step: int = 8,
 ) -> tuple[int, int] | None:
-    """Sample frames until reliable votes lock left/right defending teams."""
+    """Lock defending teams; prefers sports-radar H when keypoints are available."""
+    if keypoints_by_frame is not None:
+        locked = warmup_goal_defenders_radar(
+            frames_with_dets,
+            keypoints_by_frame,
+            confidence=confidence,
+            sample_step=sample_step,
+        )
+        if locked is not None:
+            if pitch_tracker is not None:
+                pitch_tracker.locked_goal_defenders = locked
+            return locked
+
     from world_cup_projects.common.possession import feet_xy, player_mask
 
     if pitch_tracker is None:

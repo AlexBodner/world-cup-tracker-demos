@@ -322,34 +322,28 @@ def draw_radar_minimap(
     prebuilt_radar: np.ndarray | None = None,
     debug_keypoints: bool = False,
 ) -> np.ndarray:
-    """Sports-style radar minimap — prefer clip-wide H to avoid per-frame mirroring."""
+    """Sports-style radar minimap: per-frame H from gated keypoints (no mirror lock)."""
+    del clip_radar_transformer  # deprecated; minimap always fits per-frame from keypoints
     if prebuilt_radar is not None:
         radar = prebuilt_radar
+    elif keypoints is not None:
+        from world_cup_projects.common.pitch import render_radar_simple
+
+        radar = render_radar_simple(
+            dets,
+            keypoints,
+            confidence=pitch_confidence,
+            locked_goal_defenders=locked_goal_defenders,
+            debug_keypoints=debug_keypoints,
+        )
+    elif transformer is not None:
+        from world_cup_projects.common.pitch import render_radar_from_transformer
+
+        radar = render_radar_from_transformer(
+            dets, transformer, locked_goal_defenders=locked_goal_defenders
+        )
     else:
-        radar_t = clip_radar_transformer or transformer
-        if radar_t is not None:
-            from world_cup_projects.common.pitch import render_radar_simple
-
-            radar = render_radar_simple(
-                dets,
-                keypoints if debug_keypoints else None,
-                confidence=pitch_confidence,
-                transformer=radar_t,
-                locked_goal_defenders=locked_goal_defenders,
-                debug_keypoints=debug_keypoints,
-            )
-        elif keypoints is not None:
-            from world_cup_projects.common.pitch import render_radar_simple
-
-            radar = render_radar_simple(
-                dets,
-                keypoints,
-                confidence=pitch_confidence,
-                locked_goal_defenders=locked_goal_defenders,
-                debug_keypoints=debug_keypoints,
-            )
-        else:
-            return frame
+        return frame
     if radar is None:
         return frame
 

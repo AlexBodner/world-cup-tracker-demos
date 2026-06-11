@@ -244,6 +244,10 @@ def main() -> None:
     detections_source = _load_detections_source(args, sequence)
     end = args.max_frames if args.max_frames is not None else sequence.length
     frames = list(detections_source(sequence, start=1, end=end))
+    if args.source in ("football", "rfdetr"):
+        from world_cup_projects.common.teams import stabilize_teams_by_tracklet
+
+        frames = stabilize_teams_by_tracklet(frames)
 
     # Perform pitch transformation and goalkeeper stabilization early
     frame_transforms: dict = {}
@@ -263,22 +267,25 @@ def main() -> None:
         cache_name = f"{sequence.name}_{args.device}_{end}_{args.pitch_confidence}.pkl"
         cache_path = cache_dir / cache_name
 
-        from world_cup_projects.common.pitch import resolve_radar_anchor
-
         detections_by_frame = {int(fi): d for fi, d in frames}
-        radar_anchor = None
 
+        locked_goals = None
+        cache_ok = False
         if not args.refresh_detections_cache and cache_path.exists():
             import pickle
             with open(cache_path, "rb") as f:
                 cached_data = pickle.load(f)
+            if {"transforms", "radar_transforms", "keypoints"} <= cached_data.keys():
                 frame_transforms = cached_data["transforms"]
                 frame_radar_transforms = cached_data["radar_transforms"]
                 frame_keypoints = cached_data["keypoints"]
-                locked_goals = cached_data.get("locked_goals")
-                radar_anchor = cached_data.get("radar_anchor")
-            print(f"Loaded cached pitch homography: {cache_path.name}")
-        else:
+                cache_ok = True
+                print(f"Loaded cached pitch homography: {cache_path.name}")
+            else:
+                print(
+                    f"Pitch cache incomplete ({cache_path.name}); rebuilding transforms..."
+                )
+        if not cache_ok:
             print(f"Running pitch homography model (will cache to {cache_path.name})...")
             for frame_idx, speed_t, radar_t, kps, tracker in iter_pitch_transformers(
                 sequence,
@@ -294,16 +301,6 @@ def main() -> None:
                 frame_keypoints[frame_idx] = kps
                 pitch_tracker = tracker
 
-            locked_goals = None
-            if args.source in ("football", "rfdetr"):
-                locked_goals = warmup_goal_defenders(pitch_tracker, frames, frame_transforms)
-
-            radar_anchor = resolve_radar_anchor(
-                frames,
-                frame_keypoints,
-                confidence=args.pitch_confidence,
-            )
-
             import pickle
             with open(cache_path, "wb") as f:
                 pickle.dump(
@@ -311,22 +308,25 @@ def main() -> None:
                         "transforms": frame_transforms,
                         "radar_transforms": frame_radar_transforms,
                         "keypoints": frame_keypoints,
-                        "locked_goals": locked_goals,
-                        "radar_anchor": radar_anchor,
                     },
                     f,
                 )
             print(f"Wrote pitch cache: {cache_path}")
 
-        if radar_anchor is None:
-            radar_anchor = resolve_radar_anchor(
+        if args.source in ("football", "rfdetr") and frame_keypoints:
+            from world_cup_projects.common.pitch import warmup_goal_defenders_radar
+
+            locked_goals = warmup_goal_defenders_radar(
                 frames,
                 frame_keypoints,
                 confidence=args.pitch_confidence,
             )
-
-        if args.source in ("football", "rfdetr"):
-            stabilize_goalkeeper_teams(frames, frame_transforms, locked_goals)
+            stabilize_goalkeeper_teams(
+                frames,
+                locked_goal_defenders=locked_goals,
+                keypoints_by_frame=frame_keypoints,
+                pitch_confidence=args.pitch_confidence,
+            )
 
     weights = PassWeights.metric() if args.metric else PassWeights()
     scorer = PassQualityScorer(weights=weights, metric=args.metric, transformers=frame_transforms)
@@ -386,7 +386,6 @@ def main() -> None:
             freeze_quality_threshold=args.freeze_quality_threshold,
             debug_carrier=args.debug_carrier,
             carrier_timeline=carrier_timeline,
-            radar_anchor=radar_anchor,
         )
         manifest["video"] = render_manifest["output"]
         json_path.write_text(json.dumps(manifest, indent=2))

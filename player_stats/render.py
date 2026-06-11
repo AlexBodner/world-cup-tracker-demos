@@ -117,7 +117,15 @@ def render_demo(
     """Render the speed/distance MP4. ``frame_loader(frame_idx) -> bgr image``."""
     frames_list = list(detections_iter)
     locked_goals: tuple[int, int] | None = None
-    if pitch_tracker is not None and frame_transforms is not None:
+    if frame_keypoints:
+        from world_cup_projects.common.pitch import warmup_goal_defenders_radar
+
+        locked_goals = warmup_goal_defenders_radar(
+            frames_list,
+            frame_keypoints,
+            confidence=pitch_confidence,
+        )
+    elif pitch_tracker is not None and frame_transforms is not None:
         locked_goals = warmup_goal_defenders(
             pitch_tracker, frames_list, frame_transforms
         )
@@ -158,7 +166,6 @@ def render_demo(
                 dets,
                 kps,
                 pitch_confidence=pitch_confidence,
-                transformer=h_t,
                 locked_goal_defenders=locked_goals,
                 debug_keypoints=pitch_kp_debug,
             )

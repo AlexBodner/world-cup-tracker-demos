@@ -101,6 +101,20 @@ def build_collaboration_links(events: list[InferredPass]) -> list[CollaborationL
     return links
 
 
+def strongest_collaboration_pair(
+    links: list[CollaborationLink] | tuple[CollaborationLink, ...],
+) -> tuple[int, int, int, int] | None:
+    """Undirected pair with the most passes between them: (tid_a, tid_b, team, count)."""
+    totals: dict[tuple[int, int, int], int] = defaultdict(int)
+    for link in links:
+        a, b = sorted((link.passer_tid, link.receiver_tid))
+        totals[(a, b, link.team)] += link.count
+    if not totals:
+        return None
+    (a, b, team), count = max(totals.items(), key=lambda item: item[1])
+    return a, b, team, count
+
+
 def build_player_summaries(events: list[InferredPass]) -> list[PlayerPassSummary]:
     """Per-player pass counts and average quality as passer vs receiver."""
     teams: dict[int, int] = {}

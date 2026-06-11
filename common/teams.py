@@ -22,6 +22,50 @@ def get_crops(frame: np.ndarray, detections: sv.Detections) -> List[np.ndarray]:
     return [sv.crop_image(frame, xyxy) for xyxy in detections.xyxy]
 
 
+class TrackletTeamStabilizer:
+    """Per-track jersey team with hysteresis: flip only after N consecutive disagrees."""
+
+    def __init__(self, *, flip_after: int = 8) -> None:
+        self.flip_after = max(1, int(flip_after))
+        self._stable: dict[int, int] = {}
+        self._streak: dict[int, int] = {}
+
+    def apply(self, dets: sv.Detections) -> sv.Detections:
+        if dets.tracker_id is None or dets.data is None or len(dets) == 0:
+            return dets
+        team = np.array(dets.data.get("team", np.full(len(dets), TEAM_NONE)), dtype=int)
+        for i, tid in enumerate(dets.tracker_id):
+            tid = int(tid)
+            if tid < 0 or dets.class_id[i] != ROLE_PLAYER:
+                continue
+            raw = int(team[i])
+            if raw not in (0, 1):
+                continue
+            if tid not in self._stable:
+                self._stable[tid] = raw
+                self._streak[tid] = 0
+            elif raw == self._stable[tid]:
+                self._streak[tid] = 0
+            else:
+                self._streak[tid] = self._streak.get(tid, 0) + 1
+                if self._streak[tid] >= self.flip_after:
+                    self._stable[tid] = raw
+                    self._streak[tid] = 0
+            team[i] = self._stable[tid]
+        dets.data["team"] = team
+        return dets
+
+
+def stabilize_teams_by_tracklet(
+    frames: Iterable[tuple[int, sv.Detections]],
+    *,
+    flip_after: int = 8,
+) -> list[tuple[int, sv.Detections]]:
+    """Run :class:`TrackletTeamStabilizer` across a clip (works on cached detections too)."""
+    stabilizer = TrackletTeamStabilizer(flip_after=flip_after)
+    return [(int(fi), stabilizer.apply(dets)) for fi, dets in frames]
+
+
 def resolve_goalkeepers_team_by_goal(
     goalkeepers_pitch_cm: np.ndarray,
     outfield_pitch_cm: np.ndarray,
@@ -201,16 +245,22 @@ class JerseyColorTeamClassifier:
 
 def stabilize_goalkeeper_teams(
     frames: list[tuple[int, sv.Detections]],
-    transforms: dict[int, object | None],
+    transforms: dict[int, object | None] | None = None,
     locked_goal_defenders: tuple[int, int] | None = None,
+    *,
+    keypoints_by_frame: dict[int, object] | None = None,
+    pitch_confidence: float = 0.9,
 ) -> None:
-    """Mutate frames to ensure goalkeepers have stable teams and roles via tracking.
+    """Mutate frames so GKs keep a stable defending team (sports-radar pitch space).
 
-    1. Identify tracklets that are ever detected as ROLE_GOALKEEPER.
-    2. For each, determine which goal they are closer to on average (pitch-space).
-    3. Force ROLE_GOALKEEPER and the defending team for the entire tracklet duration.
+    1. Identify tracklets ever detected as ROLE_GOALKEEPER.
+    2. Average pitch X from the same per-frame radar H used on the minimap.
+    3. Assign the team defending the nearer goal for the whole tracklet.
     """
-    from world_cup_projects.common.pitch import image_to_pitch_cm
+    from world_cup_projects.common.pitch import (
+        homography_from_keypoints_radar,
+        image_to_pitch_cm,
+    )
     from world_cup_projects.common.possession import feet_xy
     from world_cup_projects.common.soccernet import TEAM_LEFT, TEAM_RIGHT
 
@@ -219,14 +269,20 @@ def stabilize_goalkeeper_teams(
     else:
         left_def, right_def = locked_goal_defenders
 
-    # track_id -> list of X-positions in pitch centimeters
     track_positions: dict[int, list[float]] = {}
     gk_track_ids: set[int] = set()
 
     for frame_idx, dets in frames:
         if dets.tracker_id is None:
             continue
-        t = transforms.get(frame_idx)
+        t = None
+        if keypoints_by_frame is not None:
+            t = homography_from_keypoints_radar(
+                keypoints_by_frame.get(int(frame_idx)),
+                confidence=pitch_confidence,
+            )
+        if t is None and transforms is not None:
+            t = transforms.get(frame_idx)
         if t is None:
             continue
 
@@ -245,7 +301,6 @@ def stabilize_goalkeeper_teams(
             if np.isfinite(feet_cm[i]).all():
                 track_positions.setdefault(tid, []).append(float(feet_cm[i, 0]))
 
-    # Determine stable team for each goalkeeper tracklet
     stable_assignments: dict[int, int] = {}
     pitch_mid_cm = 12000.0 / 2.0
 
@@ -254,12 +309,7 @@ def stabilize_goalkeeper_teams(
         if not positions:
             continue
         avg_x = sum(positions) / len(positions)
-        # Note on inversion: infer_goal_defenders returns the team IDs as (left_defender, right_defender).
-        # However, due to how the rendering layer maps Team IDs (0/1) to colors (Blue/Pink) 
-        # relative to the outfield player clusters, assigning the GK to the 'defending' ID 
-        # visually paints them as the opponent. Swapping the assignment forces the GK's ID 
-        # to match the color of the outfield players they are playing behind.
-        stable_assignments[tid] = right_def if avg_x < pitch_mid_cm else left_def
+        stable_assignments[tid] = left_def if avg_x < pitch_mid_cm else right_def
 
     # Patch frames in place
     for _, dets in frames:

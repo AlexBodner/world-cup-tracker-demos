@@ -55,7 +55,10 @@ from world_cup_projects.player_stats.pass_events import (
     InferredTurnover,
     PassQualityScorer,
 )
-from world_cup_projects.player_stats.pass_network import PassNetwork
+from world_cup_projects.player_stats.pass_network import (
+    PassNetwork,
+    strongest_collaboration_pair,
+)
 
 TEAM_COLORS_BGR = [c.as_bgr() for c in TEAM_COLORS[:2]]
 RANK_COLORS_BGR = [(80, 220, 60), (40, 220, 240), (40, 140, 255)]
@@ -527,15 +530,16 @@ def _stats_end_card(size: tuple[int, int], network: PassNetwork) -> np.ndarray:
         size=(w - graph_x - 40, h - 220),
     )
 
-    if network.links:
-        best = network.links[0]
+    strongest = strongest_collaboration_pair(network.links)
+    if strongest is not None:
+        tid_a, tid_b, team, count = strongest
         draw_text_shadow(
             card,
-            f"STRONGEST LINK:  #{best.passer_tid} -> #{best.receiver_tid}"
-            f"  ({best.count} passes, Avg Quality: {_format_quality(best.avg_quality)})",
+            f"STRONGEST LINK:  #{tid_a} <-> #{tid_b}"
+            f"  ({count} passes)",
             (44, h - 80),
             font_scale=0.72,
-            color_bgr=(255, 220, 80),
+            color_bgr=_team_color(team),
             thickness=2,
         )
 
@@ -650,7 +654,6 @@ def render_pass_network_demo(
     freeze_quality_threshold: float = 0.0,
     debug_carrier: bool = False,
     carrier_timeline: dict[int, CarrierFrameState] | None = None,
-    radar_anchor=None,
 ) -> dict:
     """Render tracked clip plus a stats end-card."""
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
@@ -772,16 +775,12 @@ def render_pass_network_demo(
         if metric and transformer is None and frame_transforms is not None:
             draw_text_shadow(image, "WARNING: Poor Pitch Detection", (20, 40), font_scale=0.6, color_bgr=(50, 50, 255), thickness=2)
             
-        if show_radar and metric and (
-            radar_anchor is not None or radar_transformer is not None
-        ):
+        if show_radar and metric and kps is not None:
             image = draw_radar_minimap(
                 image,
                 dets,
                 kps,
                 pitch_confidence=pitch_confidence,
-                transformer=radar_transformer,
-                clip_radar_transformer=radar_anchor,
                 locked_goal_defenders=locked_goal_defenders,
                 debug_keypoints=debug_pitch_keypoints,
             )

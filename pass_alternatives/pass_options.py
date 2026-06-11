@@ -8,6 +8,8 @@ Each candidate lane (carrier -> teammate) is scored on three football-sense axes
   width than rivals; they can let the ball through so we only ding obvious obstacles).
 * **forward progress** - gain toward the attacking direction.
 * **carrier motion** - passes behind the carrier's Kalman-predicted run direction are penalized.
+* **backward attack** - passes toward own goal (negative forward gain) are penalized when
+  the carrier is running forward (optional gate).
 * **receiver space** - how much room the receiver has from the nearest opponent.
 
 A short-range/very-long-range penalty keeps the suggestions realistic. Scores are
@@ -73,6 +75,9 @@ class PassWeights:
     motion_min_displacement_m: float = 0.35
     backward_penalty: float = 0.22
     backward_cos_threshold: float = -0.15  # pass vs run; below => backward
+    backward_attack_penalty: float = 0.18
+    backward_attack_only_when_running_forward: bool = True
+    backward_attack_motion_cos_threshold: float = 0.15  # run vs attack; above => gate on
     # Freeze-moment selection (plan_events): favor slow, tight ball control
     use_ball_control_gate: bool = True
     ball_speed_lookback_frames: int = 4
@@ -115,6 +120,7 @@ class PassWeights:
             use_carrier_motion=True,
             motion_min_displacement_m=0.35,
             backward_penalty=0.22,
+            backward_attack_penalty=0.18,
             ball_speed_ref_m=1.2,
             ball_speed_max_m=3.5,
             ball_speed_skip_m=6.5,
@@ -285,6 +291,58 @@ def _build_lane_debug(
     )
 
 
+def remap_lane_debug_to_pitch_cm(
+    options: list[PassOption],
+    carrier: Carrier,
+    pitch_cm: np.ndarray,
+    feet_img: np.ndarray,
+    *,
+    weights: PassWeights = PassWeights(),
+) -> list[PassOption]:
+    """Rebuild corridor quads in another pitch-cm frame (e.g. sports radar H).
+
+    Keeps the same receivers as ``options``; only remaps geometry so lanes align
+    with the minimap homography.
+    """
+    from dataclasses import replace
+
+    ci = carrier.index
+    remapped: list[PassOption] = []
+    for opt in options:
+        ri = opt.receiver_index
+        if ci >= len(pitch_cm) or ri >= len(pitch_cm):
+            remapped.append(opt)
+            continue
+        delta_cm = pitch_cm[ri] - pitch_cm[ci]
+        length_m = float(np.linalg.norm(delta_cm)) / 100.0
+        pass_len_px = float(np.linalg.norm(feet_img[ri] - feet_img[ci]))
+        lane_w = _lane_width_for_pass(
+            weights, pass_length=length_m, pass_length_px=pass_len_px
+        )
+        half_cm = _half_width_cm(
+            weights,
+            lane_w,
+            pass_length_m=length_m,
+            pass_length_px=pass_len_px,
+            use_image_lane=weights.lane_in_image_space,
+        )
+        poly = pass_corridor_polygon(
+            pitch_cm[ci],
+            pitch_cm[ri],
+            half_cm,
+            t_min=weights.lane_t_min,
+            t_max=weights.lane_t_max,
+        )
+        prev = opt.lane_debug
+        debug = PassLaneDebug(
+            corridor_polygon_cm=poly,
+            blocking_rival_indices=prev.blocking_rival_indices if prev else (),
+            blocking_teammate_indices=prev.blocking_teammate_indices if prev else (),
+        )
+        remapped.append(replace(opt, lane_debug=debug))
+    return remapped
+
+
 def _backward_motion_penalty(
     pass_delta: np.ndarray,
     motion_dir: np.ndarray | None,
@@ -302,6 +360,24 @@ def _backward_motion_penalty(
     span = 1.0 - weights.backward_cos_threshold
     severity = min(1.0, (weights.backward_cos_threshold - align) / span)
     return weights.backward_penalty * severity, align
+
+
+def _backward_attack_penalty(
+    forward_gain: float,
+    attack: np.ndarray,
+    motion_dir: np.ndarray | None,
+    weights: PassWeights,
+) -> float:
+    """Penalty for passes toward own goal (negative forward gain vs attack direction)."""
+    if weights.backward_attack_penalty <= 0 or forward_gain >= 0:
+        return 0.0
+    if weights.backward_attack_only_when_running_forward:
+        if motion_dir is None:
+            return 0.0
+        if float(motion_dir @ attack) < weights.backward_attack_motion_cos_threshold:
+            return 0.0
+    severity = min(1.0, -forward_gain / weights.forward_ref)
+    return weights.backward_attack_penalty * severity
 
 
 def _teammate_lane_penalty_amount(
@@ -503,6 +579,9 @@ def score_pass_options(
             delta, carrier_motion_dir, weights
         )
         score -= back_pen
+        score -= _backward_attack_penalty(
+            forward_gain, attack, carrier_motion_dir, weights
+        )
         if length < weights.min_length or length > weights.max_length:
             continue
 

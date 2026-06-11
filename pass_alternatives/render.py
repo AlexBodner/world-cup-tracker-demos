@@ -22,6 +22,7 @@ from world_cup_projects.common.clips import pitch_keypoints_unreliable
 from world_cup_projects.common.pitch import (
     PitchHomographyTracker,
     ViewTransformer,
+    homography_from_keypoints_radar,
     image_to_pitch_cm,
     image_to_pitch_m,
     iter_pitch_transformers,
@@ -71,6 +72,7 @@ from world_cup_projects.common.visual import (
 from world_cup_projects.pass_alternatives.pass_options import (
     PassOption,
     PassWeights,
+    remap_lane_debug_to_pitch_cm,
     top_pass_options,
 )
 
@@ -472,7 +474,6 @@ def _annotate_live(
             dets,
             keypoints,
             pitch_confidence=pitch_confidence,
-            transformer=radar_transformer,
             locked_goal_defenders=locked_goal_defenders,
             debug_keypoints=debug_pitch_keypoints,
         )
@@ -686,30 +687,42 @@ def _draw_pass_overlay(
         rank_color=RANK_COLORS_BGR[latest_rank] if visible else None,
     )
 
-    if show_lane_debug and show_radar and keypoints is not None:
-        feet_img = feet_xy(dets)
-        pitch_cm_lane = (
-            image_to_pitch_cm(feet_img, transformer) if transformer is not None else None
+    if show_radar and keypoints is not None:
+        radar_h = homography_from_keypoints_radar(
+            keypoints, confidence=pitch_confidence
         )
         radar = render_radar_simple(
             dets,
-            None,  # Force use of transformer to maintain orientation lock
+            keypoints,
             confidence=pitch_confidence,
-            transformer=transformer,
+            transformer=radar_h,
             locked_goal_defenders=locked_goal_defenders,
             debug_keypoints=debug_pitch_keypoints,
         )
-        if radar is not None and pitch_cm_lane is not None:
-            radar = draw_pass_lanes_on_radar(radar, visible, pitch_cm_lane)
+        if radar is not None and show_lane_debug and visible and radar_h is not None:
+            feet_img = feet_xy(dets)
+            pitch_cm_radar = image_to_pitch_cm(feet_img, radar_h)
+            if pitch_cm_radar is not None:
+                radar_visible = remap_lane_debug_to_pitch_cm(
+                    visible,
+                    event.carrier,
+                    pitch_cm_radar,
+                    feet_img,
+                    weights=weights,
+                )
+                radar = draw_pass_lanes_on_radar(
+                    radar, radar_visible, pitch_cm_radar
+                )
+            dim = draw_pass_lane_legend(dim)
+        if radar is not None:
             dim = draw_radar_minimap(
                 dim,
                 dets,
                 keypoints,
-                transformer=transformer,
+                pitch_confidence=pitch_confidence,
                 locked_goal_defenders=locked_goal_defenders,
                 prebuilt_radar=radar,
             )
-        dim = draw_pass_lane_legend(dim)
 
     dim = draw_hud_bar(dim, "PASS ALTERNATIVES  -  top 3 open lanes")
     return draw_branding_tag(dim)
@@ -763,10 +776,13 @@ def render_demo(
         )
     if metric and transforms:
         detections_source = _patch_goalkeeper_teams(detections_source, transforms)
+    frame_list = list(_iter_frames(sequence, detections_source, max_frames=max_frames))
     locked_goals = warmup_goal_defenders(
         pitch_tracker,
-        _iter_frames(sequence, detections_source, max_frames=max_frames),
+        frame_list,
         transforms,
+        keypoints_by_frame=frame_keypoints,
+        confidence=pitch_confidence,
     )
     events = plan_events(
         sequence,

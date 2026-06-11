@@ -7,132 +7,46 @@ removed.
 Two shareable football-analytics demos that promote the Roboflow
 [`trackers`](https://github.com/roboflow/trackers) library, riding the World Cup hype.
 Both reuse what we already built at Roboflow (`trackers`, RF-DETR,
-[`roboflow/sports`](https://github.com/roboflow/sports)) and run on the **SoccerNet**
-dataset to avoid FIFA copyright-strike risk on real broadcast footage.
+[`roboflow/sports`](https://github.com/roboflow/sports)). **v2 demos** (detector +
+pitch homography) run on **Bundesliga broadcast clips** in `bundesliga_videos/` — the same
+domain the pitch-keypoint and player-detection models were trained on. **v1** can still
+use **SoccerNet** game-state GT tracks when you want zero model weights.
 
-1. **Pass Alternatives** - freeze the frame when a player has the ball and overlay the 3
-   best passing lanes, scored by openness / forward-progress / receiver-space.
-2. **Pass Network** - infer completed passes and turnovers from tracking, score each pass
-   with the same lane model, and render a collaboration web + possession-lost banners.
-3. **Player Speed & Distance** - per-player speed (km/h) + total distance covered, shown as
-   on-pitch labels, an end-of-clip leaderboard, and (v2) a top-down radar minimap.
+1. **Pass Alternatives** — freeze the frame when a player has the ball and overlay the
+   three best passing lanes.
+2. **Pass Network** — infer completed passes and turnovers from tracking, score each pass
+   with the same lane model, and render a collaboration web plus possession-lost banners.
+3. **Player Speed & Distance** — per-player speed (km/h) and total distance covered, with
+   on-pitch labels, an end-of-clip leaderboard, and a top-down radar minimap.
 
-Status: **both demos are built and produce rendered MP4s.** v1 (no weights) and v2
-(RF-DETR + ByteTrack + pitch homography) both run end-to-end.
+Status: **all three demos run end-to-end** and produce rendered MP4s.
 
-## Quick start
+## Which clips and why
 
-**Inside the Roboflow monorepo** (data auto-detected under `trackers metrics/...`):
+**Default for v2 (`--video`, `--metric`):** short Bundesliga broadcast segments in
+`bundesliga_videos/`. Pass `--video bundesliga_videos/<clip>.mp4` explicitly — there is
+no auto-picker for local MP4s.
 
-```bash
-pip install -r world_cup_projects/requirements.txt
-pip install -e trackers
-PYTHONPATH=. python -m world_cup_projects.pass_alternatives.run --sequence SNMOT-194
-```
+| Clip | Role |
+|------|------|
+| **`08fd33_0.mp4`** | Primary hero clip — stable pitch keypoints, good possession for pass network / alternatives |
+| **`08fd33_8.mp4`** | Stress test — longer gaps, missing-ball bridges, airborne receptions |
+| **`c01561_3.mp4`** | Camera / team-color edge cases (goal lock, jersey stabilizer) |
 
-**Standalone** (clone or publish this folder as the repo root):
+**Why Bundesliga, not SoccerNet, for homography:** the pitch keypoint model
+(`football-field-detection-f07vi/15` via Roboflow Inference) and football player
+detector were trained on
+[DFL Bundesliga](https://www.kaggle.com/competitions/dfl-bundesliga-data-shootout)
+broadcast frames. Radar, metric pass scoring, and speed all depend on a clean H — that
+holds on Bundesliga clips and often breaks on SoccerNet game-state angles (wrong/missing
+keypoints, domain gap). SoccerNet SNMOT sequences remain useful for **v1 GT-only** runs
+(no detector weights) but are a poor default for `--metric`.
 
-```bash
-cd world_cup_projects   # or rename the repo root to match your remote
-python -m venv .venv && source .venv/bin/activate
-pip install -e ".[full]"
-pip install git+https://github.com/roboflow/trackers.git
+**SoccerNet auto-pick (optional):** `common.clips.rank_clips` can rank test sequences by
+possession density when you use `--sequence SNMOT-*` without `--video`. That path is
+legacy for pixel-space / GT demos — not recommended for pitch homography.
 
-export SOCCERNET_TRACKING_ROOT=/path/to/soccernet/tracking
-# or: ln -s /your/path data/soccernet/tracking
-
-python -m world_cup_projects.pass_alternatives.run --sequence SNMOT-194 --metric --carrier-max-m 0.7
-python -m world_cup_projects.player_stats.run --sequence SNMOT-117 --mode homography
-python -m world_cup_projects.player_stats.analyze_velocities --sequence SNMOT-117
-```
-
-v2 extras: `rfdetr`, `ultralytics`, `gdown` (included in `[full]`).
-
-Monorepo commands (same demos, `PYTHONPATH=.` from repo root):
-
-```bash
-# Demo 1 - pass alternatives (auto-picks the best clip, renders MP4 + JSON manifest)
-PYTHONPATH=. python -m world_cup_projects.pass_alternatives.run --sequence SNMOT-194
-
-# rank clips only (no render)
-PYTHONPATH=. python -m world_cup_projects.pass_alternatives.run --rank-only
-
-# Demo 2 - speed & distance, metric (pitch homography + radar)
-PYTHONPATH=. python -m world_cup_projects.player_stats.run --sequence SNMOT-194 --mode homography
-
-# Demo 2 - weight-free fallback (bbox-height calibration)
-PYTHONPATH=. python -m world_cup_projects.player_stats.run --sequence SNMOT-194 --mode height
-
-# Homography debug: pitch keypoints, skeleton, feet warp check (orange line = bad H)
-PYTHONPATH=. python -m world_cup_projects.player_stats.run --sequence SNMOT-117 --mode homography --debug-pitch-keypoints
-PYTHONPATH=. python -m world_cup_projects.pass_alternatives.run --sequence SNMOT-194 --metric --debug-pitch-keypoints
-
-# v2 "from raw pixels" — DFL football-players-detection (ball/player/gk/referee)
-PYTHONPATH=. python -m world_cup_projects.pass_alternatives.run \
-    --video world_cup_projects/bundesliga_videos/08fd33_0.mp4 --metric
-
-# Pass network — inferred passes + turnovers + optional alternative freezes
-PYTHONPATH=. python -m world_cup_projects.player_stats.pass_network_run \
-    --video world_cup_projects/bundesliga_videos/08fd33_0.mp4 --metric --render --show-predictions
-
-# v2 fallback: generic COCO RF-DETR (poor team/role split; not recommended for video)
-RF_HOME=world_cup_projects/weights/rfdetr PYTHONPATH=. \
-    python -m world_cup_projects.player_stats.run --sequence SNMOT-194 --source rfdetr --max-frames 150
-```
-
-There is also a walkthrough notebook: [`world_cup_demos.ipynb`](world_cup_demos.ipynb)
-(SoccerNet-notebook style; previews stills inline and renders both demos).
-
-## Rendered outputs (in `assets/`, gitignored)
-
-| File | Demo | Source / calibration |
-|------|------|----------------------|
-| `player_stats_gt_homography_SNMOT-194.mp4` | Speed/distance + radar (hero) | GT + pitch homography |
-| `pass_alternatives_gt_metric_SNMOT-194.mp4` | Top-3 passing lanes, metric | GT + pitch homography |
-| `pass_alternatives_gt_SNMOT-194.mp4` | Top-3 passing lanes, pixel space | GT (no weights) |
-
-Each MP4 ships a matching `.json` manifest (freeze events / leaderboard) and is
-re-encoded to h264 (`ffmpeg -c:v libx264 -crf 23 -pix_fmt yuv420p`) so it stays small and
-broadly playable.
-
-## Visual style (Roboflow Football-AI look)
-
-Both demos share `common/visual.py`, which mirrors Roboflow's Football-AI / blog aesthetic
-using `supervision` annotators:
-
-- **Players**: `sv.EllipseAnnotator` at the feet, team-colored via a `ColorPalette` +
-  `ColorLookup.CLASS`.
-- **Labels**: `sv.LabelAnnotator` rounded chips (`border_radius`, `BOTTOM_CENTER`) — e.g.
-  `#9  12.0 km/h` in the speed demo.
-- **Ball**: `sv.TriangleAnnotator` (gold downward triangle).
-- **Radar**: bottom-center pitch minimap over a semi-transparent dark panel, team-colored
-  dots with black edges plus a white ball dot (`draw_pitch` / `draw_points_on_pitch`).
-- **HUD / branding**: alpha-blended title bar with a Roboflow-purple (`#8315F9`) drop-shadow
-  title and a `powered by trackers` tag.
-- **Pass freeze**: dimmed background, thick faux-glow ranked arrows (green → yellow →
-  orange), an emphasized ring on the best receiver, and rounded score chips.
-
-## Which clip and why
-
-`common.clips.rank_clips` scores every SoccerNet **test** sequence by possession density
-(ball glued to a player's feet), player count, and both-teams-present. Top picks:
-
-| Rank | Clip | Why |
-|------|------|-----|
-| 1 | **SNMOT-194** | ball visible 735/750, clear possession 604 frames, ~18 players, both teams |
-| 2 | **SNMOT-117** | homography/radar default — active play; center-circle frames OK (DFL-trained pitch model) |
-| 3 | SNMOT-200 | ball 707/750, possession 529, ~14 players |
-
-We use **SNMOT-194** for pixel-space / possession auto-pick. **Homography demos**
-(`--metric`, `player_stats --mode homography`) auto-pick **SNMOT-117** via
-`pick_homography_demo_clip`. Auto-pick **skips SNMOT-132, SNMOT-189, SNMOT-197** (bad keypoints)
-and **SNMOT-127** (play often stopped)
-(broken or poor pitch keypoints; blocked unless `--force-unreliable-pitch`). The minimap uses a **simple
-per-frame homography** (`homography_from_keypoints_simple`): fit accepted keypoints to the
-pitch template, draw those keypoints on the radar, warp player feet — no mirror/orientation
-locking. Metric pass scoring still uses the sequence tracker `H`.
-
-## Why SoccerNet
+## Why SoccerNet (v1 only)
 
 SoccerNet game-state clips (under `SOCCERNET_TRACKING_ROOT`, or the monorepo mirror at
 `trackers metrics/soccernet/soccernet_data/tracking` when present) ship **ground-truth
@@ -158,11 +72,12 @@ flowchart LR
         rfdetr --> bytetrack
     end
     subgraph understand [Scene understanding]
-        team[Team assignment]
+        team[Team assignment + stabilizer]
         pitch[Pitch keypoints + homography<br/>ViewTransformer]
     end
     subgraph demos [Demos]
         passd[Pass alternatives:<br/>freeze + 3 best lanes]
+        network[Pass network:<br/>inferred passes + graph]
         speed[Speed + distance:<br/>m/s, meters, radar]
     end
     snImg --> gt
@@ -170,8 +85,11 @@ flowchart LR
     gt --> team
     bytetrack --> team
     team --> passd
+    team --> network
     team --> speed
     pitch --> speed
+    pitch --> passd
+    pitch --> network
     snImg --> pitch
 ```
 
@@ -179,8 +97,8 @@ flowchart LR
 
 | Tier | Detection / tracking | Calibration | What it shows |
 |------|----------------------|-------------|---------------|
-| **v1** | SoccerNet GT tracks | image space / bbox-height | Pass lanes + approximate m/s - no weights |
-| **v2** | RF-DETR + `trackers.ByteTrackTracker` | pitch keypoint homography -> `ViewTransformer` | True meters / m/s + top-down radar |
+| **v1** | SoccerNet GT tracks | image space / bbox-height | Pass lanes + approximate m/s — no weights |
+| **v2** | football-players-detection + ByteTrack/BoTSORT | DFL pitch homography → `ViewTransformer` | True meters / m/s + top-down radar on Bundesliga clips |
 
 ## Folder layout
 
@@ -194,9 +112,10 @@ world_cup_projects/
     possession.py              # ball-carrier detection
     clips.py                   # auto-pick best clips
     geometry.py                # point-to-segment distance etc.
-    pitch.py                   # vendored ViewTransformer + pitch config + radar + PitchHomography
+    pitch.py                   # ViewTransformer + pitch config + radar + PitchHomography
     teams.py                   # team assignment (Siglip TeamClassifier + GK resolution)
     detect.py                  # RF-DETR + ByteTrack pipeline (v2)
+    visual.py                  # shared annotators, radar, HUD
   pass_alternatives/
     pass_options.py            # lane scoring (openness / forward / space)
     render.py                  # freeze-frame overlay video
@@ -204,8 +123,8 @@ world_cup_projects/
   player_stats/
     pass_events.py             # pass + turnover inference rules
     pass_network.py            # collaboration graph aggregation
-    pass_network_render.py       # passes + alternatives + turnover video
-    pass_network_run.py          # CLI
+    pass_network_render.py     # passes + alternatives + turnover video
+    pass_network_run.py        # CLI
     carrier_tracking.py        # per-frame carrier debug timeline
     speed_distance.py          # per-track speed + cumulative distance
     render.py                  # speed labels + leaderboard + radar
@@ -215,18 +134,35 @@ world_cup_projects/
   assets/                      # rendered mp4s / json / stills (gitignored)
 ```
 
+## Scene understanding (teams, radar, homography)
+
+**Team colors (v2):** per-frame jersey KMeans assigns team 0/1. A
+`TrackletTeamStabilizer` then locks each `tracker_id` and only flips after **8 consecutive**
+disagreeing frames — this cuts outfield flicker on broadcast clips.
+
+**Radar minimap:** per-frame `homography_from_keypoints_radar()` (sports-style fit from
+accepted keypoints, confidence ≥ 0.9). No clip-wide mirror/orientation lock on display —
+what you see matches [`roboflow/sports`](https://github.com/roboflow/sports) radar demos.
+
+**Goal colors:** during warmup, outfield feet are clustered on pitch X; the team with lower
+mean X defends the left goal. Goalkeepers are pinned to that side's defending team for the
+clip (`warmup_goal_defenders_radar`).
+
+**Metric pass scoring** (lane quality, pass length, speed) still uses the sequence
+`PitchHomographyTracker` — smoother for distances, separate from the radar display H.
+
+---
+
 ## Pass analytics — how we compute things
 
-Football intuition first, then the exact gates. Two pipelines share the same lane-scoring
-model (`pass_alternatives/pass_options.py`):
+Football intuition first, then the exact gates. Pass alternatives and pass detection share
+the same lane-scoring model (`pass_alternatives/pass_options.py`):
 
 | Pipeline | Question it answers | When it runs |
 |----------|---------------------|--------------|
 | **Pass alternatives** | *What could the carrier play right now?* | Freeze frames on good moments |
 | **Pass detection** | *Who actually passed to whom?* | Full-clip scan of carrier handoffs |
 | **Turnover detection** | *Who lost the ball to the opponent?* | Same scan, rule 5 below |
-
----
 
 ### Foundation — who has the ball?
 
@@ -246,10 +182,7 @@ carrier   = nearest valid player
 - **Control** (tight, ~0.8 m / 55 px): ball glued to feet — dribbling.
 - **Reception** (looser, ~1.8 m / 120 px): first contact / one-touch — wider gate.
 - **Why aerial veto:** without it, balls flying over a player still pass the metric
-  distance check and create false possession (e.g. #1 credited when ball passes below
-  their feet on a long switch).
-
----
+  distance check and create false possession.
 
 ### A. Scoring pass alternatives (hypothetical lanes)
 
@@ -268,32 +201,45 @@ rivals     = count of opponents inside corridor
 
 space      = distance from R to nearest opponent (anywhere, not just on the line)
 forward    = dot(R - C, attack_direction)   # toward opponent goal in metric mode
-motion     = penalty if pass aims behind carrier's recent run (Kalman velocity)
 
-score = 0.45 * norm(openness) + 0.30 * norm(forward) + 0.25 * norm(space)
-        - teammate_lane_penalty   # narrow corridor, light ding
-        - backward_penalty
+score = 0.45 * norm(openness) + 0.30 * norm(max(forward, 0)) + 0.25 * norm(space)
+        - teammate_lane_penalty
+        - backward_penalty          # pass vs carrier run (see below)
+        - backward_attack_penalty   # pass toward own goal (see below)
 skip if length < 2 m or > 45 m
 ```
+
+**Two backward penalties** (both can apply; they measure different things):
+
+| Penalty | Reference axis | When it fires |
+|---------|----------------|---------------|
+| `backward_penalty` | Carrier **run** (recent Kalman velocity) | Pass aims behind where the player is moving (`pass · run < -0.15`) |
+| `backward_attack_penalty` | **Attack** direction (toward opponent goal) | `forward < 0`, and (by default) carrier is running forward (`run · attack ≥ 0.15`) |
+
+The attack-back gate skips deliberate retreats — e.g. a safety pass while the team is
+already dropping. Turn it off (`backward_attack_only_when_running_forward=False`) to penalize
+every backward pass regardless of motion.
 
 **Rival corridor width** (metric, pitch space):
 
 | Pass length | Full width | Why |
 |-------------|------------|-----|
 | ≤ 18 m | 2.5 m | base — short passes are narrow |
-| 18–28 m | 3.25 m | stepped +0.75 m — long switches need slack |
-| > 28 m | 3.75 m | capped at 4.25 m — **not** proportional to distance |
+| 18–28 m | 3.25 m | stepped +0.75 m |
+| > 28 m | 4.0 m | long switches need slack (capped at 4.5 m) |
 
-We use **fixed tiers** instead of `width ∝ length` because linear scaling over-widens
-very long balls and couples too tightly to homography error.
+Fixed tiers — not proportional to length — so very long balls don't get absurdly wide
+corridors that forgive false positives.
 
-**Teammate corridor:** 1.2 m (rivals use 2.5 m). Teammates can step aside; we only
-penalize obvious obstacles.
+**Teammate corridor:** 1.2 m (rivals use 2.5 m). Light penalty only when a teammate
+blocks the narrow lane.
 
-**When to freeze** (`plan_events`): score every possession frame offline; pick frames
-that beat score thresholds, are local peaks (±12 frames), and are ≥ 90 frames apart.
+**When to freeze (pass alternatives demo):** score every possession frame offline; pick
+frames that beat score thresholds, are local peaks (±12 frames), and are ≥ 90 frames apart.
 
----
+**When to freeze (pass network, `--show-predictions`):** only on the **release frame** of
+an inferred pass, when `quality_score` is not null, `quality_score >= --freeze-quality-threshold`
+(default 0.0), the ball carrier is found, and `top_options` returns at least one lane.
 
 ### B. Detecting completed passes (retrospective)
 
@@ -335,20 +281,18 @@ RULE 4 — Emit pass
 | Gate | Problem it fixes |
 |------|------------------|
 | Aerial control veto | Ball overhead / below feet → false carrier |
-| Reception below-feet veto | Long ball skimming under feet (#1 fly-by on #3→#27) |
+| Reception below-feet veto | Long ball skimming under feet |
 | Opponent-blocked arrival | Update release to interceptor without false pass |
 | Nearest-player check | Tracker assigns ball to wrong ID when two players close |
 | 3-frame arrival streak | Single-frame deflections counted as receptions |
-| Adjacent-pass control | One-touch passes (#3↔#27) need real control at receiver |
-| Pre-flight release window | GK punts (#18→#2) only show 1 control frame before boot |
+| Adjacent-pass control | One-touch passes need real control at receiver |
+| Pre-flight release window | GK punts only show 1 control frame before boot |
 | Per-team anchors | Opponent anchor on team B was blocking team A passes |
-| Opponent-between check | Missed pass (#14) — don't credit teammate after interception |
+| Opponent-between check | Don't credit teammate after interception |
 | In-flight anchor survival | Ball visible but no player in range — don't lose passer |
 | Missing-ball bridge | Ball not detected for ≤10 frames — keep release + arrival streak |
 | Defer receiver confirm | Receiver control must not overwrite passer anchor pre-emit |
-| Long-gap reception (2f) | Airborne receptions on gaps ≥15f (#8→#19 on 08fd33_8) |
-
----
+| Long-gap reception (2f) | Airborne receptions on gaps ≥15f |
 
 ### C. Detecting turnovers (interceptions)
 
@@ -362,82 +306,67 @@ RULE 5 — Emit turnover
   when that opponent later completes a pass to a teammate:
       interception_frame = first valid touch by interceptor after snapshot
       require opponent CONTROL between release and that touch
-      emit turnover(passer=#14, interceptor=#3, ...)
+      emit turnover(passer, interceptor, ...)
       clear team A's release anchor
 ```
 
-Teammate arrival streaks are **ignored** if an opponent controlled the ball in between
-(prevents advancing the release anchor on a failed reception after a steal).
-
----
+Teammate arrival streaks are **ignored** if an opponent controlled the ball in between.
 
 ### D. Scoring a detected pass
 
 Once a pass A→B is inferred, we re-run the lane scorer at the **release frame** with
-carrier = A and look up receiver B. Stored fields: `quality`, `openness`, `forward_gain`,
-`receiver_space`, `rivals_in_lane`, `length_m`.
+carrier = A and look up receiver B. Stored fields: `quality_score`, `openness`,
+`forward_gain`, `receiver_space`, `rivals_in_lane`, `length_m`.
 
-This is the same formula as §A — detected passes get a retrospective "how good was this
-lane?" score, not a separate model.
+- **`quality_score` is `null`** when the scorer cannot produce an option for that receiver
+  (e.g. length out of range) — those passes are excluded from quality averages on the
+  collaboration graph.
+- **Strongest link** on the stats card is the undirected pair with the most passes, not
+  an arbitrary first edge.
+
+Same formula as §A — detected passes get a retrospective "how good was this lane?" score.
 
 ---
 
-## Demo 1 - Pass Alternatives
+## Demo 1 — Pass Alternatives
 
-CLI:
-
-```bash
-PYTHONPATH=. python -m world_cup_projects.pass_alternatives.run \
-    --video bundesliga_videos/08fd33_0.mp4 --metric
-```
-
-See **§A** above for scoring. Renders ranked arrows (green → yellow → orange), corridor
-shading on video + minimap, red **!** on blocking rivals. Pitch keypoints default to
-`--pitch-confidence 0.9` (default).
+Freezes on high-scoring possession moments and draws the top three ranked passing lanes
+with corridor shading on video and the radar minimap.
 
 In v1 the attacking direction is an image-space proxy (carrier-team centroid →
-opponent-team centroid); v2 uses pitch homography for true direction-to-goal.
+opponent-team centroid); with `--metric`, homography gives true direction-to-goal.
 
-## Demo 2 - Pass Network
+Pitch keypoints default to `--pitch-confidence 0.9`.
 
-Infer passes + turnovers from tracking, build a collaboration graph, render highlights.
+## Demo 2 — Pass Network
 
-```bash
-# from world_cup_projects/
-PYTHONPATH=. python -m player_stats.pass_network_run \
-    --video bundesliga_videos/08fd33_0.mp4 --metric --render --show-predictions
-```
+Full-clip pass and turnover inference, collaboration graph, optional alternative freezes
+on release frames (`--show-predictions`). Output JSON lists `passes[]`, `turnovers[]`,
+and per-link counts in `collaboration_links`.
 
 | Flag | Effect |
 |------|--------|
 | `--render` | MP4 with pass arrows, collaboration web, turnover banner |
-| `--show-predictions` | Also insert pass-alternative freeze frames (§A) |
+| `--show-predictions` | Insert pass-alternative freeze frames on scored release frames (§A) |
+| `--freeze-quality-threshold` | Minimum `quality_score` for a freeze (default 0.0) |
 | `--debug-carrier` | HUD: active carrier, release anchor, arrival streak |
 
-Rules: **§B** (passes) and **§C** (turnovers). Output JSON lists `passes[]` and
-`turnovers[]` plus per-link counts in `collaboration_links`.
+Rules: **§B** (passes) and **§C** (turnovers).
 
-## Demo 3 - Player Speed & Distance
+## Demo 3 — Player Speed & Distance
 
-1. Track every player (GT in v1, RF-DETR + `ByteTrackTracker` in v2); accumulate the
-   `BOTTOM_CENTER` feet position per frame.
+1. Track every player (GT in v1, RF-DETR + `ByteTrackTracker` in v2); accumulate feet
+   position per frame.
 2. Convert pixel motion to meters:
-   - **height** (default, no weights): each player's bbox height (~1.8 m) gives a local
-     meters-per-pixel scale that adapts to perspective.
-   - **homography**: per-frame `ViewTransformer` from the pitch-keypoint model maps feet to
-     true pitch meters (camera-angle independent).
-3. **Speed (baseline):** one step `‖H_j(f_j)−H_{j−1}(f_{j−1})‖/Δt`, drop steps >12.5 m/s.
-   Optional upgrades (enable one at a time, compare renders):
-   `--speed-upgrade-multi-lag --speed-k-frames 15`,
-   `--speed-upgrade-adaptive-filter`,
-   `--speed-upgrade-feet-smooth`,
-   `--speed-display-smooth 7`.
+   - **height** (default, no weights): bbox height (~1.8 m) gives a local meters-per-pixel
+     scale.
+   - **homography**: per-frame `ViewTransformer` maps feet to true pitch meters.
+3. **Speed:** step distance / Δt, drop steps > 12.5 m/s. Optional upgrades:
+   `--speed-upgrade-multi-lag`, `--speed-upgrade-adaptive-filter`,
+   `--speed-upgrade-feet-smooth`, `--speed-display-smooth`.
+4. Render km/h labels, end-card leaderboard, and radar minimap in homography mode.
 
-**Radar / speed H:** per-frame confidence-filtered keypoints, orientation locked after
-the first good fit; updates gated by reprojection (no cross-frame point stacking).
-Goal defending teams are voted during warmup then fixed for the clip.
-4. Render per-player km/h labels (team-colored), an end-card leaderboard (top distance + top
-   sprint), and a top-down **radar** minimap in homography mode.
+Radar uses the sports-style per-frame H and goal-defender lock described above.
 
 ## Weights
 
@@ -447,17 +376,72 @@ Goal defending teams are voted during warmup then fixed for the clip.
   (e.g. `bundesliga_videos/08fd33_0.mp4`) which have **no SoccerNet-style GT tracks**.
   `common.detect.ensure_football_players_model()` downloads from Google Drive into
   `.cache/models/`.
-- **RF-DETR**: auto-downloads on first use. The cache dir defaults to `~/.roboflow`; set
+- **RF-DETR**: auto-downloads on first use. Cache dir defaults to `~/.roboflow`; set
   `RF_HOME=world_cup_projects/weights/rfdetr` to keep it in-repo. Force `device="cpu"` on
   pre-macOS-14 machines (MPS otherwise errors).
-- **Pitch keypoint model** (`football-pitch-detection.pt`, ~140 MB, from `roboflow/sports`):
-  trained on [DFL Bundesliga Data Shootout](https://www.kaggle.com/competitions/dfl-bundesliga-data-shootout)
-  frames ([`football-field-detection-f07vi`](https://universe.roboflow.com/roboflow-jvuqo/football-field-detection-f07vi)),
-  not SoccerNet SNMOT clips — expect domain gap on some game-state camera angles.
-  `common.pitch.ensure_pitch_model()` downloads it from Google Drive into
-  `.cache/models/`. Some sandboxed/CI networks block Google Drive (HTTP 403) - if so, fetch
-  it on an open network or drop the `.pt` in `.cache/models/`. When absent, the speed demo
-  **falls back to height calibration automatically**.
+- **Pitch keypoint model** — Roboflow Inference
+  [`football-field-detection-f07vi/15`](https://universe.roboflow.com/roboflow-jvuqo/football-field-detection-f07vi/model/15)
+  (trained on [DFL Bundesliga](https://www.kaggle.com/competitions/dfl-bundesliga-data-shootout)
+  frames). Set `ROBOFLOW_API_KEY`; weights cache automatically on first run. Use
+  `bundesliga_videos/` for metric demos, not SoccerNet SNMOT.
+
+## Rendered outputs (in `assets/`, gitignored)
+
+| File | Demo | Source / calibration |
+|------|------|----------------------|
+| `pass_network_football_metric_08fd33_0.mp4` | Pass network + radar (hero) | DFL detector + pitch H |
+| `pass_alternatives_football_metric_08fd33_0.mp4` | Top-3 passing lanes, metric | DFL detector + pitch H |
+| `pass_alternatives_gt_SNMOT-194.mp4` | Top-3 passing lanes, pixel space | SoccerNet GT (v1, no weights) |
+
+Each MP4 ships a matching `.json` manifest (freeze events / leaderboard) and is
+re-encoded to h264 (`ffmpeg -c:v libx264 -crf 23 -pix_fmt yuv420p`) for broad playback.
+
+There is also a walkthrough notebook: [`world_cup_demos.ipynb`](world_cup_demos.ipynb).
+
+---
+
+## Commands
+
+**Setup** (monorepo or standalone):
+
+```bash
+pip install -r world_cup_projects/requirements.txt
+pip install -e trackers   # monorepo only
+pip install -e ".[full]"  # standalone: cd world_cup_projects first
+
+export ROBOFLOW_API_KEY=your_key   # pitch keypoints (Inference f07vi/15)
+```
+
+v2 extras: `rfdetr`, `ultralytics`, `gdown`, `inference` (included in `[full]`).
+
+**Monorepo — v2 demos on Bundesliga** (`PYTHONPATH=.` from repo root):
+
+```bash
+# Pass network (primary demo) — inferred passes + turnovers + radar
+PYTHONPATH=. python -m world_cup_projects.player_stats.pass_network_run \
+    --video world_cup_projects/bundesliga_videos/08fd33_0.mp4 \
+    --metric --render --show-predictions
+
+# Pass alternatives — freeze frames + top-3 lanes
+PYTHONPATH=. python -m world_cup_projects.pass_alternatives.run \
+    --video world_cup_projects/bundesliga_videos/08fd33_0.mp4 --metric
+
+# Homography debug: pitch keypoints + feet warp check
+PYTHONPATH=. python -m world_cup_projects.pass_alternatives.run \
+    --video world_cup_projects/bundesliga_videos/08fd33_0.mp4 --metric --debug-pitch-keypoints
+```
+
+**SoccerNet v1 (optional, needs `SOCCERNET_TRACKING_ROOT`):**
+
+```bash
+export SOCCERNET_TRACKING_ROOT=/path/to/soccernet/tracking
+
+# GT tracks, pixel-space pass alternatives (no detector weights)
+PYTHONPATH=. python -m world_cup_projects.pass_alternatives.run --sequence SNMOT-194
+
+# Rank SoccerNet clips (legacy auto-pick)
+PYTHONPATH=. python -m world_cup_projects.pass_alternatives.run --rank-only
+```
 
 ## Credits
 

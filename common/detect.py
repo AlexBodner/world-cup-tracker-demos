@@ -28,7 +28,11 @@ from world_cup_projects.common.soccernet import (
     TEAM_NONE,
     SoccerNetSequence,
 )
-from world_cup_projects.common.teams import JerseyColorTeamClassifier, get_crops
+from world_cup_projects.common.teams import (
+    JerseyColorTeamClassifier,
+    TrackletTeamStabilizer,
+    get_crops,
+)
 from world_cup_projects.common.video import read_sequence_frame
 
 # Class ids in football-players-detection / roboflow/sports football-player-detection.pt
@@ -313,6 +317,7 @@ def iter_football_detections(
     )
     needs_frame = tracker == "botsort"
     last = sequence.length if end is None else min(end, sequence.length)
+    team_stabilizer = TrackletTeamStabilizer()
 
     for frame_idx in range(start, last + 1):
         image = read_sequence_frame(sequence, frame_idx)
@@ -396,7 +401,7 @@ def iter_football_detections(
         merged = parts[0]
         for p in parts[1:]:
             merged = sv.Detections.merge([merged, p])
-        yield frame_idx, merged
+        yield frame_idx, team_stabilizer.apply(merged)
 
 
 def iter_football_model_detections(
