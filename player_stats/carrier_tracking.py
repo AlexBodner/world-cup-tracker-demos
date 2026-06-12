@@ -47,6 +47,7 @@ class CarrierTrackingConfig:
     max_pass_gap_frames: int = 75
     min_arrival_frames: int = 3
     min_reception_arrival_frames: int = 2
+    min_arrival_control_frames: int = 1
     min_control_frames: int = 3
     min_gk_control_frames: int = 1
     pre_flight_release_window: int = 10
@@ -74,6 +75,7 @@ class CarrierFrameState:
     in_flight: bool = False
     arrival_candidate_tid: int | None = None
     arrival_streak: int = 0
+    control_streak: int = 0
     nearest_teammate_tid: int | None = None
     pass_emitted: bool = False
     pass_from_tid: int | None = None
@@ -256,6 +258,7 @@ def build_carrier_timeline(
         debug_in_flight = False
         debug_arrival_candidate: int | None = None
         debug_arrival_streak = 0
+        debug_control_streak = 0
 
         carrier, touch_kind = _active_carrier_kind(
             dets, transformer=transformer, config=config
@@ -276,18 +279,8 @@ def build_carrier_timeline(
                         and frame_idx - state.last_touch[0]
                         <= config.pre_flight_release_window
                     ):
-                        _, touch_dets, touch_carrier, _ = state.last_touch
-                        touch_cfg = _touch_validation_config(config)
-                        if not is_aerial_touch(
-                            touch_dets,
-                            touch_carrier,
-                            threshold_px=touch_cfg.aerial_dy_threshold_px,
-                        ) and not is_aerial_flyby_below_feet(
-                            touch_dets,
-                            touch_carrier,
-                            threshold_px=touch_cfg.aerial_dy_threshold_px * 2.0,
-                        ):
-                            state.release = state.last_touch
+                        # last_touch was recorded on a valid frame; no re-check needed.
+                        state.release = state.last_touch
                     state.in_flight = True
                     state.arrival_candidate_tid = -1
                     state.arrival_streak = 0
@@ -370,11 +363,17 @@ def build_carrier_timeline(
                         )
                         arrival_ready = state.arrival_streak >= min_arrival
                         adjacent = gap_frames < config.adjacent_pass_max_gap_frames
-                        if arrival_ready and adjacent:
-                            arrival_ready = (
-                                state.arrival_control_streak
-                                >= config.min_control_frames
-                            )
+                        if arrival_ready:
+                            if adjacent:
+                                arrival_ready = (
+                                    state.arrival_control_streak
+                                    >= config.min_control_frames
+                                )
+                            else:
+                                arrival_ready = (
+                                    state.arrival_control_streak
+                                    >= config.min_arrival_control_frames
+                                )
                         if arrival_ready:
                             gap = frame_idx - release_frame
                             if (
@@ -397,6 +396,7 @@ def build_carrier_timeline(
                     else None
                 )
                 debug_arrival_streak = state.arrival_streak
+                debug_control_streak = state.control_streak
 
         anchor_tid = debug_anchor_tid
         anchor_team = debug_team
@@ -426,6 +426,7 @@ def build_carrier_timeline(
                 in_flight=in_flight,
                 arrival_candidate_tid=arrival_candidate_tid,
                 arrival_streak=arrival_streak,
+                control_streak=debug_control_streak,
                 nearest_teammate_tid=(
                     nearest_teammate[0] if nearest_teammate else None
                 ),

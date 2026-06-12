@@ -9,6 +9,7 @@ import supervision as sv
 from world_cup_projects.common.pitch import image_to_pitch_m, warmup_goal_defenders
 from world_cup_projects.common.possession import (
     bbox_center_xy,
+    carrier_from_tracker_id,
     feet_xy,
     find_control_carrier,
 )
@@ -210,6 +211,8 @@ def _draw_pass_highlights(
     frame_rate: float,
     frame_keypoints: dict | None = None,
     frame_transforms: dict | None = None,
+    *,
+    draw_player_halos: bool = True,
 ) -> None:
     """Highlight active passes: pulse passer/receiver and draw the lane arrow."""
     from world_cup_projects.common.possession import ball_xy
@@ -230,11 +233,11 @@ def _draw_pass_highlights(
                 t = (frame_idx - p.frame_idx) / p.gap_frames if p.gap_frames > 0 else 1.0
                 pulse_alpha = 0.5 + 0.3 * np.sin(t * np.pi * 4) # fast pulse
                 
-                if passer_box is not None:
-                    _draw_ground_highlight(image, passer_box, color, alpha=pulse_alpha)
-                
-                if receiver_box is not None:
-                    _draw_ground_highlight(image, receiver_box, color, alpha=pulse_alpha)
+                if draw_player_halos:
+                    if passer_box is not None:
+                        _draw_ground_highlight(image, passer_box, color, alpha=pulse_alpha)
+                    if receiver_box is not None:
+                        _draw_ground_highlight(image, receiver_box, color, alpha=pulse_alpha)
 
                 # Smooth the arrow by fixing the origin if possible
                 if passer_box is not None and receiver_box is not None:
@@ -279,25 +282,25 @@ def _draw_pass_highlights(
                         # Lower alpha to make it less invasive (0.35 instead of 0.8)
                         draw_glow_arrow(image, damped_origin, current_tip, color, alpha=0.35)
 
-            elif frame_idx <= end_idx:
+            elif frame_idx <= end_idx and draw_player_halos:
                 # 2. Reception Phase: Twinkle 2 times, arrow removed
                 if receiver_box is not None:
                     # Twinkle logic: 2 cycles over twinkle_duration
                     prog = (frame_idx - receive_idx) / twinkle_duration
                     # 2 cycles of sine wave (0 to pi to 0 twice)
-                    twinkle_val = np.sin(prog * 2 * 2 * np.pi) 
+                    twinkle_val = np.sin(prog * 2 * 2 * np.pi)
                     # Map -1..1 to 0..1 for twinkle intensity
                     twinkle_alpha = max(0.0, twinkle_val)
-                    
+
                     # Also scale the ellipse slightly for the "twinkle" pop
                     twinkle_scale = 1.0 + 0.4 * twinkle_alpha
-                    
+
                     _draw_ground_highlight(
-                        image, 
-                        receiver_box, 
-                        color, 
-                        alpha=twinkle_alpha * 0.9, 
-                        scale=twinkle_scale
+                        image,
+                        receiver_box,
+                        color,
+                        alpha=twinkle_alpha * 0.9,
+                        scale=twinkle_scale,
                     )
 
 
@@ -718,7 +721,7 @@ def render_pass_network_demo(
             and qs >= freeze_quality_threshold
         ):
             event = events_by_frame[frame_idx]
-            carrier = find_control_carrier(dets, transformer=radar_transformer)
+            carrier = carrier_from_tracker_id(dets, event.passer_tid)
             if carrier is not None:
                 options = scorer.top_options(frame_idx, dets, carrier, k=3)
                 

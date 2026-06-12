@@ -52,6 +52,23 @@ _MODEL_DIR = Path(__file__).resolve().parent.parent / ".cache" / "models"
 _FOOTBALL_PLAYERS_MODEL_PATH = _MODEL_DIR / "football-player-detection.pt"
 _FOOTBALL_PLAYERS_MODEL_GDRIVE_ID = "17PXFNlx-jI7VjVo_vQnB1sONjRyvoB-q"
 DEFAULT_FOOTBALL_PLAYERS_MODEL_ID = "football-players-detection-3zvbc/11"
+FOOTBALL_PLAYERS_INFERENCE_V11 = "football-players-detection-3zvbc/11"
+FOOTBALL_PLAYERS_INFERENCE_V20 = "football-players-detection-3zvbc/20"
+FOOTBALL_PLAYERS_INFERENCE_RFDETR = "football-players-detection-3zvbc/18"
+DEFAULT_BALL_DETECTION_THRESHOLD = 0.20
+DEFAULT_FOOTBALL_BALL_MODEL_ID = "football-ball-detection-rejhg/1"
+KNOWN_FOOTBALL_PLAYER_MODELS = (
+    FOOTBALL_PLAYERS_INFERENCE_V11,
+    FOOTBALL_PLAYERS_INFERENCE_V20,
+    FOOTBALL_PLAYERS_INFERENCE_RFDETR,
+)
+
+_FP_CLASS_NAME_TO_ROLE = {
+    "ball": ROLE_BALL,
+    "goalkeeper": ROLE_GOALKEEPER,
+    "player": ROLE_PLAYER,
+    "referee": ROLE_REFEREE,
+}
 
 
 class RFDETRDetector:
@@ -231,6 +248,16 @@ def ensure_football_players_model() -> Path:
     return _FOOTBALL_PLAYERS_MODEL_PATH
 
 
+def ensure_football_players_inference(*, model_id: str = DEFAULT_FOOTBALL_PLAYERS_MODEL_ID) -> None:
+    """Verify ``ROBOFLOW_API_KEY`` is set (Inference caches weights on first run)."""
+    import os
+
+    if not os.environ.get("ROBOFLOW_API_KEY"):
+        raise RuntimeError(
+            f"Set ROBOFLOW_API_KEY for player detection inference ({model_id})."
+        )
+
+
 def _map_fp_detections(det: sv.Detections) -> sv.Detections:
     if len(det) == 0:
         return det
@@ -241,6 +268,284 @@ def _map_fp_detections(det: sv.Detections) -> sv.Detections:
     return det
 
 
+def _apply_fp_class_thresholds(
+    det: sv.Detections,
+    *,
+    player_threshold: float,
+    ball_threshold: float,
+) -> sv.Detections:
+    """Filter multi-class football detections with a lower threshold for the small ball class."""
+    if len(det) == 0:
+        return det
+    keep = np.zeros(len(det), dtype=bool)
+    for role, thr in (
+        (ROLE_PLAYER, player_threshold),
+        (ROLE_GOALKEEPER, player_threshold),
+        (ROLE_REFEREE, player_threshold),
+        (ROLE_BALL, ball_threshold),
+    ):
+        keep |= (det.class_id == role) & (
+            det.confidence >= thr if det.confidence is not None else True
+        )
+    return det[keep]
+
+
+def _best_ball_detection(balls: sv.Detections) -> sv.Detections:
+    """Keep the highest-confidence ball box when the model returns duplicates."""
+    if len(balls) <= 1:
+        return balls
+    if balls.confidence is None:
+        return balls[:1]
+    return balls[int(np.argmax(balls.confidence)) : int(np.argmax(balls.confidence)) + 1]
+
+
+def _merge_ball_detections(primary: sv.Detections, secondary: sv.Detections) -> sv.Detections:
+    """Prefer the higher-confidence ball between two detectors."""
+    if len(primary) == 0:
+        return _best_ball_detection(secondary)
+    if len(secondary) == 0:
+        return _best_ball_detection(primary)
+    p = _best_ball_detection(primary)
+    s = _best_ball_detection(secondary)
+    if p.confidence is not None and s.confidence is not None:
+        return p if float(p.confidence[0]) >= float(s.confidence[0]) else s
+    return p if len(primary) else s
+
+
+def _map_inference_fp_detections(inference_result, *, confidence: float) -> sv.Detections:
+    """Convert Roboflow Inference object-detection output to role-tagged detections."""
+    if hasattr(inference_result, "model_dump"):
+        payload = inference_result.model_dump(by_alias=True, exclude_none=True)
+    elif hasattr(inference_result, "dict"):
+        payload = inference_result.dict(exclude_none=True, by_alias=True)
+    else:
+        payload = inference_result
+
+    predictions = payload.get("predictions") or []
+    if not predictions:
+        return sv.Detections.empty()
+
+    xyxy_list: list[list[float]] = []
+    class_ids: list[int] = []
+    confidences: list[float] = []
+
+    for pred in predictions:
+        conf = float(pred.get("confidence", 0.0))
+        if conf < confidence:
+            continue
+        w = float(pred["width"])
+        h = float(pred["height"])
+        cx = float(pred["x"])
+        cy = float(pred["y"])
+        x1, y1 = cx - w / 2, cy - h / 2
+        x2, y2 = cx + w / 2, cy + h / 2
+
+        role = -1
+        if "class_id" in pred:
+            role = _FP_TO_ROLE.get(int(pred["class_id"]), -1)
+        if role < 0:
+            name = str(pred.get("class", "")).strip().lower()
+            role = _FP_CLASS_NAME_TO_ROLE.get(name, -1)
+        if role < 0:
+            continue
+
+        xyxy_list.append([x1, y1, x2, y2])
+        class_ids.append(role)
+        confidences.append(conf)
+
+    if not xyxy_list:
+        return sv.Detections.empty()
+
+    return sv.Detections(
+        xyxy=np.asarray(xyxy_list, dtype=np.float32),
+        class_id=np.asarray(class_ids, dtype=int),
+        confidence=np.asarray(confidences, dtype=np.float32),
+    )
+
+
+class FootballPlayersInferenceDetector:
+    """football-players-detection via Roboflow Inference (same API as pitch keypoints)."""
+
+    def __init__(
+        self,
+        *,
+        model_id: str = DEFAULT_FOOTBALL_PLAYERS_MODEL_ID,
+        api_key: str | None = None,
+        threshold: float = 0.5,
+        ball_threshold: float = DEFAULT_BALL_DETECTION_THRESHOLD,
+        device: str = "cpu",
+    ) -> None:
+        import os
+
+        from inference import get_model
+
+        ensure_football_players_inference(model_id=model_id)
+        key = api_key or os.environ.get("ROBOFLOW_API_KEY")
+        self.model_id = model_id
+        self.model = get_model(model_id=model_id, api_key=key)
+        self.threshold = threshold
+        self.ball_threshold = ball_threshold
+        self.device = device  # unused; kept for call-site parity with YOLO path
+
+    def detect(self, frame_bgr: np.ndarray) -> sv.Detections:
+        min_conf = min(self.threshold, self.ball_threshold, 0.05)
+        result = self.model.infer(frame_bgr, confidence=min_conf)[0]
+        det = _map_inference_fp_detections(result, confidence=min_conf)
+        return _apply_fp_class_thresholds(
+            det,
+            player_threshold=self.threshold,
+            ball_threshold=self.ball_threshold,
+        )
+
+
+class FootballBallInferenceDetector:
+    """Dedicated ball-only model (Roboflow football-ball-detection)."""
+
+    def __init__(
+        self,
+        *,
+        model_id: str = DEFAULT_FOOTBALL_BALL_MODEL_ID,
+        api_key: str | None = None,
+        threshold: float = DEFAULT_BALL_DETECTION_THRESHOLD,
+    ) -> None:
+        import os
+
+        from inference import get_model
+
+        ensure_football_players_inference(model_id=model_id)
+        key = api_key or os.environ.get("ROBOFLOW_API_KEY")
+        self.model_id = model_id
+        self.model = get_model(model_id=model_id, api_key=key)
+        self.threshold = threshold
+
+    def detect(self, frame_bgr: np.ndarray) -> sv.Detections:
+        min_conf = min(self.threshold, 0.05)
+        result = self.model.infer(frame_bgr, confidence=min_conf)[0]
+        if hasattr(result, "model_dump"):
+            payload = result.model_dump(by_alias=True, exclude_none=True)
+        elif hasattr(result, "dict"):
+            payload = result.dict(exclude_none=True, by_alias=True)
+        else:
+            payload = result
+
+        predictions = payload.get("predictions") or []
+        xyxy_list: list[list[float]] = []
+        confidences: list[float] = []
+        for pred in predictions:
+            conf = float(pred.get("confidence", 0.0))
+            if conf < self.threshold:
+                continue
+            w = float(pred["width"])
+            h = float(pred["height"])
+            cx = float(pred["x"])
+            cy = float(pred["y"])
+            xyxy_list.append([cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2])
+            confidences.append(conf)
+
+        if not xyxy_list:
+            return sv.Detections.empty()
+
+        return sv.Detections(
+            xyxy=np.asarray(xyxy_list, dtype=np.float32),
+            class_id=np.full(len(xyxy_list), ROLE_BALL, dtype=int),
+            confidence=np.asarray(confidences, dtype=np.float32),
+        )
+
+
+def create_football_players_detector(
+    *,
+    backend: str = "yolo",
+    model_id: str = DEFAULT_FOOTBALL_PLAYERS_MODEL_ID,
+    model_path: str | Path | None = None,
+    device: str = "cpu",
+    threshold: float = 0.5,
+    ball_threshold: float = DEFAULT_BALL_DETECTION_THRESHOLD,
+    api_key: str | None = None,
+) -> FootballPlayersDetector | FootballPlayersInferenceDetector:
+    """Build YOLO (local .pt) or Inference (Universe model id) football player detector."""
+    if backend == "inference":
+        return FootballPlayersInferenceDetector(
+            model_id=model_id,
+            api_key=api_key,
+            threshold=threshold,
+            ball_threshold=ball_threshold,
+            device=device,
+        )
+    if backend == "yolo":
+        return FootballPlayersDetector(
+            model_path=model_path,
+            device=device,
+            threshold=threshold,
+            ball_threshold=ball_threshold,
+        )
+    raise ValueError(f"Unknown detector backend: {backend!r} (use 'yolo' or 'inference')")
+
+
+def create_football_ball_detector(
+    *,
+    backend: str = "inference",
+    model_id: str = DEFAULT_FOOTBALL_BALL_MODEL_ID,
+    threshold: float = DEFAULT_BALL_DETECTION_THRESHOLD,
+    api_key: str | None = None,
+) -> FootballBallInferenceDetector | None:
+    if backend in (None, "", "none", "off"):
+        return None
+    if backend == "inference":
+        return FootballBallInferenceDetector(
+            model_id=model_id,
+            api_key=api_key,
+            threshold=threshold,
+        )
+    raise ValueError(f"Unknown ball detector backend: {backend!r} (use 'inference' or 'none')")
+
+
+def wrap_football_detections_cache(args, *, refresh: bool | None = None):
+    """Cached football detections with backend + model id in the cache key."""
+    from world_cup_projects.common.detection_cache import wrap_detections_cache
+
+    backend = getattr(args, "detector_backend", "yolo")
+    model_id = getattr(args, "player_model_id", DEFAULT_FOOTBALL_PLAYERS_MODEL_ID)
+    # YOLO keeps legacy ``football`` cache keys; Inference gets its own namespace + model id.
+    source_name = "football" if backend == "yolo" else f"football_{backend}"
+    cache_params: dict = {
+        "device": getattr(args, "device", "cpu"),
+        "threshold": getattr(args, "detection_threshold", 0.5),
+        "tracker": getattr(args, "tracker", "botsort"),
+    }
+    if not getattr(args, "legacy_detections_cache", False):
+        cache_params["ball_threshold"] = getattr(
+            args, "ball_threshold", DEFAULT_BALL_DETECTION_THRESHOLD
+        )
+    ball_backend = getattr(args, "ball_detector_backend", None)
+    if (
+        not getattr(args, "legacy_detections_cache", False)
+        and ball_backend
+        and ball_backend not in ("none", "off", "")
+    ):
+        cache_params["ball_backend"] = ball_backend
+        cache_params["ball_model_id"] = getattr(
+            args, "ball_model_id", DEFAULT_FOOTBALL_BALL_MODEL_ID
+        )
+    if backend == "inference":
+        cache_params["backend"] = backend
+        cache_params["model_ver"] = model_id.rsplit("/", 1)[-1]
+
+    def _iter_football_cached(sequence, **kwargs):
+        params = dict(kwargs)
+        params.pop("model_ver", None)
+        params["backend"] = backend
+        if backend == "inference":
+            params["model_id"] = model_id
+        return iter_football_model_detections(sequence, **params)
+
+    return wrap_detections_cache(
+        _iter_football_cached,
+        source_name=source_name,
+        refresh=refresh if refresh is not None else getattr(args, "refresh_detections_cache", False),
+        **cache_params,
+    )
+
+
 class FootballPlayersDetector:
     """YOLO weights from roboflow/sports (football-players-detection-3zvbc)."""
 
@@ -249,6 +554,7 @@ class FootballPlayersDetector:
         model_path: str | Path | None = None,
         device: str = "cpu",
         threshold: float = 0.5,
+        ball_threshold: float = DEFAULT_BALL_DETECTION_THRESHOLD,
     ) -> None:
         from ultralytics import YOLO
 
@@ -256,15 +562,22 @@ class FootballPlayersDetector:
         self.model = YOLO(str(path))
         self.device = device
         self.threshold = threshold
+        self.ball_threshold = ball_threshold
 
     def detect(self, frame_bgr: np.ndarray) -> sv.Detections:
+        min_conf = min(self.threshold, self.ball_threshold, 0.05)
         results = self.model.predict(
             frame_bgr,
-            conf=self.threshold,
+            conf=min_conf,
             verbose=False,
             device=self.device,
         )[0]
-        return _map_fp_detections(sv.Detections.from_ultralytics(results))
+        det = _map_fp_detections(sv.Detections.from_ultralytics(results))
+        return _apply_fp_class_thresholds(
+            det,
+            player_threshold=self.threshold,
+            ball_threshold=self.ball_threshold,
+        )
 
 
 def fit_football_team_classifier(
@@ -301,13 +614,14 @@ def _empty_detections_data(n: int) -> dict:
 
 def iter_football_detections(
     sequence: SoccerNetSequence,
-    detector: FootballPlayersDetector,
+    detector: FootballPlayersDetector | FootballPlayersInferenceDetector,
     team_classifier: JerseyColorTeamClassifier,
     *,
     start: int = 1,
     end: int | None = None,
     track_activation_threshold: float = 0.4,
     tracker: TrackerKind = "bytetrack",
+    ball_detector: FootballBallInferenceDetector | None = None,
 ) -> Iterator[tuple[int, sv.Detections]]:
     """Detect + track with football-players-detection; refs excluded from teams."""
     player_tracker = create_player_tracker(
@@ -327,6 +641,10 @@ def iter_football_detections(
 
         det = detector.detect(image)
         balls = det[det.class_id == ROLE_BALL]
+        if ball_detector is not None:
+            extra_balls = ball_detector.detect(image)
+            balls = _merge_ball_detections(balls, extra_balls)
+        balls = _best_ball_detection(balls)
         players = det[det.class_id == ROLE_PLAYER]
         gks = det[det.class_id == ROLE_GOALKEEPER]
         refs = det[det.class_id == ROLE_REFEREE]
@@ -387,7 +705,7 @@ def iter_football_detections(
         if len(balls):
             parts.append(
                 sv.Detections(
-                    xyxy=balls.xyxy[:1].astype(np.float32),
+                    xyxy=balls.xyxy.astype(np.float32),
                     tracker_id=np.array([-1], dtype=int),
                     class_id=np.array([ROLE_BALL], dtype=int),
                     data=_empty_detections_data(1),
@@ -411,12 +729,29 @@ def iter_football_model_detections(
     end: int | None = None,
     device: str = "cpu",
     threshold: float = 0.5,
+    ball_threshold: float = DEFAULT_BALL_DETECTION_THRESHOLD,
     sample_stride: int = 30,
     model_path: str | Path | None = None,
+    model_id: str = DEFAULT_FOOTBALL_PLAYERS_MODEL_ID,
+    backend: str = "yolo",
     tracker: TrackerKind = "bytetrack",
+    ball_backend: str | None = None,
+    ball_model_id: str = DEFAULT_FOOTBALL_BALL_MODEL_ID,
 ) -> Iterator[tuple[int, sv.Detections]]:
-    """Convenience wrapper: football-players YOLO + jersey team classifier."""
-    detector = FootballPlayersDetector(model_path=model_path, device=device, threshold=threshold)
+    """Convenience wrapper: football-players detect + track + jersey teams."""
+    detector = create_football_players_detector(
+        backend=backend,
+        model_id=model_id,
+        model_path=model_path,
+        device=device,
+        threshold=threshold,
+        ball_threshold=ball_threshold,
+    )
+    ball_detector = create_football_ball_detector(
+        backend=ball_backend or "none",
+        model_id=ball_model_id,
+        threshold=ball_threshold,
+    )
     team_classifier = fit_football_team_classifier(
         sequence, detector, sample_stride=sample_stride, max_frames=end or sequence.length
     )
@@ -427,4 +762,5 @@ def iter_football_model_detections(
         start=start,
         end=end,
         tracker=tracker,
+        ball_detector=ball_detector,
     )

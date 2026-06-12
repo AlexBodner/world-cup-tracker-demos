@@ -58,6 +58,22 @@ def team_class_ids(teams: np.ndarray) -> np.ndarray:
     return np.where(np.isin(teams, (0, 1)), teams, 2).astype(int)
 
 
+def cv2_safe_text(text: str) -> str:
+    """OpenCV Hershey fonts only render ASCII; map common Unicode punctuation."""
+    for src, dst in (
+        ("\u00b7", " "),  # middle dot
+        ("\u2192", "->"),  # right arrow
+        ("\u2014", "-"),  # em dash
+        ("\u2013", "-"),  # en dash
+        ("\u2026", "..."),  # ellipsis
+        ("\u00d7", "x"),  # multiplication sign
+        ("\u2264", "<="),  # less-than or equal
+        ("\u2265", ">="),  # greater-than or equal
+    ):
+        text = text.replace(src, dst)
+    return text.encode("ascii", "replace").decode("ascii")
+
+
 def draw_text_shadow(
     frame: np.ndarray,
     text: str,
@@ -68,6 +84,7 @@ def draw_text_shadow(
     thickness: int = 2,
     shadow_offset: tuple[int, int] = (2, 2),
 ) -> None:
+    text = cv2_safe_text(text)
     x, y = org
     sx, sy = shadow_offset
     cv2.putText(
@@ -765,10 +782,15 @@ def draw_glow_arrow(
     if alpha <= 0.01:
         return
     layer = frame.copy()
+    slim = thickness <= 3
+    shadow = thickness + (2 if slim else 3)
+    tip_len = 0.035 if slim else 0.05
     cv2.arrowedLine(
-        layer, start, end, (20, 20, 20), thickness + 3, cv2.LINE_AA, tipLength=0.05
+        layer, start, end, (20, 20, 20), shadow, cv2.LINE_AA, tipLength=tip_len
     )
-    cv2.arrowedLine(layer, start, end, color_bgr, thickness, cv2.LINE_AA, tipLength=0.05)
+    cv2.arrowedLine(
+        layer, start, end, color_bgr, thickness, cv2.LINE_AA, tipLength=tip_len
+    )
     if alpha >= 0.99:
         frame[:] = layer
     else:

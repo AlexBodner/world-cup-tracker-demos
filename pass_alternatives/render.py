@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Literal
 
 import cv2
@@ -26,15 +27,17 @@ from world_cup_projects.common.pitch import (
     image_to_pitch_cm,
     image_to_pitch_m,
     iter_pitch_transformers,
+    load_pitch_homography_cache,
     pitch_attack_direction,
     render_radar_simple,
     warmup_goal_defenders,
 )
 from world_cup_projects.pass_alternatives.lane_visual import (
-    draw_blocking_rivals_on_frame,
-    draw_pass_corridors_on_frame,
+    apply_pass_lane_geometry,
     draw_pass_lane_legend,
     draw_pass_lanes_on_radar,
+    draw_receiver_highlight,
+    pass_line_label_xy,
 )
 from world_cup_projects.pass_alternatives.pass_options import PassWeights, top_pass_options
 from world_cup_projects.common.possession import (
@@ -45,15 +48,16 @@ from world_cup_projects.common.possession import (
     find_control_carrier,
     player_mask,
 )
-from world_cup_projects.common.possession_config import (
-    CONTROL_MAX_DISTANCE_M,
-    CONTROL_MAX_DISTANCE_PX,
-)
 from world_cup_projects.common.soccernet import (
     SoccerNetSequence,
     iter_gt_detections,
 )
-from world_cup_projects.common.video import read_sequence_frame
+from world_cup_projects.common.video import (
+    H264StreamWriter,
+    SequentialVideoReader,
+    finalize_video_for_playback,
+    read_sequence_frame,
+)
 from world_cup_projects.common.visual import (
     ROBOFLOW_PURPLE_BGR,
     annotate_ball,
@@ -242,6 +246,21 @@ def _load_pitch_maps(
     PitchHomographyTracker | None,
 ]:
     """One model pass per frame when transforms and/or debug keypoints are needed."""
+    clip_end = max_frames if max_frames is not None else sequence.length
+    cached = load_pitch_homography_cache(
+        sequence.name,
+        end=clip_end,
+        pitch_confidence=pitch_confidence,
+        device=pitch_device,
+    )
+    if cached is not None:
+        transforms = cached.transforms if need_transforms else {}
+        radar_transforms = cached.radar_transforms
+        keypoints = (
+            cached.keypoints if (need_keypoints or need_transforms) else None
+        )
+        return transforms, keypoints, radar_transforms, None
+
     transforms: dict[int, ViewTransformer | None] = {}
     radar_transforms: dict[int, ViewTransformer | None] = {}
     keypoints: dict[int, sv.KeyPoints | None] | None = (
@@ -313,6 +332,72 @@ def _freeze_moment_score(
     return score
 
 
+def _resolve_freeze_frame_earlier(
+    event: PassEvent,
+    by_frame: dict[int, PassEvent],
+    *,
+    weights: PassWeights,
+    metric: bool,
+    instant_speed_by_frame: dict[int, float],
+) -> PassEvent:
+    """Keep the pass moment but freeze earlier — before release or score peak."""
+    if not weights.freeze_nudge_earlier:
+        return event
+    slack = weights.freeze_nudge_score_slack
+    eps = weights.freeze_separation_eps_m if metric else weights.freeze_separation_eps_px
+    best = event
+
+    # Ball leaving feet: walk back while separating or ball just sped up.
+    while True:
+        prev = by_frame.get(best.frame_idx - 1)
+        if prev is None or prev.top_score < best.top_score - slack:
+            break
+        separating = best.carrier.distance > prev.carrier.distance + eps
+        instant = instant_speed_by_frame.get(best.frame_idx)
+        fast_ball = instant is not None and (
+            (metric and instant >= weights.freeze_release_ball_speed_skip_m)
+            or (not metric and instant >= weights.freeze_release_ball_speed_skip_px_s)
+        )
+        if not (separating or fast_ball):
+            break
+        best = prev
+
+    # Lane score peaked on this frame vs the previous — prefer one frame earlier
+    # (still in control) when the prior frame is nearly as good.
+    prev = by_frame.get(best.frame_idx - 1)
+    if (
+        prev is not None
+        and best.top_score > prev.top_score
+        and prev.top_score >= best.top_score - slack
+    ):
+        best = prev
+
+    return best
+
+
+def _apply_freeze_frame_nudges(
+    candidates: list[PassEvent],
+    *,
+    weights: PassWeights,
+    metric: bool,
+    instant_speed_by_frame: dict[int, float],
+) -> list[PassEvent]:
+    by_frame = {e.frame_idx: e for e in candidates}
+    resolved: dict[int, PassEvent] = {}
+    for event in candidates:
+        nudged = _resolve_freeze_frame_earlier(
+            event,
+            by_frame,
+            weights=weights,
+            metric=metric,
+            instant_speed_by_frame=instant_speed_by_frame,
+        )
+        prev = resolved.get(nudged.frame_idx)
+        if prev is None or nudged.top_score > prev.top_score:
+            resolved[nudged.frame_idx] = nudged
+    return sorted(resolved.values(), key=lambda e: e.frame_idx)
+
+
 def _select_pass_moments(
     candidates: list[PassEvent],
     *,
@@ -361,8 +446,8 @@ def plan_events(
     *,
     max_events: int | None = None,
     min_gap_frames: int = 90,
-    carrier_max_distance_px: float = CONTROL_MAX_DISTANCE_PX,
-    carrier_max_distance_m: float = CONTROL_MAX_DISTANCE_M,
+    carrier_max_distance_px: float | None = None,
+    carrier_max_distance_m: float | None = None,
     weights: PassWeights = PassWeights(),
     detections_source: DetectionSource = iter_gt_detections,
     max_frames: int | None = None,
@@ -377,10 +462,23 @@ def plan_events(
             sequence, max_frames=max_frames, pitch_device=pitch_device
         )
 
+    max_px = (
+        carrier_max_distance_px
+        if carrier_max_distance_px is not None
+        else weights.freeze_carrier_max_distance_px
+    )
+    max_m = (
+        carrier_max_distance_m
+        if carrier_max_distance_m is not None
+        else weights.freeze_carrier_max_distance_m
+    )
+    require_both = weights.freeze_require_both_spaces and metric
+
     history = TrackPositionHistory()
     ball_history = BallPositionHistory()
     fps = float(sequence.frame_rate)
     candidates: list[PassEvent] = []
+    instant_speed_by_frame: dict[int, float] = {}
     for frame_idx, dets in _iter_frames(
         sequence, detections_source, max_frames=max_frames
     ):
@@ -396,11 +494,14 @@ def plan_events(
 
         carrier = find_control_carrier(
             dets,
-            max_distance_px=carrier_max_distance_px,
+            max_distance_px=max_px,
             transformer=transformer,
-            max_distance_m=carrier_max_distance_m,
+            max_distance_m=max_m,
+            require_both_spaces=require_both and transformer is not None,
         )
         if carrier is None:
+            continue
+        if metric and frame_idx < 30:
             continue
         options = _score_options(
             dets,
@@ -429,8 +530,22 @@ def plan_events(
         )
         if pick_score is None:
             continue
+        instant = ball_history.speed(
+            frame_idx,
+            lookback_frames=1,
+            fps=fps,
+            transformer=transformer if metric else None,
+        )
+        if instant is not None:
+            instant_speed_by_frame[frame_idx] = instant
         candidates.append(PassEvent(frame_idx, carrier, options, pick_score))
 
+    candidates = _apply_freeze_frame_nudges(
+        candidates,
+        weights=weights,
+        metric=metric,
+        instant_speed_by_frame=instant_speed_by_frame,
+    )
     return _select_pass_moments(
         candidates,
         weights=weights,
@@ -525,26 +640,6 @@ def _options_with_lane_debug(
     )
 
 
-def _pass_line_label_xy(
-    start: tuple[int, int],
-    end: tuple[int, int],
-    *,
-    along: float = 0.42,
-    offset_px: int = 14,
-) -> tuple[int, int]:
-    """Point beside the pass segment for a distance label."""
-    sx, sy = start
-    ex, ey = end
-    px = sx + along * (ex - sx)
-    py = sy + along * (ey - sy)
-    dx, dy = ex - sx, ey - sy
-    norm = float(np.hypot(dx, dy)) or 1.0
-    return (
-        int(px - dy / norm * offset_px),
-        int(py + dx / norm * offset_px),
-    )
-
-
 def _slowdown_hold_count(
     frames_until_event: int,
     *,
@@ -606,8 +701,7 @@ def _draw_pass_overlay(
         visible = options[: max(0, revealed_options)]
 
     if show_lane_debug and transformer is not None and visible:
-        dim = draw_pass_corridors_on_frame(dim, visible, transformer)
-        dim = draw_blocking_rivals_on_frame(dim, visible, feet_xy=feet_img)
+        dim = apply_pass_lane_geometry(dim, visible, transformer, feet_img)
 
     dim = annotate_players(
         dim,
@@ -648,13 +742,8 @@ def _draw_pass_overlay(
         is_new = rank == len(visible) - 1
         alpha = ease_out_cubic(reveal_progress) if is_new else 1.0
         draw_glow_arrow(dim, (cx, cy), (rx, ry), color, thickness=5, alpha=alpha)
-        ring = 20 if rank == 0 else 14
         if alpha > 0.2:
-            layer = dim.copy()
-            cv2.circle(layer, (rx, ry), ring, color, 3 if rank == 0 else 2)
-            if rank == 0:
-                cv2.circle(layer, (rx, ry), ring + 6, (255, 255, 255), 1)
-            dim[:] = cv2.addWeighted(layer, alpha, dim, 1.0 - alpha, 0)
+            draw_receiver_highlight(dim, (rx, ry), rank, color, alpha=alpha)
         if alpha < 0.85:
             continue
         midx, midy = (cx + rx) // 2, (cy + ry) // 2
@@ -669,7 +758,7 @@ def _draw_pass_overlay(
             chip += f"  !{len(option.lane_debug.blocking_rival_indices)}"
         draw_score_chip(dim, chip, (midx, midy), bg_bgr=color)
         if metric:
-            lx, ly = _pass_line_label_xy((cx, cy), (rx, ry))
+            lx, ly = pass_line_label_xy((cx, cy), (rx, ry))
             draw_text_shadow(
                 dim,
                 f"{option.length:.1f} m",
@@ -746,8 +835,8 @@ def render_demo(
     pitch_device: str = "cpu",
     version_tag: str = "v1",
     frame_transforms: dict | None = None,
-    carrier_max_distance_px: float = CONTROL_MAX_DISTANCE_PX,
-    carrier_max_distance_m: float = CONTROL_MAX_DISTANCE_M,
+    carrier_max_distance_px: float | None = None,
+    carrier_max_distance_m: float | None = None,
     debug_pitch_keypoints: bool = False,
     pitch_confidence: float = 0.9,
     show_radar: bool | None = None,
@@ -776,8 +865,6 @@ def render_demo(
                 need_keypoints=debug_pitch_keypoints or metric,
             )
         )
-    if metric and transforms:
-        detections_source = _patch_goalkeeper_teams(detections_source, transforms)
     frame_list = list(_iter_frames(sequence, detections_source, max_frames=max_frames))
     locked_goals = warmup_goal_defenders(
         pitch_tracker,
@@ -786,6 +873,16 @@ def render_demo(
         keypoints_by_frame=frame_keypoints,
         confidence=pitch_confidence,
     )
+    if metric and frame_keypoints is not None:
+        from world_cup_projects.common.teams import stabilize_goalkeeper_teams
+
+        stabilize_goalkeeper_teams(
+            frame_list,
+            transforms=transforms,
+            locked_goal_defenders=locked_goals,
+            keypoints_by_frame=frame_keypoints,
+            pitch_confidence=pitch_confidence,
+        )
     events = plan_events(
         sequence,
         max_events=max_events,
@@ -804,10 +901,33 @@ def render_demo(
     ramp_frames = max(1, int(round(slowdown_ramp_seconds * sequence.frame_rate)))
     reveal_frames = max(4, int(round(option_reveal_seconds * sequence.frame_rate)))
 
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(
-        out_path, fourcc, sequence.frame_rate, (sequence.width, sequence.height)
-    )
+    video_reader: SequentialVideoReader | None = None
+    if getattr(sequence, "video_path", None) is not None:
+        video_reader = SequentialVideoReader(sequence.video_path)
+
+    def _load_frame_image(frame_idx: int) -> np.ndarray:
+        if video_reader is not None:
+            image = video_reader.read(frame_idx)
+        else:
+            image = read_sequence_frame(sequence, frame_idx)
+        if image is None:
+            image = np.full((sequence.height, sequence.width, 3), 30, np.uint8)
+        return image
+
+    use_h264_stream = True
+    try:
+        writer: H264StreamWriter | cv2.VideoWriter = H264StreamWriter(
+            out_path,
+            width=sequence.width,
+            height=sequence.height,
+            fps=sequence.frame_rate,
+        )
+    except RuntimeError:
+        use_h264_stream = False
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(
+            out_path, fourcc, sequence.frame_rate, (sequence.width, sequence.height)
+        )
     track_history = TrackPositionHistory()
     use_cached_kalman = False
     kalman_replay = None
@@ -825,9 +945,7 @@ def render_demo(
     for frame_idx, dets in _iter_frames(
         sequence, detections_source, max_frames=max_frames
     ):
-        image = read_sequence_frame(sequence, frame_idx)
-        if image is None:
-            image = np.full((sequence.height, sequence.width, 3), 30, np.uint8)
+        image = _load_frame_image(frame_idx)
         transformer = transforms.get(frame_idx) if transforms else None
         kps = frame_keypoints.get(frame_idx) if frame_keypoints is not None else None
         if pitch_tracker is not None and transformer is not None and locked_goals is None:
@@ -917,7 +1035,13 @@ def render_demo(
                     )
                     writer.write(overlay)
 
-    writer.release()
+    if use_h264_stream:
+        writer.close()
+    else:
+        writer.release()
+        finalize_video_for_playback(Path(out_path))
+    if video_reader is not None:
+        video_reader.close()
     return {
         "sequence": sequence.name,
         "output": out_path,

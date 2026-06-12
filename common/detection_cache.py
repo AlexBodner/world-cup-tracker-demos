@@ -179,6 +179,16 @@ def wrap_detections_cache(
 
         if not refresh:
             loaded = load_cached_detections(path)
+            if loaded is None and "ball_threshold" in key_params:
+                legacy_params = {
+                    k: v for k, v in key_params.items() if k != "ball_threshold"
+                }
+                legacy_path = cache_path(
+                    sequence, source_name, start=start, end=last, **legacy_params
+                )
+                loaded = load_cached_detections(legacy_path)
+                if loaded is not None:
+                    path = legacy_path
             if loaded is not None:
                 meta, frames = loaded
                 if (

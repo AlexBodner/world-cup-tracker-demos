@@ -12,8 +12,8 @@ CONTROL_MAX_DISTANCE_PX = 55.0
 CONTROL_MAX_DISTANCE_M = 0.8
 
 # Looser first-touch gate — pass detection only (control is tried first).
-RECEPTION_MAX_DISTANCE_PX = 120.0
-RECEPTION_MAX_DISTANCE_M = 1.8
+RECEPTION_MAX_DISTANCE_PX = 100.0
+RECEPTION_MAX_DISTANCE_M = 1.5
 
 # Vertical offset in image space above/below feet that vetoes ground possession.
 AERIAL_DY_THRESHOLD_PX = 20.0

@@ -29,10 +29,6 @@ from world_cup_projects.common.clips import (
     pitch_keypoints_unreliable,
     rank_clips,
 )
-from world_cup_projects.common.possession_config import (
-    CONTROL_MAX_DISTANCE_M,
-    CONTROL_MAX_DISTANCE_PX,
-)
 from world_cup_projects import DEFAULT_ASSETS_DIR
 from world_cup_projects.common.soccernet import (
     DEFAULT_TRACKING_ROOT,
@@ -77,14 +73,14 @@ def main() -> None:
     parser.add_argument(
         "--carrier-max-px",
         type=float,
-        default=CONTROL_MAX_DISTANCE_PX,
-        help="Ball-to-feet control limit in pixels when not using --metric (default 55).",
+        default=None,
+        help="Freeze in-control limit in pixels (default 55, same as pass detection).",
     )
     parser.add_argument(
         "--carrier-max-m",
         type=float,
-        default=CONTROL_MAX_DISTANCE_M,
-        help="Ball-to-feet control limit in meters on the pitch when using --metric (default 0.8).",
+        default=None,
+        help="Freeze in-control limit in meters with --metric (default 0.8, same as pass detection).",
     )
     parser.add_argument(
         "--rank-only",
@@ -118,6 +114,45 @@ def main() -> None:
         "--refresh-detections-cache",
         action="store_true",
         help="Re-run YOLO/RF-DETR instead of loading .cache/detections/.",
+    )
+    parser.add_argument(
+        "--legacy-detections-cache",
+        action="store_true",
+        help="Use pre-ball_threshold YOLO cache (ignore inference / RF-DETR caches).",
+    )
+    parser.add_argument(
+        "--detector-backend",
+        choices=("yolo", "inference"),
+        default="yolo",
+        help="football source: local Ultralytics .pt (yolo) or Roboflow Inference (needs ROBOFLOW_API_KEY)",
+    )
+    parser.add_argument(
+        "--player-model-id",
+        default=None,
+        help="Universe model id for --detector-backend inference (default football-players-detection-3zvbc/11)",
+    )
+    parser.add_argument(
+        "--detection-threshold",
+        type=float,
+        default=0.5,
+        help="Player / GK / referee detection confidence threshold",
+    )
+    parser.add_argument(
+        "--ball-threshold",
+        type=float,
+        default=None,
+        help="Ball class confidence threshold (default 0.20; lower catches blur / air balls)",
+    )
+    parser.add_argument(
+        "--ball-detector-backend",
+        choices=("none", "inference"),
+        default="none",
+        help="Optional dedicated ball model via Inference (needs ROBOFLOW_API_KEY)",
+    )
+    parser.add_argument(
+        "--ball-model-id",
+        default=None,
+        help="Universe ball model id (default football-ball-detection-rejhg/1)",
     )
     parser.add_argument(
         "--freeze-min-pick-score",
@@ -173,6 +208,16 @@ def main() -> None:
         help="Max score deduction for a blocking teammate (default 0.10 with --metric).",
     )
     args = parser.parse_args()
+
+    from world_cup_projects.common.detect import (
+        DEFAULT_BALL_DETECTION_THRESHOLD,
+        DEFAULT_FOOTBALL_BALL_MODEL_ID,
+    )
+
+    if args.ball_threshold is None:
+        args.ball_threshold = DEFAULT_BALL_DETECTION_THRESHOLD
+    if args.ball_model_id is None:
+        args.ball_model_id = DEFAULT_FOOTBALL_BALL_MODEL_ID
 
     if args.video:
         if args.rank_only:
@@ -240,17 +285,22 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     if args.source == "football":
-        from world_cup_projects.common.detect import iter_football_model_detections
-        from world_cup_projects.common.detection_cache import wrap_detections_cache
-
-        detections_source = wrap_detections_cache(
-            iter_football_model_detections,
-            source_name="football",
-            refresh=args.refresh_detections_cache,
-            device=args.device,
-            threshold=0.5,
-            tracker=args.tracker,
+        from world_cup_projects.common.detect import (
+            DEFAULT_FOOTBALL_PLAYERS_MODEL_ID,
+            wrap_football_detections_cache,
         )
+
+        if args.legacy_detections_cache:
+            if args.detector_backend != "yolo":
+                print(
+                    "Note: --legacy-detections-cache uses YOLO v11 cache "
+                    "(ignores inference / RF-DETR)."
+                )
+            args.detector_backend = "yolo"
+            args.ball_detector_backend = "none"
+        if args.player_model_id is None:
+            args.player_model_id = DEFAULT_FOOTBALL_PLAYERS_MODEL_ID
+        detections_source = wrap_football_detections_cache(args)
     elif args.source == "rfdetr":
         from world_cup_projects.common.detect import iter_model_detections
         from world_cup_projects.common.detection_cache import wrap_detections_cache
@@ -290,6 +340,11 @@ def main() -> None:
     tag = args.source + ("_metric" if args.metric else "")
     if args.tracker != "bytetrack":
         tag += f"_{args.tracker}"
+    if args.source == "football" and args.detector_backend != "yolo":
+        tag += f"_{args.detector_backend}"
+        if args.player_model_id:
+            ver = args.player_model_id.rsplit("/", 1)[-1]
+            tag += f"_v{ver}"
     tag += f"_facing_{args.facing_mode}"
     if args.debug_pitch_keypoints:
         tag += "_pitch_kp_debug"

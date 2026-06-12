@@ -71,12 +71,14 @@ def find_ball_carrier(
     max_distance_px: float = CARRIER_MAX_DISTANCE_PX,
     transformer=None,
     max_distance_m: float = CARRIER_MAX_DISTANCE_M,
+    require_both_spaces: bool = False,
 ) -> Carrier | None:
     """Nearest player to the ball, if within range (pixels or pitch meters).
 
-    When ``transformer`` is set, we check both metric and pixel distance. A player
-    is considered a valid carrier if they are within the limit in EITHER space.
-    This prevents possession drops when homography is temporarily distorted by camera blur.
+    When ``transformer`` is set, we check both metric and pixel distance. By default
+    a player is valid if they are within the limit in **either** space (robust to brief
+    homography glitches). With ``require_both_spaces=True``, both must pass — used for
+    pass-alternative freeze picking so warped metric alone cannot extend possession.
     """
     ball = ball_xy(detections)
     if ball is None:
@@ -107,7 +109,8 @@ def find_ball_carrier(
     limit_px = np.full(len(dist_px), max_distance_px, dtype=np.float32)
     limit_px[roles == ROLE_GOALKEEPER] = max_distance_px * 2.5
 
-    valid_mask = dist_px <= limit_px
+    pixel_valid = dist_px <= limit_px
+    valid_mask = pixel_valid
     dist_to_use = dist_px
 
     if transformer is not None:
@@ -119,12 +122,13 @@ def find_ball_carrier(
             dist_m = np.linalg.norm(feet_m - ball_m[0], axis=1)
             limit_m = np.full(len(dist_m), max_distance_m, dtype=np.float32)
             limit_m[roles == ROLE_GOALKEEPER] = max_distance_m * 3.5
-            
-            # A player is valid if they pass the metric check OR the pixel check.
-            # HOWEVER, if the ball is clearly aerial in 2D space, we veto the metric check
-            # because the 2D-to-3D projection assumes the ball is flat on the ground.
+
+            # Veto metric when the ball is clearly aerial in 2D (flat-ground assumption).
             metric_valid = (dist_m <= limit_m) & ~is_aerial
-            valid_mask = valid_mask | metric_valid
+            if require_both_spaces:
+                valid_mask = pixel_valid & metric_valid
+            else:
+                valid_mask = pixel_valid | metric_valid
             dist_to_use = dist_m
 
     if not valid_mask.any():
@@ -141,12 +145,38 @@ def find_ball_carrier(
     return Carrier(global_idx, team, float(dist_to_use[local]), ball)
 
 
+def carrier_from_tracker_id(
+    detections: sv.Detections,
+    tracker_id: int,
+) -> Carrier | None:
+    """Build a :class:`Carrier` for a known player row (e.g. inferred passer at release).
+
+    Does not require the ball to be at their feet — used for pass-alternative freezes on
+    the release frame, when control-range carrier lookup would already have failed.
+    """
+    if tracker_id < 0 or detections.tracker_id is None:
+        return None
+    pmask = player_mask(detections)
+    rows = np.flatnonzero(pmask & (detections.tracker_id == tracker_id))
+    if len(rows) == 0:
+        return None
+    idx = int(rows[0])
+    ball = ball_xy(detections)
+    feet = feet_xy(detections)[idx]
+    if ball is None:
+        ball = feet
+    dist = float(np.linalg.norm(feet - ball))
+    team = int(detections.data["team"][idx])
+    return Carrier(idx, team, dist, np.asarray(ball, dtype=np.float64))
+
+
 def find_control_carrier(
     detections: sv.Detections,
     *,
     transformer=None,
     max_distance_px: float = CONTROL_MAX_DISTANCE_PX,
     max_distance_m: float = CONTROL_MAX_DISTANCE_M,
+    require_both_spaces: bool = False,
 ) -> Carrier | None:
     """Nearest player within tight dribble range (pass passer / lane-scoring gate)."""
     return find_ball_carrier(
@@ -154,6 +184,7 @@ def find_control_carrier(
         max_distance_px=max_distance_px,
         transformer=transformer,
         max_distance_m=max_distance_m,
+        require_both_spaces=require_both_spaces,
     )
 
 

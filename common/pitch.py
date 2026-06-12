@@ -1119,6 +1119,44 @@ def pitch_cm_to_image(
     return cv2.perspectiveTransform(pts, inv).reshape(-1, 2)
 
 
+def pitch_circle_polygon_cm(
+    center_m: np.ndarray,
+    radius_m: float,
+    *,
+    segments: int = 72,
+) -> np.ndarray:
+    """Sample a ground circle in pitch cm (projects to an ellipse on broadcast view)."""
+    center = np.asarray(center_m, dtype=np.float64).reshape(2) * 100.0
+    r_cm = float(radius_m) * 100.0
+    angles = np.linspace(0.0, 2.0 * np.pi, segments, endpoint=False)
+    return np.column_stack(
+        [center[0] + r_cm * np.cos(angles), center[1] + r_cm * np.sin(angles)]
+    )
+
+
+def pitch_circle_to_image(
+    center_m: np.ndarray,
+    radius_m: float,
+    transformer: ViewTransformer | None,
+    *,
+    segments: int = 72,
+) -> np.ndarray | None:
+    """Project a pitch-space ground circle onto image pixels."""
+    poly_cm = pitch_circle_polygon_cm(center_m, radius_m, segments=segments)
+    img = pitch_cm_to_image(poly_cm, transformer)
+    if img is None:
+        return None
+    return np.round(img).astype(np.int32)
+
+
+def pitch_polygon_extent_px(poly_img: np.ndarray) -> int:
+    """Approximate radius of a projected polygon in image pixels."""
+    if poly_img is None or len(poly_img) < 3:
+        return 0
+    cx, cy = poly_img.mean(axis=0)
+    return int(np.max(np.hypot(poly_img[:, 0] - cx, poly_img[:, 1] - cy)))
+
+
 def image_to_pitch_m(
     points_xy: np.ndarray, transformer: ViewTransformer | None
 ) -> np.ndarray | None:
@@ -1545,3 +1583,188 @@ def iter_pitch_transformers(
             yield frame_idx, speed_t, radar_t, kps
         else:
             yield frame_idx, speed_t, radar_t
+
+
+@dataclass
+class PitchHomographyMaps:
+    """Per-frame speed H, radar H, and pitch keypoints (from cache or live inference)."""
+
+    transforms: dict[int, ViewTransformer | None]
+    radar_transforms: dict[int, ViewTransformer | None]
+    keypoints: dict[int, sv.KeyPoints | None]
+
+
+def _pitch_cache_roots(cache_dir: str | None = None) -> list:
+    from pathlib import Path
+
+    roots: list[Path] = []
+    if cache_dir:
+        roots.append(Path(cache_dir))
+    pkg = Path(__file__).resolve().parents[1]
+    roots.extend(
+        [
+            pkg / ".cache" / "pitch",
+            pkg.parent / ".cache" / "pitch",
+            Path(".cache") / "pitch",
+        ]
+    )
+    seen: set[Path] = set()
+    unique: list[Path] = []
+    for root in roots:
+        if root not in seen and root.is_dir():
+            seen.add(root)
+            unique.append(root)
+    return unique
+
+
+def load_pitch_homography_cache(
+    sequence_name: str,
+    *,
+    end: int | None = None,
+    pitch_confidence: float = 0.5,
+    device: str = "cpu",
+    refresh: bool = False,
+    cache_dir: str | None = None,
+) -> PitchHomographyMaps | None:
+    """Load cached pitch maps when available (avoids re-running Inference without API key)."""
+    import pickle
+    from pathlib import Path
+
+    cache_roots = _pitch_cache_roots(cache_dir)
+    if not cache_roots:
+        return None
+
+    candidates: list[Path] = []
+    if not refresh:
+        suffix = f"_{end}_" if end is not None else "_"
+
+        def _matches_end(name: str) -> bool:
+            return end is None or suffix in name
+
+        # 1. Exact device + end + confidence
+        for root in cache_roots:
+            exact = root / f"{sequence_name}_{device}_{end}_{pitch_confidence}.pkl"
+            if exact.is_file():
+                candidates.append(exact)
+
+        # 2. Same device + end, any confidence
+        if not candidates:
+            for root in cache_roots:
+                candidates.extend(
+                    sorted(
+                        (
+                            p
+                            for p in root.glob(f"{sequence_name}_{device}_*.pkl")
+                            if _matches_end(p.name)
+                        ),
+                        key=lambda p: p.stat().st_mtime,
+                        reverse=True,
+                    )
+                )
+
+        # 3. Cross-device fallback (last resort)
+        if not candidates:
+            for root in cache_roots:
+                candidates.extend(
+                    sorted(
+                        (
+                            p
+                            for p in root.glob(f"{sequence_name}_*.pkl")
+                            if _matches_end(p.name)
+                        ),
+                        key=lambda p: p.stat().st_mtime,
+                        reverse=True,
+                    )
+                )
+
+        seen: set[Path] = set()
+        unique: list[Path] = []
+        for p in candidates:
+            if p not in seen:
+                seen.add(p)
+                unique.append(p)
+        candidates = unique
+
+    for path in candidates:
+        try:
+            with path.open("rb") as f:
+                cached = pickle.load(f)
+        except (OSError, pickle.UnpicklingError):
+            continue
+        if not {"transforms", "radar_transforms", "keypoints"} <= cached.keys():
+            continue
+        name = path.name
+        expected_prefix = f"{sequence_name}_{device}_"
+        if not name.startswith(expected_prefix):
+            print(
+                f"Warning: pitch cache device mismatch — loaded {name} "
+                f"(requested device={device})"
+            )
+        print(f"Loaded cached pitch homography: {name}")
+        return PitchHomographyMaps(
+            transforms=cached["transforms"],
+            radar_transforms=cached["radar_transforms"],
+            keypoints=cached["keypoints"],
+        )
+    return None
+
+
+def ensure_pitch_homography_maps(
+    sequence,
+    *,
+    device: str = "cpu",
+    end: int | None = None,
+    pitch_confidence: float = 0.5,
+    refresh: bool = False,
+    detections_by_frame: dict[int, object] | None = None,
+) -> PitchHomographyMaps:
+    """Return pitch maps from cache or by running the keypoint model on the clip."""
+    import pickle
+    from pathlib import Path
+
+    clip_end = end if end is not None else sequence.length
+    cached = load_pitch_homography_cache(
+        sequence.name,
+        end=clip_end,
+        pitch_confidence=pitch_confidence,
+        device=device,
+        refresh=refresh,
+    )
+    if cached is not None:
+        return cached
+
+    transforms: dict[int, ViewTransformer | None] = {}
+    radar_transforms: dict[int, ViewTransformer | None] = {}
+    keypoints: dict[int, sv.KeyPoints | None] = {}
+    cache_roots = _pitch_cache_roots()
+    cache_root = cache_roots[0] if cache_roots else Path(".cache/pitch")
+    cache_path = cache_root / f"{sequence.name}_{device}_{clip_end}_{pitch_confidence}.pkl"
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    print(f"Running pitch homography (cache → {cache_path.name})...")
+    for frame_idx, speed_t, radar_t, kps, _trk in iter_pitch_transformers(
+        sequence,
+        device=device,
+        end=clip_end,
+        confidence=pitch_confidence,
+        yield_keypoints=True,
+        yield_tracker=True,
+        detections_by_frame=detections_by_frame,
+    ):
+        transforms[frame_idx] = speed_t
+        radar_transforms[frame_idx] = radar_t
+        keypoints[frame_idx] = kps
+    with cache_path.open("wb") as f:
+        pickle.dump(
+            {
+                "transforms": transforms,
+                "radar_transforms": radar_transforms,
+                "keypoints": keypoints,
+            },
+            f,
+        )
+    print(f"Wrote pitch cache: {cache_path.name}")
+    return PitchHomographyMaps(
+        transforms=transforms,
+        radar_transforms=radar_transforms,
+        keypoints=keypoints,
+    )

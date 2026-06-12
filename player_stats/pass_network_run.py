@@ -55,17 +55,9 @@ from world_cup_projects.player_stats.pass_network_render import render_pass_netw
 
 def _load_detections_source(args, sequence):
     if args.source == "football":
-        from world_cup_projects.common.detect import iter_football_model_detections
-        from world_cup_projects.common.detection_cache import wrap_detections_cache
+        from world_cup_projects.common.detect import wrap_football_detections_cache
 
-        return wrap_detections_cache(
-            iter_football_model_detections,
-            source_name="football",
-            refresh=args.refresh_detections_cache,
-            device=args.device,
-            threshold=0.5,
-            tracker=args.tracker,
-        )
+        return wrap_football_detections_cache(args)
     if args.source == "rfdetr":
         from world_cup_projects.common.detect import iter_model_detections
         from world_cup_projects.common.detection_cache import wrap_detections_cache
@@ -130,6 +122,40 @@ def main() -> None:
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--pitch-confidence", type=float, default=0.9)
     parser.add_argument("--refresh-detections-cache", action="store_true")
+    parser.add_argument(
+        "--detector-backend",
+        choices=("yolo", "inference"),
+        default="yolo",
+        help="football source: local Ultralytics .pt (yolo) or Roboflow Inference (needs ROBOFLOW_API_KEY)",
+    )
+    parser.add_argument(
+        "--player-model-id",
+        default=None,
+        help="Universe model id for --detector-backend inference (default football-players-detection-3zvbc/11)",
+    )
+    parser.add_argument(
+        "--detection-threshold",
+        type=float,
+        default=0.5,
+        help="Player / GK / referee detection confidence threshold",
+    )
+    parser.add_argument(
+        "--ball-threshold",
+        type=float,
+        default=None,
+        help="Ball class confidence threshold (default 0.20; lower catches blur / air balls)",
+    )
+    parser.add_argument(
+        "--ball-detector-backend",
+        choices=("none", "inference"),
+        default="none",
+        help="Optional dedicated ball model via Inference (needs ROBOFLOW_API_KEY)",
+    )
+    parser.add_argument(
+        "--ball-model-id",
+        default=None,
+        help="Universe ball model id (default football-ball-detection-rejhg/1)",
+    )
     parser.add_argument(
         "--control-max-m",
         type=float,
@@ -215,6 +241,16 @@ def main() -> None:
         action="store_true",
         help="Overlay per-frame ball-carrier HUD (control/reception, anchor, in-flight).",
     )
+    parser.add_argument(
+        "--tag-suffix",
+        default=None,
+        help="Extra tag in output filenames (e.g. inference_v20). Auto-set for --detector-backend inference.",
+    )
+    parser.add_argument(
+        "--legacy-detections-cache",
+        action="store_true",
+        help="Use YOLO v11 detection cache without ball_threshold in the cache key.",
+    )
     args = parser.parse_args()
 
     if args.video:
@@ -230,6 +266,19 @@ def main() -> None:
             p for p in find_sequences(args.data, args.split) if p.name == args.sequence
         )
         sequence = load_sequence(seq_dir)
+
+    if args.player_model_id is None:
+        from world_cup_projects.common.detect import DEFAULT_FOOTBALL_PLAYERS_MODEL_ID
+
+        args.player_model_id = DEFAULT_FOOTBALL_PLAYERS_MODEL_ID
+    if args.ball_threshold is None:
+        from world_cup_projects.common.detect import DEFAULT_BALL_DETECTION_THRESHOLD
+
+        args.ball_threshold = DEFAULT_BALL_DETECTION_THRESHOLD
+    if args.ball_model_id is None:
+        from world_cup_projects.common.detect import DEFAULT_FOOTBALL_BALL_MODEL_ID
+
+        args.ball_model_id = DEFAULT_FOOTBALL_BALL_MODEL_ID
 
     config = PassDetectionConfig(
         min_carrier_gap_frames=args.min_pass_gap,
@@ -343,6 +392,11 @@ def main() -> None:
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
     tag = args.source + ("_metric" if args.metric else "")
+    if args.detector_backend == "inference" and args.player_model_id:
+        ver = args.player_model_id.rsplit("/", 1)[-1]
+        tag += f"_inference_v{ver}"
+    if args.tag_suffix:
+        tag += f"_{args.tag_suffix}"
     if args.debug_pitch_keypoints:
         tag += "_pitch_kp_debug"
     if args.debug_carrier:
