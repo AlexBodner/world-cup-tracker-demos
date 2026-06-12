@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
+
+if TYPE_CHECKING:
+    from world_cup_projects.common.tracking_facing import JoystickDotSmoother
 
 import cv2
 import numpy as np
@@ -69,6 +72,7 @@ def cv2_safe_text(text: str) -> str:
         ("\u00d7", "x"),  # multiplication sign
         ("\u2264", "<="),  # less-than or equal
         ("\u2265", ">="),  # greater-than or equal
+        ("\u00b0", " deg"),  # degree sign
     ):
         text = text.replace(src, dst)
     return text.encode("ascii", "replace").decode("ascii")
@@ -201,6 +205,146 @@ def draw_player_facing_arrows(
             tipLength=0.42,
         )
     return frame
+
+
+def _player_ellipse_geometry(xyxy: np.ndarray) -> tuple[int, int, float, float]:
+    """Match ``sv.EllipseAnnotator``: feet center + axis-aligned semi-axes."""
+    x1, _y1, x2, y2 = xyxy.astype(np.float64)
+    cx = int((x1 + x2) / 2)
+    cy = int(y2)
+    a = float(x2 - x1)
+    b = 0.35 * a
+    return cx, cy, a, b
+
+
+def _ellipse_extent_in_direction(a: float, b: float, ux: float, uy: float) -> float:
+    """Distance from ellipse center to edge along a unit direction."""
+    denom = (b * ux) ** 2 + (a * uy) ** 2
+    if denom < 1e-12:
+        return float(min(a, b))
+    return float((a * b) / np.sqrt(denom))
+
+
+def kalman_speed_stick(
+    speed_px: float,
+    *,
+    min_speed_px: float = 0.5,
+    max_speed_px: float = 4.0,
+) -> float | None:
+    """Map Kalman speed (px/frame) to joystick deflection in [0, 1]."""
+    if not np.isfinite(speed_px) or speed_px < min_speed_px:
+        return None
+    if max_speed_px <= min_speed_px:
+        return 1.0
+    linear = float(np.clip((speed_px - min_speed_px) / (max_speed_px - min_speed_px), 0.0, 1.0))
+    # Slight curve so typical jogging reads closer to the ellipse edge.
+    return float(np.sqrt(linear))
+
+
+def _dot_radius_for_ellipse(semi_axis_a: float) -> int:
+    """Scale dot with bbox width (matches ellipse horizontal semi-axis)."""
+    return int(np.clip(round(semi_axis_a * 0.13), 3, 8))
+
+
+def draw_kalman_joystick_dots(
+    frame: np.ndarray,
+    dets: sv.Detections,
+    *,
+    min_speed_px: float = 0.5,
+    max_speed_px: float = 4.0,
+    dot_smoother: JoystickDotSmoother | None = None,
+) -> np.ndarray:
+    """PlayStation-style direction dot on each player ellipse from Kalman velocity."""
+    if len(dets) == 0 or dets.data is None:
+        return frame
+    kf_vx = dets.data.get("kf_vx")
+    kf_vy = dets.data.get("kf_vy")
+    if kf_vx is None or kf_vy is None:
+        return frame
+
+    pmask = np.isin(dets.class_id, (ROLE_PLAYER, ROLE_GOALKEEPER))
+    if not pmask.any():
+        return frame
+
+    teams = dets.data.get("team", np.full(len(dets), -1))
+    tids = dets.tracker_id if dets.tracker_id is not None else np.full(len(dets), -1, dtype=int)
+    for i in np.flatnonzero(pmask):
+        team = int(teams[i])
+        if team not in (0, 1):
+            continue
+        cx, cy, a, b = _player_ellipse_geometry(dets.xyxy[i])
+        vx, vy = float(kf_vx[i]), float(kf_vy[i])
+        if not np.isfinite(vx) or not np.isfinite(vy):
+            px, py = cx, cy
+        else:
+            speed = float(np.hypot(vx, vy))
+            if speed < min_speed_px:
+                px, py = cx, cy
+            else:
+                stick = kalman_speed_stick(
+                    speed, min_speed_px=min_speed_px, max_speed_px=max_speed_px
+                )
+                if stick is None:
+                    px, py = cx, cy
+                else:
+                    ux, uy = vx / speed, vy / speed
+                    reach = stick * _ellipse_extent_in_direction(a, b, ux, uy)
+                    px, py = cx + ux * reach, cy + uy * reach
+        if dot_smoother is not None:
+            px, py = dot_smoother.smooth(
+                int(tids[i]), float(cx), float(cy), float(px), float(py)
+            )
+        else:
+            px, py = int(px), int(py)
+        dot_color = TEAM_COLORS[team].as_bgr()
+        radius = _dot_radius_for_ellipse(a)
+        cv2.circle(frame, (px, py), radius, dot_color, -1, cv2.LINE_AA)
+    return frame
+
+
+def annotate_kalman_motion_players(
+    frame: np.ndarray,
+    dets: sv.Detections,
+    *,
+    min_speed_px: float = 0.5,
+    max_speed_px: float = 4.0,
+    dot_smoother: JoystickDotSmoother | None = None,
+) -> np.ndarray:
+    """Team ellipses + Kalman joystick dots only (no labels, ball, or radar)."""
+    outfield = dets[dets.class_id == ROLE_PLAYER]
+    if len(outfield):
+        teams = outfield.data.get("team", np.zeros(len(outfield)))
+        outfield_vis = sv.Detections(
+            xyxy=outfield.xyxy,
+            class_id=team_class_ids(teams),
+            tracker_id=outfield.tracker_id,
+            data=outfield.data,
+        )
+        frame = _ELLIPSE.annotate(frame, outfield_vis)
+
+    gks = dets[dets.class_id == ROLE_GOALKEEPER]
+    if len(gks):
+        gk_teams = gks.data.get("team", np.full(len(gks), -1))
+        has_team = np.isin(gk_teams, (0, 1))
+        if has_team.any():
+            gk_colored = gks[has_team]
+            gk_vis = sv.Detections(
+                xyxy=gk_colored.xyxy,
+                class_id=team_class_ids(gk_teams[has_team]),
+                tracker_id=gk_colored.tracker_id,
+                data=gk_colored.data,
+            )
+            frame = _ELLIPSE.annotate(frame, gk_vis)
+        if (~has_team).any():
+            frame = _GK_ELLIPSE.annotate(frame, gks[~has_team])
+
+    return draw_kalman_joystick_dots(
+        frame,
+        dets,
+        min_speed_px=min_speed_px,
+        max_speed_px=max_speed_px,
+        dot_smoother=dot_smoother,
+    )
 
 
 def draw_facing_legend(frame: np.ndarray) -> np.ndarray:
@@ -338,6 +482,7 @@ def draw_radar_minimap(
     locked_goal_defenders: tuple[int, int] | None = None,
     prebuilt_radar: np.ndarray | None = None,
     debug_keypoints: bool = False,
+    opacity: float = 0.5,
 ) -> np.ndarray:
     """Sports-style radar minimap: per-frame H from gated keypoints (no mirror lock)."""
     del clip_radar_transformer  # deprecated; minimap always fits per-frame from keypoints
@@ -377,7 +522,7 @@ def draw_radar_minimap(
     else:
         x, y = w - rw - margin, h - rh - margin - brand_clearance
     rect = sv.Rect(x=x, y=y, width=rw, height=rh)
-    return sv.draw_image(frame, radar, opacity=0.5, rect=rect)
+    return sv.draw_image(frame, radar, opacity=opacity, rect=rect)
 
 
 draw_radar_bottom_center = draw_radar_minimap

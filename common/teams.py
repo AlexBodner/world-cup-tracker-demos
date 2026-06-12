@@ -25,7 +25,7 @@ def get_crops(frame: np.ndarray, detections: sv.Detections) -> List[np.ndarray]:
 class TrackletTeamStabilizer:
     """Per-track jersey team with hysteresis: flip only after N consecutive disagrees."""
 
-    def __init__(self, *, flip_after: int = 8) -> None:
+    def __init__(self, *, flip_after: int = 16) -> None:
         self.flip_after = max(1, int(flip_after))
         self._stable: dict[int, int] = {}
         self._streak: dict[int, int] = {}
@@ -59,7 +59,7 @@ class TrackletTeamStabilizer:
 def stabilize_teams_by_tracklet(
     frames: Iterable[tuple[int, sv.Detections]],
     *,
-    flip_after: int = 8,
+    flip_after: int = 16,
 ) -> list[tuple[int, sv.Detections]]:
     """Run :class:`TrackletTeamStabilizer` across a clip (works on cached detections too)."""
     stabilizer = TrackletTeamStabilizer(flip_after=flip_after)

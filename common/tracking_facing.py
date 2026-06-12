@@ -187,6 +187,119 @@ class KalmanFacingReplay:
         )
 
 
+class KalmanVelocitySmoother:
+    """Per-track EMA on ``kf_vx`` / ``kf_vy`` for display (holds last value on NaN)."""
+
+    def __init__(self, *, alpha: float = 0.3) -> None:
+        self.alpha = float(np.clip(alpha, 0.05, 1.0))
+        self._state: dict[int, tuple[float, float]] = {}
+
+    def smooth_detections(self, dets: sv.Detections) -> sv.Detections:
+        if len(dets) == 0 or dets.data is None:
+            return dets
+        kf_vx = dets.data.get("kf_vx")
+        kf_vy = dets.data.get("kf_vy")
+        if kf_vx is None or kf_vy is None:
+            return dets
+
+        n = len(dets)
+        out_vx = np.full(n, np.nan, dtype=np.float32)
+        out_vy = np.full(n, np.nan, dtype=np.float32)
+        tids = dets.tracker_id if dets.tracker_id is not None else np.full(n, -1, dtype=int)
+        a = self.alpha
+
+        for i in range(n):
+            tid = int(tids[i])
+            raw_x, raw_y = float(kf_vx[i]), float(kf_vy[i])
+            has_raw = np.isfinite(raw_x) and np.isfinite(raw_y)
+
+            if tid >= 0 and has_raw:
+                if tid in self._state:
+                    prev_x, prev_y = self._state[tid]
+                    sx = a * raw_x + (1.0 - a) * prev_x
+                    sy = a * raw_y + (1.0 - a) * prev_y
+                else:
+                    sx, sy = raw_x, raw_y
+                self._state[tid] = (sx, sy)
+                out_vx[i], out_vy[i] = sx, sy
+            elif tid >= 0 and tid in self._state:
+                sx, sy = self._state[tid]
+                out_vx[i], out_vy[i] = sx, sy
+            elif has_raw:
+                out_vx[i], out_vy[i] = raw_x, raw_y
+
+        data = dict(dets.data)
+        data["kf_vx"] = out_vx
+        data["kf_vy"] = out_vy
+        return sv.Detections(
+            xyxy=dets.xyxy,
+            class_id=dets.class_id,
+            tracker_id=dets.tracker_id,
+            confidence=dets.confidence,
+            data=data,
+        )
+
+
+class JoystickDotSmoother:
+    """EMA on joystick offset from ellipse center (not absolute screen position)."""
+
+    def __init__(self, *, alpha: float = 0.32) -> None:
+        self.alpha = float(np.clip(alpha, 0.05, 1.0))
+        self._offset: dict[int, tuple[float, float]] = {}
+
+    def smooth(
+        self,
+        tracker_id: int,
+        cx: float,
+        cy: float,
+        px: float,
+        py: float,
+    ) -> tuple[int, int]:
+        if tracker_id < 0:
+            return int(round(px)), int(round(py))
+        ox, oy = px - cx, py - cy
+        a = self.alpha
+        if tracker_id in self._offset:
+            pox, poy = self._offset[tracker_id]
+            ox = a * ox + (1.0 - a) * pox
+            oy = a * oy + (1.0 - a) * poy
+        self._offset[tracker_id] = (ox, oy)
+        return int(round(cx + ox)), int(round(cy + oy))
+
+
+class EllipseWidthSmoother:
+    """Per-track EMA on bbox width so ground ellipses do not flicker with detector jitter."""
+
+    def __init__(self, *, alpha: float = 0.22) -> None:
+        self.alpha = float(np.clip(alpha, 0.05, 1.0))
+        self._width: dict[int, float] = {}
+
+    def smooth_detections(self, dets: sv.Detections) -> sv.Detections:
+        if len(dets) == 0:
+            return dets
+        xyxy = dets.xyxy.astype(np.float64).copy()
+        tids = dets.tracker_id if dets.tracker_id is not None else np.full(len(dets), -1, dtype=int)
+        a = self.alpha
+        for i in range(len(dets)):
+            x1, y1, x2, y2 = xyxy[i]
+            cx = (x1 + x2) * 0.5
+            width = float(x2 - x1)
+            tid = int(tids[i])
+            if tid >= 0 and width > 1.0:
+                if tid in self._width:
+                    width = a * width + (1.0 - a) * self._width[tid]
+                self._width[tid] = width
+            xyxy[i, 0] = cx - width * 0.5
+            xyxy[i, 2] = cx + width * 0.5
+        return sv.Detections(
+            xyxy=xyxy.astype(np.float32),
+            class_id=dets.class_id,
+            tracker_id=dets.tracker_id,
+            confidence=dets.confidence,
+            data=dets.data,
+        )
+
+
 def facing_kalman_from_trackable(
     frame_dets: sv.Detections,
     pmask: np.ndarray,

@@ -10,7 +10,7 @@ Both yield the same ``sv.Detections`` contract as :func:`common.soccernet.iter_g
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Iterator
+from typing import Iterable, Iterator
 
 import cv2
 import numpy as np
@@ -51,14 +51,21 @@ _FP_TO_ROLE = {
 _MODEL_DIR = Path(__file__).resolve().parent.parent / ".cache" / "models"
 _FOOTBALL_PLAYERS_MODEL_PATH = _MODEL_DIR / "football-player-detection.pt"
 _FOOTBALL_PLAYERS_MODEL_GDRIVE_ID = "17PXFNlx-jI7VjVo_vQnB1sONjRyvoB-q"
+_FOOTBALL_BALL_MODEL_PATH = _MODEL_DIR / "football-ball-detection.pt"
+_FOOTBALL_BALL_MODEL_GDRIVE_ID = "1isw4wx-MK9h9LMr36VvIWlJD6ppUvw7V"
 DEFAULT_FOOTBALL_PLAYERS_MODEL_ID = "football-players-detection-3zvbc/11"
 FOOTBALL_PLAYERS_INFERENCE_V11 = "football-players-detection-3zvbc/11"
+# Latest YOLO on Universe (yolo11m, Aug 2025) — use via --detector-backend inference.
+FOOTBALL_PLAYERS_INFERENCE_V19 = "football-players-detection-3zvbc/19"
 FOOTBALL_PLAYERS_INFERENCE_V20 = "football-players-detection-3zvbc/20"
 FOOTBALL_PLAYERS_INFERENCE_RFDETR = "football-players-detection-3zvbc/18"
+BEST_FOOTBALL_PLAYERS_YOLO_MODEL_ID = FOOTBALL_PLAYERS_INFERENCE_V19
 DEFAULT_BALL_DETECTION_THRESHOLD = 0.20
-DEFAULT_FOOTBALL_BALL_MODEL_ID = "football-ball-detection-rejhg/1"
+# Dedicated ball-only YOLOv8x (DFL / Bundesliga ball dataset).
+DEFAULT_FOOTBALL_BALL_MODEL_ID = "football-ball-detection-rejhg/4"
 KNOWN_FOOTBALL_PLAYER_MODELS = (
     FOOTBALL_PLAYERS_INFERENCE_V11,
+    FOOTBALL_PLAYERS_INFERENCE_V19,
     FOOTBALL_PLAYERS_INFERENCE_V20,
     FOOTBALL_PLAYERS_INFERENCE_RFDETR,
 )
@@ -248,6 +255,22 @@ def ensure_football_players_model() -> Path:
     return _FOOTBALL_PLAYERS_MODEL_PATH
 
 
+def ensure_football_ball_model() -> Path:
+    """Download football-ball-detection.pt (Universe football-ball-detection-rejhg)."""
+    _MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    if _FOOTBALL_BALL_MODEL_PATH.is_file():
+        return _FOOTBALL_BALL_MODEL_PATH
+
+    try:
+        import gdown
+    except ImportError as exc:
+        raise ImportError("Install gdown to download football ball model weights.") from exc
+
+    url = f"https://drive.google.com/uc?id={_FOOTBALL_BALL_MODEL_GDRIVE_ID}"
+    gdown.download(url, str(_FOOTBALL_BALL_MODEL_PATH), quiet=False)
+    return _FOOTBALL_BALL_MODEL_PATH
+
+
 def ensure_football_players_inference(*, model_id: str = DEFAULT_FOOTBALL_PLAYERS_MODEL_ID) -> None:
     """Verify ``ROBOFLOW_API_KEY`` is set (Inference caches weights on first run)."""
     import os
@@ -288,6 +311,98 @@ def _apply_fp_class_thresholds(
             det.confidence >= thr if det.confidence is not None else True
         )
     return det[keep]
+
+
+REFEREE_PLAYER_IOU_THRESHOLD = 0.25
+REFEREE_TRACK_IOU_THRESHOLD = 0.4
+
+
+def _detection_overlap_with_referees(
+    subject: sv.Detections,
+    referees: sv.Detections,
+    *,
+    iou_threshold: float = REFEREE_PLAYER_IOU_THRESHOLD,
+) -> np.ndarray:
+    """Per-row mask: subject detection overlaps any referee box."""
+    if len(subject) == 0 or len(referees) == 0:
+        return np.zeros(len(subject), dtype=bool)
+    ious = sv.box_iou_batch(subject.xyxy, referees.xyxy)
+    overlap = ious.max(axis=1) >= iou_threshold
+    if overlap.all():
+        return overlap
+    rcx = (referees.xyxy[:, 0] + referees.xyxy[:, 2]) / 2.0
+    rcy = (referees.xyxy[:, 1] + referees.xyxy[:, 3]) / 2.0
+    x1, y1, x2, y2 = (
+        subject.xyxy[:, 0],
+        subject.xyxy[:, 1],
+        subject.xyxy[:, 2],
+        subject.xyxy[:, 3],
+    )
+    for i in np.flatnonzero(~overlap):
+        inside = (rcx >= x1[i]) & (rcx <= x2[i]) & (rcy >= y1[i]) & (rcy <= y2[i])
+        if inside.any():
+            overlap[i] = True
+    return overlap
+
+
+def suppress_players_overlapping_referees(
+    players: sv.Detections,
+    referees: sv.Detections,
+    *,
+    iou_threshold: float = REFEREE_PLAYER_IOU_THRESHOLD,
+) -> sv.Detections:
+    """Drop player rows that duplicate a referee detection (same person, two classes)."""
+    if len(players) == 0 or len(referees) == 0:
+        return players
+    drop = _detection_overlap_with_referees(players, referees, iou_threshold=iou_threshold)
+    return players[~drop]
+
+
+def filter_referees_from_detections(
+    dets: sv.Detections,
+    *,
+    blocked_tracker_ids: set[int] | frozenset[int] | None = None,
+    iou_threshold: float = REFEREE_PLAYER_IOU_THRESHOLD,
+) -> sv.Detections:
+    """Remove referee rows and outfield players overlapping or flagged as refs."""
+    if len(dets) == 0:
+        return dets
+    ref_mask = dets.class_id == ROLE_REFEREE
+    keep = ~ref_mask
+    player_mask = dets.class_id == ROLE_PLAYER
+    refs = dets[ref_mask]
+    if len(refs) and player_mask.any():
+        overlap = _detection_overlap_with_referees(
+            dets[player_mask], refs, iou_threshold=iou_threshold
+        )
+        player_idx = np.flatnonzero(player_mask)
+        keep[player_idx[overlap]] = False
+    if blocked_tracker_ids and dets.tracker_id is not None:
+        for i, tid in enumerate(dets.tracker_id):
+            if int(tid) in blocked_tracker_ids:
+                keep[i] = False
+    return dets[keep]
+
+
+def collect_referee_tracker_ids(
+    frames: Iterable[tuple[int, sv.Detections]],
+    *,
+    iou_threshold: float = REFEREE_TRACK_IOU_THRESHOLD,
+) -> frozenset[int]:
+    """Track ids that ever strongly overlap a referee box (misclassified as player)."""
+    flagged: set[int] = set()
+    for _, dets in frames:
+        player_mask = dets.class_id == ROLE_PLAYER
+        ref_mask = dets.class_id == ROLE_REFEREE
+        if not player_mask.any() or not ref_mask.any() or dets.tracker_id is None:
+            continue
+        ious = sv.box_iou_batch(dets.xyxy[player_mask], dets.xyxy[ref_mask])
+        player_idx = np.flatnonzero(player_mask)
+        tids = dets.tracker_id[player_idx]
+        for j, mx in enumerate(ious.max(axis=1)):
+            if float(mx) >= iou_threshold and int(tids[j]) >= 0:
+                flagged.add(int(tids[j]))
+    return frozenset(flagged)
 
 
 def _best_ball_detection(balls: sv.Detections) -> sv.Detections:
@@ -452,6 +567,38 @@ class FootballBallInferenceDetector:
         )
 
 
+class FootballBallYoloDetector:
+    """Dedicated ball-only YOLO (football-ball-detection-rejhg weights)."""
+
+    def __init__(
+        self,
+        model_path: str | Path | None = None,
+        device: str = "cpu",
+        threshold: float = DEFAULT_BALL_DETECTION_THRESHOLD,
+    ) -> None:
+        from ultralytics import YOLO
+
+        path = Path(model_path) if model_path else ensure_football_ball_model()
+        self.model = YOLO(str(path))
+        self.device = device
+        self.threshold = threshold
+
+    def detect(self, frame_bgr: np.ndarray) -> sv.Detections:
+        min_conf = min(self.threshold, 0.05)
+        results = self.model.predict(
+            frame_bgr, conf=min_conf, verbose=False, device=self.device
+        )[0]
+        det = sv.Detections.from_ultralytics(results)
+        if len(det) == 0:
+            return sv.Detections.empty()
+        if det.confidence is not None:
+            det = det[det.confidence >= self.threshold]
+        if len(det) == 0:
+            return sv.Detections.empty()
+        det.class_id = np.full(len(det), ROLE_BALL, dtype=int)
+        return det
+
+
 def create_football_players_detector(
     *,
     backend: str = "yolo",
@@ -487,7 +634,8 @@ def create_football_ball_detector(
     model_id: str = DEFAULT_FOOTBALL_BALL_MODEL_ID,
     threshold: float = DEFAULT_BALL_DETECTION_THRESHOLD,
     api_key: str | None = None,
-) -> FootballBallInferenceDetector | None:
+    device: str = "cpu",
+) -> FootballBallInferenceDetector | FootballBallYoloDetector | None:
     if backend in (None, "", "none", "off"):
         return None
     if backend == "inference":
@@ -496,7 +644,9 @@ def create_football_ball_detector(
             api_key=api_key,
             threshold=threshold,
         )
-    raise ValueError(f"Unknown ball detector backend: {backend!r} (use 'inference' or 'none')")
+    if backend == "yolo":
+        return FootballBallYoloDetector(device=device, threshold=threshold)
+    raise ValueError(f"Unknown ball detector backend: {backend!r} (use 'inference', 'yolo', or 'none')")
 
 
 def wrap_football_detections_cache(args, *, refresh: bool | None = None):
@@ -621,7 +771,7 @@ def iter_football_detections(
     end: int | None = None,
     track_activation_threshold: float = 0.4,
     tracker: TrackerKind = "bytetrack",
-    ball_detector: FootballBallInferenceDetector | None = None,
+    ball_detector: FootballBallInferenceDetector | FootballBallYoloDetector | None = None,
 ) -> Iterator[tuple[int, sv.Detections]]:
     """Detect + track with football-players-detection; refs excluded from teams."""
     player_tracker = create_player_tracker(
@@ -648,6 +798,7 @@ def iter_football_detections(
         players = det[det.class_id == ROLE_PLAYER]
         gks = det[det.class_id == ROLE_GOALKEEPER]
         refs = det[det.class_id == ROLE_REFEREE]
+        players = suppress_players_overlapping_referees(players, refs)
 
         trackable = sv.Detections.merge([players, gks])
         tracked = (
@@ -751,6 +902,7 @@ def iter_football_model_detections(
         backend=ball_backend or "none",
         model_id=ball_model_id,
         threshold=ball_threshold,
+        device=device,
     )
     team_classifier = fit_football_team_classifier(
         sequence, detector, sample_stride=sample_stride, max_frames=end or sequence.length
