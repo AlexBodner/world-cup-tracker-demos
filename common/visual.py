@@ -225,6 +225,26 @@ def _ellipse_extent_in_direction(a: float, b: float, ux: float, uy: float) -> fl
     return float((a * b) / np.sqrt(denom))
 
 
+def _joystick_dot_reach(
+    stick: float,
+    a: float,
+    b: float,
+    ux: float,
+    uy: float,
+    *,
+    dot_radius: float,
+    ellipse_thickness: float = 2.0,
+) -> float:
+    """Center distance for a joystick dot tied to the drawn ellipse.
+
+    At full deflection the dot center sits on the ellipse edge plus its radius so
+    the filled circle can extend to the outer side of the stroke.
+    """
+    edge = _ellipse_extent_in_direction(a, b, ux, uy)
+    outer = edge + 0.5 * ellipse_thickness + dot_radius
+    return float(stick) * outer
+
+
 def kalman_speed_stick(
     speed_px: float,
     *,
@@ -273,6 +293,7 @@ def draw_kalman_joystick_dots(
         if team not in (0, 1):
             continue
         cx, cy, a, b = _player_ellipse_geometry(dets.xyxy[i])
+        radius = _dot_radius_for_ellipse(a)
         vx, vy = float(kf_vx[i]), float(kf_vy[i])
         if not np.isfinite(vx) or not np.isfinite(vy):
             px, py = cx, cy
@@ -288,7 +309,9 @@ def draw_kalman_joystick_dots(
                     px, py = cx, cy
                 else:
                     ux, uy = vx / speed, vy / speed
-                    reach = stick * _ellipse_extent_in_direction(a, b, ux, uy)
+                    reach = _joystick_dot_reach(
+                        stick, a, b, ux, uy, dot_radius=float(radius)
+                    )
                     px, py = cx + ux * reach, cy + uy * reach
         if dot_smoother is not None:
             px, py = dot_smoother.smooth(
@@ -297,7 +320,6 @@ def draw_kalman_joystick_dots(
         else:
             px, py = int(px), int(py)
         dot_color = TEAM_COLORS[team].as_bgr()
-        radius = _dot_radius_for_ellipse(a)
         cv2.circle(frame, (px, py), radius, dot_color, -1, cv2.LINE_AA)
     return frame
 
