@@ -5,7 +5,10 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Literal
 
 if TYPE_CHECKING:
-    from world_cup_projects.common.tracking_facing import JoystickDotSmoother
+    from world_cup_projects.common.tracking_facing import (
+        JoystickDotSmoother,
+        KalmanSpeedDisplaySmoother,
+    )
 
 import cv2
 import numpy as np
@@ -266,6 +269,9 @@ def _dot_radius_for_ellipse(semi_axis_a: float) -> int:
     return int(np.clip(round(semi_axis_a * 0.13), 3, 8))
 
 
+KALMAN_SPEED_MS_TO_KMH = 3.6
+
+
 def draw_kalman_joystick_dots(
     frame: np.ndarray,
     dets: sv.Detections,
@@ -273,6 +279,12 @@ def draw_kalman_joystick_dots(
     min_speed_px: float = 0.5,
     max_speed_px: float = 4.0,
     dot_smoother: JoystickDotSmoother | None = None,
+    speed_smoother: KalmanSpeedDisplaySmoother | None = None,
+    transformer=None,
+    fps: float = 25.0,
+    show_speed: bool = False,
+    min_speed_kmh: float = 4.0,
+    speed_homography_weight: float = 0.3,
 ) -> np.ndarray:
     """PlayStation-style direction dot on each player ellipse from Kalman velocity."""
     if len(dets) == 0 or dets.data is None:
@@ -286,6 +298,10 @@ def draw_kalman_joystick_dots(
     if not pmask.any():
         return frame
 
+    from world_cup_projects.common.possession import feet_xy
+    from world_cup_projects.common.tracking_facing import kalman_ground_speed_m_s
+
+    feet = feet_xy(dets) if show_speed else None
     teams = dets.data.get("team", np.full(len(dets), -1))
     tids = dets.tracker_id if dets.tracker_id is not None else np.full(len(dets), -1, dtype=int)
     for i in np.flatnonzero(pmask):
@@ -295,20 +311,21 @@ def draw_kalman_joystick_dots(
         cx, cy, a, b = _player_ellipse_geometry(dets.xyxy[i])
         radius = _dot_radius_for_ellipse(a)
         vx, vy = float(kf_vx[i]), float(kf_vy[i])
+        speed_px = 0.0
         if not np.isfinite(vx) or not np.isfinite(vy):
             px, py = cx, cy
         else:
-            speed = float(np.hypot(vx, vy))
-            if speed < min_speed_px:
+            speed_px = float(np.hypot(vx, vy))
+            if speed_px < min_speed_px:
                 px, py = cx, cy
             else:
                 stick = kalman_speed_stick(
-                    speed, min_speed_px=min_speed_px, max_speed_px=max_speed_px
+                    speed_px, min_speed_px=min_speed_px, max_speed_px=max_speed_px
                 )
                 if stick is None:
                     px, py = cx, cy
                 else:
-                    ux, uy = vx / speed, vy / speed
+                    ux, uy = vx / speed_px, vy / speed_px
                     reach = _joystick_dot_reach(
                         stick, a, b, ux, uy, dot_radius=float(radius)
                     )
@@ -321,6 +338,31 @@ def draw_kalman_joystick_dots(
             px, py = int(px), int(py)
         dot_color = TEAM_COLORS[team].as_bgr()
         cv2.circle(frame, (px, py), radius, dot_color, -1, cv2.LINE_AA)
+        if show_speed and feet is not None and speed_px >= min_speed_px:
+            box_h = float(dets.xyxy[i, 3] - dets.xyxy[i, 1])
+            speed_m_s = kalman_ground_speed_m_s(
+                feet[i],
+                np.array([vx, vy], dtype=np.float64),
+                transformer,
+                fps=fps,
+                box_height_px=box_h,
+                min_speed_px=min_speed_px,
+                homography_weight=speed_homography_weight,
+            )
+            if speed_m_s is not None:
+                if speed_smoother is not None:
+                    speed_m_s = speed_smoother.smooth(int(tids[i]), speed_m_s)
+                speed_kmh = speed_m_s * KALMAN_SPEED_MS_TO_KMH
+                if speed_kmh >= min_speed_kmh:
+                    label = f"{speed_kmh:.1f}"
+                    draw_text_shadow(
+                        frame,
+                        label,
+                        (px - 8, py - radius - 6),
+                        font_scale=0.42,
+                        color_bgr=dot_color,
+                        thickness=1,
+                    )
     return frame
 
 
@@ -331,6 +373,12 @@ def annotate_kalman_motion_players(
     min_speed_px: float = 0.5,
     max_speed_px: float = 4.0,
     dot_smoother: JoystickDotSmoother | None = None,
+    speed_smoother: KalmanSpeedDisplaySmoother | None = None,
+    transformer=None,
+    fps: float = 25.0,
+    show_speed: bool = False,
+    min_speed_kmh: float = 4.0,
+    speed_homography_weight: float = 0.3,
 ) -> np.ndarray:
     """Team ellipses + Kalman joystick dots only (no labels, ball, or radar)."""
     outfield = dets[dets.class_id == ROLE_PLAYER]
@@ -366,6 +414,12 @@ def annotate_kalman_motion_players(
         min_speed_px=min_speed_px,
         max_speed_px=max_speed_px,
         dot_smoother=dot_smoother,
+        speed_smoother=speed_smoother,
+        transformer=transformer,
+        fps=fps,
+        show_speed=show_speed,
+        min_speed_kmh=min_speed_kmh,
+        speed_homography_weight=speed_homography_weight,
     )
 
 
@@ -471,6 +525,40 @@ def annotate_ball(frame: np.ndarray, dets: sv.Detections) -> np.ndarray:
         class_id=np.array([0]),
     )
     return _BALL_TRI.annotate(frame, ball_dets)
+
+
+def draw_ball_speed_arrow(
+    frame: np.ndarray,
+    ball: np.ndarray,
+    velocity: np.ndarray,
+    *,
+    speed_label: str,
+    color: tuple[int, int, int] = (0, 255, 255),
+    min_speed_px: float = 0.5,
+    scale_px: float = 3.0,
+) -> np.ndarray:
+    """Draw ball motion arrow + speed label (raw detection displacement, not Kalman)."""
+    from world_cup_projects.common.geometry import unit
+
+    speed = float(np.linalg.norm(velocity))
+    if speed < min_speed_px:
+        return frame
+    direction = unit(velocity)
+    if direction is None:
+        return frame
+
+    origin = (int(round(float(ball[0]))), int(round(float(ball[1]))))
+    tip = (
+        int(round(origin[0] + direction[0] * speed * scale_px)),
+        int(round(origin[1] + direction[1] * speed * scale_px)),
+    )
+    cv2.arrowedLine(frame, origin, tip, color, 2, tipLength=0.35)
+    label_pos = (
+        int(round((origin[0] + tip[0]) / 2 - 20)),
+        int(round((origin[1] + tip[1]) / 2 - 10)),
+    )
+    draw_text_shadow(frame, speed_label, label_pos, font_scale=0.55, color_bgr=color)
+    return frame
 
 
 def _valid_pitch_cm(

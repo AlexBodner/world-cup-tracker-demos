@@ -94,6 +94,30 @@ def main() -> None:
         default=16,
         help="Outfield team flip only after N consecutive jersey disagrees (tracklet lock)",
     )
+    parser.add_argument(
+        "--show-speed",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Show Kalman ground speed (km/h) near each joystick dot",
+    )
+    parser.add_argument(
+        "--min-speed-kmh",
+        type=float,
+        default=4.0,
+        help="Hide speed label below this ground speed (km/h)",
+    )
+    parser.add_argument(
+        "--speed-homography-weight",
+        type=float,
+        default=0.3,
+        help="Blend homography vs player-height speed (0=height only, 1=homography only)",
+    )
+    parser.add_argument(
+        "--speed-smooth-alpha",
+        type=float,
+        default=0.22,
+        help="EMA weight on displayed km/h labels (lower = smoother)",
+    )
     parser.add_argument("--refresh-detections-cache", action="store_true")
     args = parser.parse_args()
 
@@ -117,6 +141,10 @@ def main() -> None:
         dot_smooth_alpha=args.dot_smooth_alpha,
         width_smooth_alpha=args.width_smooth_alpha,
         team_flip_after=args.team_flip_after,
+        show_speed=args.show_speed,
+        min_speed_kmh=args.min_speed_kmh,
+        speed_homography_weight=args.speed_homography_weight,
+        speed_smooth_alpha=args.speed_smooth_alpha,
     )
     manifest["output"] = out_path
     print(json.dumps(manifest, indent=2))

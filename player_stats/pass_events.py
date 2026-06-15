@@ -16,7 +16,8 @@ Simple rule set (per team, frame by frame)
    - longer gaps still need ``min_arrival_control_frames`` with the ball at
      the feet (filters early credit while the ball is still travelling in).
 4. **Emit pass** — same team, frame gap in range, min ball travel, no opponent
-   *control* between passer and receiver, dedupe nearby duplicates.
+   *touch* (control or reception) between passer and receiver, dedupe nearby
+   duplicates.
 5. **Emit turnover** — team A releases the ball; an opponent touches it before
    any teammate of A arrives (snapshot release on first opponent touch). When
    that opponent later completes a pass, attribute the turnover to their
@@ -88,7 +89,7 @@ class PassDetectionConfig:
     """
 
     min_carrier_gap_frames: int = 1
-    max_pass_gap_frames: int = 75  # ~3 s at 25 fps; tolerates ball-detection dropouts
+    max_pass_gap_frames: int = 110  # ~4.4 s at 25 fps; long aerials + ball dropouts
     min_ball_travel_m: float = 1.0
     min_ball_travel_px: float = 25.0
     control_max_distance_m: float = CONTROL_MAX_DISTANCE_M
@@ -106,6 +107,13 @@ class PassDetectionConfig:
     adjacent_pass_max_gap_frames: int = 15  # quick plays need control at receiver
     aerial_dy_threshold_px: float = AERIAL_DY_THRESHOLD_PX
     max_plausible_travel_m: float = 40.0
+    min_long_gap_opponent_control_streak: int = 2
+    transit_min_speed_m_s: float = 9.0
+    transit_min_feet_px: float = 30.0
+    transit_min_speed_px_per_frame: float = 10.0
+    max_plausible_transit_speed_m_s: float = 35.0
+    ball_speed_lookback_frames: int = 10
+    ball_speed_min_lookback_frames: int = 3
 
     def for_frame_rate(self, fps: float, *, base_fps: float = 25.0) -> PassDetectionConfig:
         """Scale time-based frame counts for a different video frame rate."""
@@ -140,10 +148,29 @@ class PassDetectionConfig:
             ),
             aerial_dy_threshold_px=self.aerial_dy_threshold_px,
             max_plausible_travel_m=self.max_plausible_travel_m,
+            min_long_gap_opponent_control_streak=self.min_long_gap_opponent_control_streak,
+            transit_min_speed_m_s=self.transit_min_speed_m_s,
+            transit_min_feet_px=self.transit_min_feet_px,
+            transit_min_speed_px_per_frame=self.transit_min_speed_px_per_frame,
+            max_plausible_transit_speed_m_s=self.max_plausible_transit_speed_m_s,
+            ball_speed_lookback_frames=max(
+                1, round(self.ball_speed_lookback_frames * scale)
+            ),
+            ball_speed_min_lookback_frames=max(
+                1, round(self.ball_speed_min_lookback_frames * scale)
+            ),
         )
 
     def touch_validation_config(self) -> TouchValidationConfig:
-        return TouchValidationConfig(aerial_dy_threshold_px=self.aerial_dy_threshold_px)
+        return TouchValidationConfig(
+            aerial_dy_threshold_px=self.aerial_dy_threshold_px,
+            transit_min_speed_m_s=self.transit_min_speed_m_s,
+            transit_min_feet_px=self.transit_min_feet_px,
+            transit_min_speed_px_per_frame=self.transit_min_speed_px_per_frame,
+            max_plausible_transit_speed_m_s=self.max_plausible_transit_speed_m_s,
+            ball_speed_lookback_frames=self.ball_speed_lookback_frames,
+            ball_speed_min_lookback_frames=self.ball_speed_min_lookback_frames,
+        )
 
     def tracking_config(self) -> CarrierTrackingConfig:
         return CarrierTrackingConfig(
@@ -387,6 +414,242 @@ def _effective_ball_travel(
     return travel
 
 
+def _ball_speed_reference(
+    frames_by_idx: dict[int, sv.Detections],
+    frame_idx: int,
+    *,
+    max_lookback: int,
+    min_lookback: int = 3,
+    transformers: dict[int, object] | None = None,
+    metric: bool = False,
+) -> tuple[np.ndarray | None, int, object | None]:
+    """Nearest prior ball position when the previous frame has no detection (up to ``max_lookback``)."""
+    for gap in range(max(min_lookback, 2), max_lookback + 1):
+        older = frames_by_idx.get(frame_idx - gap)
+        if older is None:
+            continue
+        older_ball = ball_xy(older)
+        if older_ball is None:
+            continue
+        prev_t = transformers.get(frame_idx - gap) if metric and transformers else None
+        return np.asarray(older_ball, dtype=np.float64), gap, prev_t
+    return None, 1, None
+
+
+def _touch_validation_kwargs(
+    frames_by_idx: dict[int, sv.Detections],
+    frame_idx: int,
+    *,
+    transformers: dict[int, object],
+    metric: bool,
+    fps: float,
+    max_lookback: int = 10,
+    min_lookback: int = 3,
+) -> dict:
+    transformer = transformers.get(frame_idx) if metric else None
+    prev = frames_by_idx.get(frame_idx - 1)
+    prev_ball = ball_xy(prev) if prev is not None else None
+    prev_transformer = (
+        transformers.get(frame_idx - 1) if metric and prev_ball is not None else None
+    )
+    speed_prev_ball = (
+        np.asarray(prev_ball, dtype=np.float64) if prev_ball is not None else None
+    )
+    speed_frame_gap = 1
+    speed_prev_transformer = prev_transformer
+    if speed_prev_ball is None and transformer is None:
+        speed_prev_ball, speed_frame_gap, speed_prev_transformer = _ball_speed_reference(
+            frames_by_idx,
+            frame_idx,
+            max_lookback=max_lookback,
+            min_lookback=min_lookback,
+            transformers=transformers,
+            metric=metric,
+        )
+    return {
+        "prev_ball": np.asarray(prev_ball, dtype=np.float64) if prev_ball is not None else None,
+        "speed_prev_ball": speed_prev_ball,
+        "speed_frame_gap": speed_frame_gap,
+        "speed_prev_transformer": speed_prev_transformer,
+        "fps": fps,
+        "transformer": transformer,
+    }
+
+
+def _first_opponent_touch_in_window(
+    frames_by_idx: dict[int, sv.Detections],
+    *,
+    start_frame: int,
+    end_frame: int,
+    passer_team: int,
+    config: PassDetectionConfig,
+    transformers: dict[int, object],
+    metric: bool,
+    require_control: bool = False,
+    player_tid: int | None = None,
+    fps: float = 25.0,
+) -> tuple[int, int, str] | None:
+    """First ``(frame, opponent_tid, touch_kind)`` matching the demo opponent-touch gate."""
+    touch_cfg = config.touch_validation_config()
+    for frame_idx in range(start_frame + 1, end_frame):
+        dets = frames_by_idx.get(frame_idx)
+        if dets is None:
+            continue
+        transformer = transformers.get(frame_idx) if metric else None
+        carrier, touch_kind = _active_carrier(
+            dets, transformer=transformer, config=config
+        )
+        touch_kind = touch_kind or "reception"
+        if carrier is None or int(carrier.team) == passer_team:
+            continue
+        if require_control and touch_kind != "control":
+            continue
+        if dets.tracker_id is None:
+            continue
+        tid = int(dets.tracker_id[carrier.index])
+        if player_tid is not None and tid != player_tid:
+            continue
+        if not is_valid_possession_touch(
+            dets,
+            carrier,
+            touch_kind=touch_kind,
+            config=touch_cfg,
+            **_touch_validation_kwargs(
+                frames_by_idx,
+                frame_idx,
+                transformers=transformers,
+                metric=metric,
+                fps=fps,
+                max_lookback=config.ball_speed_lookback_frames,
+                min_lookback=config.ball_speed_min_lookback_frames,
+            ),
+        ):
+            continue
+        return frame_idx, tid, touch_kind
+    return None
+
+
+def _opponent_control_streak_between(
+    frames_by_idx: dict[int, sv.Detections],
+    *,
+    start_frame: int,
+    end_frame: int,
+    passer_team: int,
+    config: PassDetectionConfig,
+    transformers: dict[int, object],
+    metric: bool,
+    min_streak: int,
+    fps: float = 25.0,
+) -> bool:
+    """True if an opponent had ``min_streak`` consecutive control frames in window."""
+    touch_cfg = config.touch_validation_config()
+    streak = 0
+    for frame_idx in range(start_frame + 1, end_frame):
+        dets = frames_by_idx.get(frame_idx)
+        if dets is None:
+            streak = 0
+            continue
+        transformer = transformers.get(frame_idx) if metric else None
+        carrier, touch_kind = _active_carrier(
+            dets, transformer=transformer, config=config
+        )
+        touch_kind = touch_kind or "reception"
+        if carrier is None or int(carrier.team) == passer_team:
+            streak = 0
+            continue
+        if touch_kind != "control":
+            streak = 0
+            continue
+        if not is_valid_possession_touch(
+            dets,
+            carrier,
+            touch_kind=touch_kind,
+            config=touch_cfg,
+            **_touch_validation_kwargs(
+                frames_by_idx,
+                frame_idx,
+                transformers=transformers,
+                metric=metric,
+                fps=fps,
+                max_lookback=config.ball_speed_lookback_frames,
+                min_lookback=config.ball_speed_min_lookback_frames,
+            ),
+        ):
+            streak = 0
+            continue
+        streak += 1
+        if streak >= min_streak:
+            return True
+    return False
+
+
+def _opponent_blocks_between(
+    frames_by_idx: dict[int, sv.Detections],
+    *,
+    start_frame: int,
+    end_frame: int,
+    passer_team: int,
+    gap_frames: int,
+    config: PassDetectionConfig,
+    transformers: dict[int, object],
+    metric: bool,
+    fps: float = 25.0,
+) -> bool:
+    """Short gaps: any opponent touch; long gaps: sustained opponent control."""
+    if gap_frames >= config.adjacent_pass_max_gap_frames:
+        return _opponent_control_streak_between(
+            frames_by_idx,
+            start_frame=start_frame,
+            end_frame=end_frame,
+            passer_team=passer_team,
+            config=config,
+            transformers=transformers,
+            metric=metric,
+            min_streak=config.min_long_gap_opponent_control_streak,
+            fps=fps,
+        )
+    return _opponent_touch_between(
+        frames_by_idx,
+        start_frame=start_frame,
+        end_frame=end_frame,
+        passer_team=passer_team,
+        config=config,
+        transformers=transformers,
+        metric=metric,
+        require_control=False,
+        fps=fps,
+    )
+
+
+def _opponent_touch_between(
+    frames_by_idx: dict[int, sv.Detections],
+    *,
+    start_frame: int,
+    end_frame: int,
+    passer_team: int,
+    config: PassDetectionConfig,
+    transformers: dict[int, object],
+    metric: bool,
+    require_control: bool = False,
+    fps: float = 25.0,
+) -> bool:
+    """True if an opponent had a valid touch between two teammate beats."""
+    return (
+        _first_opponent_touch_in_window(
+            frames_by_idx,
+            start_frame=start_frame,
+            end_frame=end_frame,
+            passer_team=passer_team,
+            config=config,
+            transformers=transformers,
+            metric=metric,
+            require_control=require_control,
+            fps=fps,
+        )
+        is not None
+    )
+
+
 def _opponent_control_between(
     frames_by_idx: dict[int, sv.Detections],
     *,
@@ -396,23 +659,20 @@ def _opponent_control_between(
     config: PassDetectionConfig,
     transformers: dict[int, object],
     metric: bool,
+    fps: float = 25.0,
 ) -> bool:
     """True if an opponent had sustained control between two teammate touches."""
-    for frame_idx in range(start_frame + 1, end_frame):
-        dets = frames_by_idx.get(frame_idx)
-        if dets is None:
-            continue
-        transformer = transformers.get(frame_idx) if metric else None
-        carrier, touch_kind = _active_carrier(
-            dets, transformer=transformer, config=config
-        )
-        if (
-            carrier is not None
-            and touch_kind == "control"
-            and int(carrier.team) != passer_team
-        ):
-            return True
-    return False
+    return _opponent_touch_between(
+        frames_by_idx,
+        start_frame=start_frame,
+        end_frame=end_frame,
+        passer_team=passer_team,
+        config=config,
+        transformers=transformers,
+        metric=metric,
+        require_control=True,
+        fps=fps,
+    )
 
 
 def _min_travel_threshold(config: PassDetectionConfig, *, metric: bool) -> float:
@@ -544,6 +804,7 @@ def _bridge_missing_ball(
     frames_by_idx: dict[int, sv.Detections],
     transformers: dict[int, object],
     metric: bool,
+    fps: float = 25.0,
 ) -> None:
     """Brief ball dropout: keep release anchor and arrival streak (like in-flight)."""
     for team_id, state in team_states.items():
@@ -559,6 +820,7 @@ def _bridge_missing_ball(
                 frames_by_idx=frames_by_idx,
                 transformers=transformers,
                 metric=metric,
+                fps=fps,
             )
         state.in_flight = True
 
@@ -567,6 +829,8 @@ def _end_missing_ball_bridge(team_states: dict[int, _TeamPossessionState]) -> No
     """Ball gone too long — stop bridging and let stale-release expiry run."""
     for state in team_states.values():
         state.in_flight = False
+        if state.release is not None:
+            continue
         state.arrival_candidate_tid = -1
         state.arrival_streak = 0
         state.arrival_control_streak = 0
@@ -582,6 +846,7 @@ def _promote_pre_flight_release(
     frames_by_idx: dict[int, sv.Detections] | None = None,
     transformers: dict[int, object] | None = None,
     metric: bool = False,
+    fps: float = 25.0,
 ) -> None:
     """Credit a brief touch as the passer when the ball immediately goes in-flight."""
     if state.last_touch is None:
@@ -606,26 +871,29 @@ def _promote_pre_flight_release(
             and frames_by_idx is not None
             and transformers is not None
         ):
-            opponent_between = _opponent_control_between(
+            opponent_between = _opponent_blocks_between(
                 frames_by_idx,
                 start_frame=release_frame,
                 end_frame=touch_frame,
                 passer_team=team,
+                gap_frames=touch_frame - release_frame,
                 config=config,
                 transformers=transformers,
                 metric=metric,
+                fps=fps,
             )
         other_in_play = (
             other_state is not None
             and other_state.release is not None
             and touch_frame > other_state.release[0]
         )
-        if not opponent_between and not other_in_play:
-            return
-        state.release = (touch_frame, touch_dets, touch_carrier, touch_tid)
-        state.arrival_candidate_tid = -1
-        state.arrival_streak = 0
-        state.arrival_control_streak = 0
+        if opponent_between or other_in_play:
+            # Opponent has the ball or a teammate deflected en route — drop the
+            # stale passer anchor; a fly-by near another teammate is not a new pass.
+            state.release = None
+            state.arrival_candidate_tid = -1
+            state.arrival_streak = 0
+            state.arrival_control_streak = 0
         return
     if state.release is not None:
         return
@@ -656,6 +924,8 @@ def _confirm_release(
     tid: int,
 ) -> None:
     state.release = (frame_idx, dets, carrier, tid)
+    if state.turnover_snapshot is not None:
+        state.turnover_snapshot = (frame_idx, tid)
 
 
 def _recent_turnover_duplicate(
@@ -785,8 +1055,10 @@ def _first_valid_touch_frame(
     config: PassDetectionConfig,
     transformers: dict[int, object],
     metric: bool,
+    fps: float = 25.0,
 ) -> int | None:
     """First frame in ``(start_frame, end_frame)`` where ``player_tid`` has a valid touch."""
+    touch_cfg = config.touch_validation_config()
     for frame_idx in range(start_frame + 1, end_frame):
         dets = frames_by_idx.get(frame_idx)
         if dets is None:
@@ -797,7 +1069,19 @@ def _first_valid_touch_frame(
         )
         touch_kind = touch_kind or "reception"
         if carrier is None or not is_valid_possession_touch(
-            dets, carrier, touch_kind=touch_kind, config=config.touch_validation_config()
+            dets,
+            carrier,
+            touch_kind=touch_kind,
+            config=touch_cfg,
+            **_touch_validation_kwargs(
+                frames_by_idx,
+                frame_idx,
+                transformers=transformers,
+                metric=metric,
+                fps=fps,
+                max_lookback=config.ball_speed_lookback_frames,
+                min_lookback=config.ball_speed_min_lookback_frames,
+            ),
         ):
             continue
         if dets.tracker_id is None:
@@ -814,6 +1098,7 @@ def scan_possession_events(
     config: PassDetectionConfig = PassDetectionConfig(),
     metric: bool = True,
     transformers: dict[int, object] | None = None,
+    fps: float = 25.0,
 ) -> PossessionScanResult:
     """Scan tracked detections for passes (rule 4) and turnovers (rule 5)."""
     transformers = transformers or {}
@@ -860,7 +1145,19 @@ def scan_possession_events(
 
         touch_kind = touch_kind or "reception"
         if carrier is None or not is_valid_possession_touch(
-            dets, carrier, touch_kind=touch_kind, config=config.touch_validation_config()
+            dets,
+            carrier,
+            touch_kind=touch_kind,
+            config=config.touch_validation_config(),
+            **_touch_validation_kwargs(
+                frames_by_idx,
+                frame_idx,
+                transformers=transformers,
+                metric=metric,
+                fps=fps,
+                max_lookback=config.ball_speed_lookback_frames,
+                min_lookback=config.ball_speed_min_lookback_frames,
+            ),
         ):
             if ball is not None:
                 for team_id, state in team_states.items():
@@ -874,11 +1171,13 @@ def scan_possession_events(
                             frames_by_idx=frames_by_idx,
                             transformers=transformers,
                             metric=metric,
+                            fps=fps,
                         )
                     state.in_flight = True
-                    state.arrival_candidate_tid = -1
-                    state.arrival_streak = 0
-                    state.arrival_control_streak = 0
+                    if state.release is None:
+                        state.arrival_candidate_tid = -1
+                        state.arrival_streak = 0
+                        state.arrival_control_streak = 0
             elif missing_ball_streak <= config.missing_ball_tolerance:
                 _bridge_missing_ball(
                     team_states,
@@ -887,6 +1186,7 @@ def scan_possession_events(
                     frames_by_idx=frames_by_idx,
                     transformers=transformers,
                     metric=metric,
+                    fps=fps,
                 )
             else:
                 _end_missing_ball_bridge(team_states)
@@ -902,7 +1202,6 @@ def scan_possession_events(
         if (
             other_state.release is not None
             and frame_idx > other_state.release[0]
-            and other_state.turnover_snapshot is None
         ):
             other_state.turnover_snapshot = (
                 other_state.release[0],
@@ -959,14 +1258,16 @@ def scan_possession_events(
         if not arrival_ready:
             continue
 
-        opponent_blocked = _opponent_control_between(
+        opponent_blocked = _opponent_blocks_between(
             frames_by_idx,
             start_frame=release_frame,
             end_frame=frame_idx,
             passer_team=team,
+            gap_frames=gap_frames,
             config=config,
             transformers=transformers,
             metric=metric,
+            fps=fps,
         )
         if opponent_blocked:
             # Stale anchors survive opponent possession; credit the arriving teammate
@@ -998,13 +1299,16 @@ def scan_possession_events(
                 losing_release_frame, losing_passer_tid = snapshot
                 intercept_frame = _first_valid_touch_frame(
                     frames_by_idx,
-                    player_tid=tid,
+                    player_tid=release_tid,
                     start_frame=losing_release_frame,
                     end_frame=frame_idx,
                     config=config,
                     transformers=transformers,
                     metric=metric,
+                    fps=fps,
                 )
+                if intercept_frame is None:
+                    intercept_frame = release_frame
                 if intercept_frame is not None and _opponent_control_between(
                     frames_by_idx,
                     start_frame=losing_release_frame,
@@ -1013,10 +1317,11 @@ def scan_possession_events(
                     config=config,
                     transformers=transformers,
                     metric=metric,
+                    fps=fps,
                 ):
                     _try_emit_turnover(
                         losing,
-                        interceptor_tid=tid,
+                        interceptor_tid=release_tid,
                         interceptor_team=team,
                         interception_frame=intercept_frame,
                         turnovers=turnovers,

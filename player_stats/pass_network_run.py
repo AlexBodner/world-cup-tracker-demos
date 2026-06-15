@@ -99,6 +99,7 @@ def analyze_pass_network(
         config=config,
         metric=metric,
         transformers=scorer._transformers,
+        fps=float(sequence.frame_rate),
     )
     return build_pass_network(
         sequence.name,

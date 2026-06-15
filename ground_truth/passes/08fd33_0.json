@@ -1,0 +1,22 @@
+{
+  "sequence": "08fd33_0",
+  "source": "current pass_network output (approved)",
+  "passes": [
+    {"passer_tid": 18, "receiver_tid": 2},
+    {"passer_tid": 2, "receiver_tid": 8},
+    {"passer_tid": 8, "receiver_tid": 10},
+    {"passer_tid": 10, "receiver_tid": 20},
+    {"passer_tid": 20, "receiver_tid": 14},
+    {"passer_tid": 3, "receiver_tid": 27},
+    {"passer_tid": 27, "receiver_tid": 3},
+    {"passer_tid": 3, "receiver_tid": 16},
+    {"passer_tid": 16, "receiver_tid": 6}
+  ],
+  "turnovers": [
+    {
+      "passer_tid": 14,
+      "interceptor_tid": 3,
+      "notes": "#14 release intercepted by #3"
+    }
+  ]
+}

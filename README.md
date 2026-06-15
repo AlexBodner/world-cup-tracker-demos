@@ -333,7 +333,7 @@ receiver.team == passer.team
 1 ≤ gap ≤ 75 frames                    # ~3 s at 25 fps
 ball_travel ≥ 1.0 m   (or ≥ 25 px)    # warp release→arrival ball positions
 NOT duplicate(passer, receiver) within 12 frames
-NOT opponent_control_between(release_frame, arrival_frame)
+NOT opponent_touch_between(release_frame, arrival_frame)
   → ∃ frame in (release, arrival) where opponent has touch_kind == "control"
 ```
 

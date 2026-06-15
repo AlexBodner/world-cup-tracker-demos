@@ -393,9 +393,8 @@ def decompose_lane_score(
     teammate_penalty = _teammate_lane_penalty_amount(
         option.teammate_openness, weights, open_ref=tm_ref
     )
-    delta = option.receiver_xy - carrier_feet
-    backward_run_penalty, _ = _backward_motion_penalty(
-        delta, carrier_motion_dir, weights
+    backward_run_penalty = _backward_motion_penalty_from_align(
+        float(option.motion_alignment), weights
     )
     attack = attack_dir if attack_dir is not None else np.array([1.0, 0.0], dtype=np.float32)
     backward_attack_penalty = _backward_attack_penalty(
@@ -414,6 +413,20 @@ def decompose_lane_score(
     )
 
 
+def _backward_motion_penalty_from_align(
+    align: float,
+    weights: PassWeights,
+) -> float:
+    """Run-direction penalty from pass·run cosine (same formula as main demo)."""
+    if weights.backward_penalty <= 0:
+        return 0.0
+    if align >= weights.backward_cos_threshold:
+        return 0.0
+    span = 1.0 - weights.backward_cos_threshold
+    severity = min(1.0, (weights.backward_cos_threshold - align) / span)
+    return weights.backward_penalty * severity
+
+
 def _backward_motion_penalty(
     pass_delta: np.ndarray,
     motion_dir: np.ndarray | None,
@@ -426,11 +439,7 @@ def _backward_motion_penalty(
     if length < 1e-6:
         return 0.0, 0.0
     align = float(unit(pass_delta) @ motion_dir)
-    if align >= weights.backward_cos_threshold:
-        return 0.0, align
-    span = 1.0 - weights.backward_cos_threshold
-    severity = min(1.0, (weights.backward_cos_threshold - align) / span)
-    return weights.backward_penalty * severity, align
+    return _backward_motion_penalty_from_align(align, weights), align
 
 
 def _backward_attack_penalty(

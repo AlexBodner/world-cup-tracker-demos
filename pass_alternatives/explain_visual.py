@@ -147,11 +147,15 @@ def _draw_step_badge(
     layout: Literal["talk", "social"],
 ) -> None:
     pad, badge_w, badge_h, scale, _w = _badge_box(canvas, layout)
+    if subtitle and not _PRESENTATION:
+        badge_h = int(66 + 6 * scale)
     x1 = pad + badge_w
     y1 = pad + badge_h
     cv2.rectangle(canvas, (pad, pad), (x1, y1), _STEP_BADGE_BGR, -1)
     cv2.rectangle(canvas, (pad, pad), (x1, y1), (55, 55, 65), 1)
     cv2.rectangle(canvas, (pad, pad), (pad + 5, y1), ROBOFLOW_PURPLE_BGR, -1)
+    from world_cup_projects.common.visual import cv2_safe_text
+
     draw_text_shadow(
         canvas,
         f"STEP {step}/{total}",
@@ -162,7 +166,7 @@ def _draw_step_badge(
     )
     draw_text_shadow(
         canvas,
-        title,
+        cv2_safe_text(title),
         (pad + 14, pad + int(38 * scale)),
         font_scale=0.62 * scale,
         color_bgr=(255, 255, 255),
@@ -171,9 +175,9 @@ def _draw_step_badge(
     if subtitle and not _PRESENTATION:
         draw_text_shadow(
             canvas,
-            subtitle,
-            (pad + int(20 * scale), pad + int(82 * scale)),
-            font_scale=0.46 * scale,
+            cv2_safe_text(subtitle),
+            (pad + 14, pad + int(58 * scale)),
+            font_scale=0.44 * scale,
             color_bgr=(175, 175, 185),
             thickness=1,
         )
@@ -230,6 +234,7 @@ def _draw_score_bar(
     bar_w: int,
     scale: float,
     negative: bool = False,
+    panel_right: int | None = None,
 ) -> int:
     """One compact row: label | bar | value."""
     bar_h = 11
@@ -249,13 +254,20 @@ def _draw_score_bar(
         thickness=1,
     )
     sign = "-" if negative and value > 0.005 else ""
+    value_text = f"{sign}{abs(value):.2f}"
+    font_scale = 0.38 * scale
+    thickness = 1
+    (tw, _), _ = cv2.getTextSize(value_text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
+    value_x = bar_x + bar_w + 8
+    if panel_right is not None:
+        value_x = min(value_x, panel_right - 8 - tw)
     draw_text_shadow(
         canvas,
-        f"{sign}{abs(value):.2f}",
-        (bar_x + bar_w + 8, y),
-        font_scale=0.38 * scale,
+        value_text,
+        (value_x, y),
+        font_scale=font_scale,
         color_bgr=bar_color,
-        thickness=1,
+        thickness=thickness,
     )
     return y + int(26 * scale)
 
@@ -280,7 +292,7 @@ def _draw_scoring_panel(
             ("RUN", breakdown.backward_run_penalty),
             ("BACK", breakdown.backward_attack_penalty),
         )
-        if pen > 0.005
+        if label == "RUN" or pen > 0.005
     ]
     row_count = 3 + len(penalties)
     ph = int(36 * scale + row_count * 26 * scale)
@@ -317,7 +329,8 @@ def _draw_scoring_panel(
         y = _draw_score_bar(
             canvas, px + 12, y, label, pen, 0.22,
             color=_REJECT_BGR, label_w=label_w, bar_w=bar_w, scale=scale,
-            negative=True,
+            negative=pen > 0.005,
+            panel_right=px + pw,
         )
 
 

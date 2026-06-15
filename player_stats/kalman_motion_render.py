@@ -17,6 +17,7 @@ from world_cup_projects.common.soccernet import ROLE_GOALKEEPER, ROLE_PLAYER
 from world_cup_projects.common.tracking_facing import (
     EllipseWidthSmoother,
     JoystickDotSmoother,
+    KalmanSpeedDisplaySmoother,
     KalmanVelocitySmoother,
     detections_have_kalman_velocity,
     kalman_velocity_arrays,
@@ -108,6 +109,27 @@ def _patch_goalkeeper_teams_if_needed(
     return apply_goalkeeper_teams_by_goal(dets, transformer)
 
 
+def _build_frame_transformers(
+    keypoints: dict[int, object] | None,
+    *,
+    pitch_confidence: float = 0.9,
+) -> dict[int, object]:
+    """Per-frame pitch homographies for metric Kalman speed."""
+    from world_cup_projects.common.pitch import homography_from_keypoints_radar
+
+    if not keypoints:
+        return {}
+    transformers: dict[int, object] = {}
+    for frame_idx, kp in keypoints.items():
+        transformer = homography_from_keypoints_radar(
+            kp,
+            confidence=pitch_confidence,
+        )
+        if transformer is not None:
+            transformers[int(frame_idx)] = transformer
+    return transformers
+
+
 def _attach_kalman_velocity(
     dets: sv.Detections,
     player_tracker,
@@ -155,6 +177,11 @@ def render_kalman_motion_video(
     dot_smooth_alpha: float = 0.32,
     width_smooth_alpha: float = 0.22,
     team_flip_after: int = 16,
+    show_speed: bool = True,
+    min_speed_kmh: float = 4.0,
+    speed_homography_weight: float = 0.3,
+    speed_smooth_alpha: float = 0.22,
+    pitch_confidence: float = 0.9,
 ) -> dict:
     """Write an MP4 with team ellipses and Kalman joystick dots on each frame."""
     frame_list = list(_iter_frames(sequence, detections_source, max_frames=max_frames))
@@ -175,6 +202,10 @@ def render_kalman_motion_video(
     _stabilize_goalkeeper_teams(
         sequence, frame_list, pitch_device=pitch_device, keypoints=keypoints
     )
+    transformers = _build_frame_transformers(
+        keypoints, pitch_confidence=pitch_confidence
+    )
+    fps = float(sequence.frame_rate)
 
     use_cached_kalman = bool(
         frame_list and detections_have_kalman_velocity(frame_list[0][1])
@@ -217,6 +248,11 @@ def render_kalman_motion_video(
 
     velocity_smoother = KalmanVelocitySmoother(alpha=smooth_alpha)
     dot_smoother = JoystickDotSmoother(alpha=dot_smooth_alpha)
+    speed_smoother = (
+        KalmanSpeedDisplaySmoother(alpha=speed_smooth_alpha)
+        if show_speed
+        else None
+    )
     width_smoother = EllipseWidthSmoother(alpha=width_smooth_alpha)
     n_frames = 0
     n_dots = 0
@@ -239,6 +275,12 @@ def render_kalman_motion_video(
             min_speed_px=min_speed_px,
             max_speed_px=max_speed_px,
             dot_smoother=dot_smoother,
+            speed_smoother=speed_smoother,
+            transformer=transformers.get(int(frame_idx)),
+            fps=fps,
+            show_speed=show_speed,
+            min_speed_kmh=min_speed_kmh,
+            speed_homography_weight=speed_homography_weight,
         )
         if dets.data is not None:
             teams = dets.data.get("team", np.full(len(dets), -1))
@@ -267,5 +309,9 @@ def render_kalman_motion_video(
         "dot_smooth_alpha": dot_smooth_alpha,
         "width_smooth_alpha": width_smooth_alpha,
         "team_flip_after": team_flip_after,
+        "show_speed": show_speed,
+        "min_speed_kmh": min_speed_kmh,
+        "speed_homography_weight": speed_homography_weight,
+        "speed_smooth_alpha": speed_smooth_alpha,
         "encoder": "h264" if use_h264_stream else "mp4v",
     }

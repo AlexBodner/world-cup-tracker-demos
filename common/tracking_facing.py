@@ -11,6 +11,8 @@ from world_cup_projects.common.player_tracker import TrackerKind, create_player_
 from world_cup_projects.common.soccernet import ROLE_GOALKEEPER, ROLE_PLAYER
 
 DEFAULT_MIN_SPEED_PX = 0.5
+PLAYER_HEIGHT_M = 1.8
+DEFAULT_SPEED_HOMOGRAPHY_WEIGHT = 0.3
 
 
 def kalman_velocity_by_tracker_id(tracker, *, min_speed: float = DEFAULT_MIN_SPEED_PX) -> dict[int, np.ndarray]:
@@ -111,6 +113,74 @@ def carrier_kalman_direction(
     if float(np.linalg.norm(delta)) < 1e-6:
         return unit(vel_img)
     return unit(delta)
+
+
+def kalman_ground_speed_m_s(
+    feet_px: np.ndarray,
+    vel_px: np.ndarray,
+    transformer,
+    *,
+    fps: float,
+    box_height_px: float | None = None,
+    min_speed_px: float = DEFAULT_MIN_SPEED_PX,
+    homography_weight: float = DEFAULT_SPEED_HOMOGRAPHY_WEIGHT,
+) -> float | None:
+    """Ground speed (m/s) from Kalman image velocity.
+
+    Blends pitch-homography displacement with a player-height meters-per-pixel
+    estimate so broadcast homography scale error does not inflate labels.
+    """
+    vel = np.asarray(vel_px, dtype=np.float64).reshape(2)
+    vx, vy = float(vel[0]), float(vel[1])
+    if not np.isfinite(vx) or not np.isfinite(vy) or fps <= 0:
+        return None
+    speed_px = float(np.hypot(vx, vy))
+    if speed_px < min_speed_px:
+        return None
+
+    homo_ms: float | None = None
+    if transformer is not None:
+        from world_cup_projects.common.pitch import image_to_pitch_m
+
+        feet = np.asarray(feet_px, dtype=np.float64).reshape(2)
+        p0 = image_to_pitch_m(feet.reshape(1, 2), transformer)
+        p1 = image_to_pitch_m((feet + vel).reshape(1, 2), transformer)
+        if p0 is not None and p1 is not None:
+            delta_m = p1[0] - p0[0]
+            speed_m_per_frame = float(np.linalg.norm(delta_m))
+            if speed_m_per_frame >= 1e-9:
+                homo_ms = speed_m_per_frame * float(fps)
+
+    height_ms: float | None = None
+    if box_height_px is not None and box_height_px > 1.0:
+        mpp = PLAYER_HEIGHT_M / float(box_height_px)
+        height_ms = speed_px * mpp * float(fps)
+
+    if homo_ms is None and height_ms is None:
+        return None
+    if homo_ms is None:
+        return height_ms
+    if height_ms is None:
+        return homo_ms
+    w = float(np.clip(homography_weight, 0.0, 1.0))
+    return w * homo_ms + (1.0 - w) * height_ms
+
+
+class KalmanSpeedDisplaySmoother:
+    """EMA on displayed ground speed (m/s) per track."""
+
+    def __init__(self, *, alpha: float = 0.3) -> None:
+        self.alpha = float(np.clip(alpha, 0.05, 1.0))
+        self._speed: dict[int, float] = {}
+
+    def smooth(self, tracker_id: int, speed_m_s: float) -> float:
+        if tracker_id < 0:
+            return float(speed_m_s)
+        a = self.alpha
+        if tracker_id in self._speed:
+            speed_m_s = a * float(speed_m_s) + (1.0 - a) * self._speed[tracker_id]
+        self._speed[tracker_id] = float(speed_m_s)
+        return float(speed_m_s)
 
 
 def detections_have_kalman_velocity(detections: sv.Detections) -> bool:

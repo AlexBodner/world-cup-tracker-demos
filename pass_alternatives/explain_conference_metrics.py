@@ -25,7 +25,6 @@ from world_cup_projects.pass_alternatives.explain_visual import (
     ExplainContext,
     _PANEL_BG,
     _RANK_BGR,
-    _draw_score_bar,
     _draw_step_badge,
     _ui_scale,
 )
@@ -48,6 +47,7 @@ _RIVAL_BGR = (60, 80, 255)
 _TEAMMATE_BGR = (0, 210, 255)
 _PENALTY_BGR = (70, 70, 220)
 _MOTION_BGR = (180, 255, 120)
+_ANGLE_ARC_BGR = (100, 220, 255)
 _ATTACK_AXIS_BGR = (190, 190, 200)
 _CENTROID_LINE_BGR = (140, 140, 155)
 
@@ -144,6 +144,7 @@ class PenaltyRadarDraw:
     motion_end_cm: np.ndarray | None
     backward_tip_cm: np.ndarray | None
     attack_end_cm: np.ndarray
+    pass_align: float | None = None
 
 
 def _m_per_px(ctx: ExplainContext, option: PassOption) -> float:
@@ -248,6 +249,26 @@ def _attack_unit_from_pitch_cm(
 
 def _radar_pt(point_cm: np.ndarray) -> tuple[int, int]:
     return tuple(pitch_cm_to_radar_px(point_cm.reshape(1, 2))[0])
+
+
+def _carrier_motion_end_cm(
+    ctx: ExplainContext,
+    carrier_cm: np.ndarray,
+    transformer,
+    *,
+    span_m: float = 10.0,
+) -> np.ndarray | None:
+    """Carrier run tip in the same pitch-cm frame as the sports-radar minimap."""
+    if transformer is None:
+        return None
+    from world_cup_projects.common.tracking_facing import carrier_kalman_direction
+
+    motion_m = carrier_kalman_direction(
+        ctx.dets, ctx.carrier.index, transformer=transformer
+    )
+    if motion_m is None:
+        return None
+    return carrier_cm + motion_m * (span_m * 100.0)
 
 
 def build_radar_metric_draw(
@@ -481,7 +502,7 @@ def compute_penalty_geometry(
 
     motion_dir_m = None
     pass_align = float(option.motion_alignment)
-    if breakdown.backward_run_penalty > 0.005 and ctx.carrier_motion_dir is not None:
+    if ctx.carrier_motion_dir is not None:
         motion_dir_m = unit(ctx.carrier_motion_dir.astype(np.float64))
 
     backward_tip_m = None
@@ -506,6 +527,7 @@ def build_penalty_radar_draw(
     pitch_cm: np.ndarray,
     *,
     rank_color: tuple[int, int, int],
+    radar_transformer=None,
 ) -> PenaltyRadarDraw:
     carrier_cm = pitch_cm[ctx.carrier.index]
     receiver_cm = pitch_cm[option.receiver_index]
@@ -517,10 +539,12 @@ def build_penalty_radar_draw(
         teammate_proj_cm = _proj_on_segment_cm(teammate_cm, carrier_cm, receiver_cm)
     motion_end_cm = None
     if penalty.motion_dir_m is not None:
-        motion_end_cm = carrier_cm + penalty.motion_dir_m * (10.0 * 100.0)
+        motion_end_cm = _carrier_motion_end_cm(
+            ctx, carrier_cm, radar_transformer, span_m=10.0
+        )
     backward_tip_cm = None
     if penalty.backward_tip_m is not None:
-        backward_tip_cm = penalty.backward_tip_m * 100.0
+        backward_tip_cm = carrier_cm + attack_m * (float(option.forward_gain) * 100.0)
     return PenaltyRadarDraw(
         rank_color=rank_color,
         carrier_cm=carrier_cm,
@@ -530,6 +554,7 @@ def build_penalty_radar_draw(
         motion_end_cm=motion_end_cm,
         backward_tip_cm=backward_tip_cm,
         attack_end_cm=attack_end_cm,
+        pass_align=penalty.pass_align,
     )
 
 
@@ -762,34 +787,78 @@ def _dashed_line(
         cv2.line(img, a, b, color, thickness, cv2.LINE_AA)
 
 
-def _fmt_lane_clearance(value_m: float, ref_m: float) -> str:
-    if not np.isfinite(value_m) or value_m > ref_m * 3.0:
-        return f">{ref_m:.0f} m"
-    return f"{value_m:.1f} m"
+def _align_angle_deg(cos_align: float) -> float:
+    """Angle between pass and carrier run from pitch-space cosine alignment."""
+    return float(np.degrees(np.arccos(np.clip(cos_align, -1.0, 1.0))))
 
 
-def _draw_single_metric_panel(
+def _draw_angle_arc(
+    img: np.ndarray,
+    vertex: tuple[int, int],
+    pt_a: tuple[int, int],
+    pt_b: tuple[int, int],
+    *,
+    color: tuple[int, int, int],
+    radius_px: float | None = None,
+    thickness: int = 2,
+    num_pts: int = 28,
+) -> None:
+    """Draw a circular arc at ``vertex`` between rays toward ``pt_a`` and ``pt_b``."""
+    v0 = np.array(vertex, dtype=np.float64)
+    va = np.array(pt_a, dtype=np.float64) - v0
+    vb = np.array(pt_b, dtype=np.float64) - v0
+    na, nb = float(np.linalg.norm(va)), float(np.linalg.norm(vb))
+    if na < 1e-6 or nb < 1e-6:
+        return
+    va = va / na
+    vb = vb / nb
+    dot = float(np.clip(va @ vb, -1.0, 1.0))
+    sweep = float(np.arccos(dot))
+    if sweep < np.radians(3.0):
+        return
+    cross = float(va[0] * vb[1] - va[1] * vb[0])
+    if cross < 0.0:
+        sweep = -sweep
+    if abs(sweep) > np.pi:
+        sweep -= np.sign(sweep) * 2.0 * np.pi
+
+    if radius_px is None:
+        radius_px = min(na, nb) * 0.32
+    radius_px = float(np.clip(radius_px, 16.0, 52.0))
+
+    arc_pts: list[tuple[int, int]] = []
+    for t in np.linspace(0.0, 1.0, num_pts):
+        theta = sweep * float(t)
+        c, s = np.cos(theta), np.sin(theta)
+        vr = np.array(
+            (c * va[0] - s * va[1], s * va[0] + c * va[1]),
+            dtype=np.float64,
+        )
+        pt = v0 + vr * radius_px
+        arc_pts.append((int(round(pt[0])), int(round(pt[1]))))
+    if len(arc_pts) >= 2:
+        cv2.polylines(img, [np.array(arc_pts, dtype=np.int32)], False, color, thickness, cv2.LINE_AA)
+
+
+def _draw_step_panel(
     canvas: np.ndarray,
     *,
     label: str,
-    raw: float,
-    ref: float,
-    term: float,
-    weight: float,
+    justification: str,
     color: tuple[int, int, int],
     layout: Literal["talk", "social"],
-    unit: str = "m",
-    detail: str = "",
+    score: float | None = None,
+    negative: bool = False,
 ) -> None:
+    """Compact upper-left panel: title, one-line justification, optional score."""
     from world_cup_projects.common.visual import draw_text_shadow
 
-    h, w = canvas.shape[:2]
     scale = _ui_scale(layout)
     pad = 14
     badge_h = int(46 + 6 * scale)
     px, py = pad, pad + badge_h + 10
-    pw = int(min(w * 0.27, 300))
-    ph = int((104 if detail else 88) * scale)
+    pw = int(min(canvas.shape[1] * 0.27, 280))
+    ph = int(72 * scale)
     overlay = canvas.copy()
     cv2.rectangle(overlay, (px, py), (px + pw, py + ph), _PANEL_BG, -1)
     cv2.rectangle(overlay, (px, py), (px + pw, py + ph), (55, 55, 65), 1)
@@ -797,92 +866,49 @@ def _draw_single_metric_panel(
     draw_text_shadow(
         canvas,
         label,
-        (px + 12, py + int(22 * scale)),
-        font_scale=0.48 * scale,
+        (px + 12, py + int(20 * scale)),
+        font_scale=0.46 * scale,
         color_bgr=color,
         thickness=2,
     )
-    row = 42
-    if detail:
-        draw_text_shadow(
-            canvas,
-            detail,
-            (px + 12, py + int(row * scale)),
-            font_scale=0.34 * scale,
-            color_bgr=(170, 170, 180),
-            thickness=1,
-        )
-        row += 18
-    raw_text = (
-        f"{_fmt_lane_clearance(raw, ref)}  ->  +{term:.2f}"
-        if unit == "m"
-        else f"{raw:.1f} {unit}  ->  +{term:.2f}"
-    )
     draw_text_shadow(
         canvas,
-        raw_text,
-        (px + 12, py + int(row * scale)),
-        font_scale=0.40 * scale,
-        color_bgr=(190, 190, 200),
+        justification,
+        (px + 12, py + int(40 * scale)),
+        font_scale=0.34 * scale,
+        color_bgr=(165, 165, 175),
         thickness=1,
     )
-    label_w = 52
-    bar_w = pw - label_w - 58
-    _draw_score_bar(
-        canvas,
-        px + 12,
-        py + int((row + 20) * scale),
-        "term",
-        term,
-        weight,
-        color=color,
-        label_w=label_w,
-        bar_w=bar_w,
-        scale=scale,
-    )
+    if score is not None:
+        score_color = _PENALTY_BGR if negative else color
+        score_text = f"-{abs(score):.2f}" if negative else f"+{abs(score):.2f}"
+        font_scale = 0.54 * scale
+        thickness = 2
+        (tw, _), _ = cv2.getTextSize(
+            score_text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness
+        )
+        draw_text_shadow(
+            canvas,
+            score_text,
+            (px + pw - 12 - tw, py + int(62 * scale)),
+            font_scale=font_scale,
+            color_bgr=score_color,
+            thickness=thickness,
+        )
 
 
 def _draw_attack_axis_panel(
     canvas: np.ndarray,
-    axis: AttackAxisGeometry,
+    _axis: AttackAxisGeometry,
     *,
     layout: Literal["talk", "social"],
 ) -> None:
-    from world_cup_projects.common.visual import draw_text_shadow
-
-    scale = _ui_scale(layout)
-    pad = 14
-    badge_h = int(46 + 6 * scale)
-    px, py = pad, pad + badge_h + 10
-    pw = int(min(canvas.shape[1] * 0.30, 340))
-    ph = int(96 * scale)
-    overlay = canvas.copy()
-    cv2.rectangle(overlay, (px, py), (px + pw, py + ph), _PANEL_BG, -1)
-    cv2.rectangle(overlay, (px, py), (px + pw, py + ph), (55, 55, 65), 1)
-    canvas[:] = cv2.addWeighted(overlay, 0.92, canvas, 0.08, 0)
-    draw_text_shadow(
+    _draw_step_panel(
         canvas,
-        "ATTACK AXIS",
-        (px + 12, py + int(22 * scale)),
-        font_scale=0.48 * scale,
-        color_bgr=_ATTACK_AXIS_BGR,
-        thickness=2,
-    )
-    draw_text_shadow(
-        canvas,
-        f"mean({axis.n_opp} opp) - mean({axis.n_own} own)",
-        (px + 12, py + int(44 * scale)),
-        font_scale=0.36 * scale,
-        color_bgr=(190, 190, 200),
-        thickness=1,
-    )
-    draw_text_shadow(
-        canvas,
-        "then normalize to unit vector",
-        (px + 12, py + int(64 * scale)),
-        font_scale=0.36 * scale,
-        color_bgr=(170, 170, 180),
-        thickness=1,
+        label="ATTACK AXIS",
+        justification="own centroid → opponent centroid",
+        color=_ATTACK_AXIS_BGR,
+        layout=layout,
     )
 
 
@@ -972,6 +998,8 @@ def _draw_teammate_corridor_outline(
     frame: np.ndarray,
     geom: LaneMetricGeometry,
     transformer,
+    *,
+    color: tuple[int, int, int],
 ) -> None:
     poly_cm = _teammate_corridor_polygon_cm(geom)
     if poly_cm is None:
@@ -982,7 +1010,7 @@ def _draw_teammate_corridor_outline(
     for i in range(4):
         p0 = tuple(poly[i])
         p1 = tuple(poly[(i + 1) % 4])
-        _dashed_line(frame, p0, p1, _TEAMMATE_BGR, thickness=2, gap=10)
+        _dashed_line(frame, p0, p1, color, thickness=2, gap=10)
 
 
 def _draw_teammate_corridor_on_radar(
@@ -1002,7 +1030,7 @@ def _draw_teammate_corridor_on_radar(
     for i in range(4):
         p0 = tuple(poly[i])
         p1 = tuple(poly[(i + 1) % 4])
-        _dashed_line(radar, p0, p1, _TEAMMATE_BGR, thickness=1, gap=6)
+        _dashed_line(radar, p0, p1, draw.rank_color, thickness=1, gap=6)
 
 
 def draw_openness_on_frame(
@@ -1020,7 +1048,7 @@ def draw_openness_on_frame(
     r = _m_to_img(geom.receiver_m, transformer, m_per_px=m_per_px)
     if c is None or r is None:
         return frame
-    _draw_teammate_corridor_outline(frame, geom, transformer)
+    _draw_teammate_corridor_outline(frame, geom, transformer, color=rank_color)
     centers = [c, r]
     rival = proj = None
     if geom.openness_rival_m is not None:
@@ -1088,40 +1116,6 @@ def draw_openness_on_radar(radar: np.ndarray, draw: RadarMetricDraw) -> np.ndarr
     return out
 
 
-def _draw_penalty_panel(
-    canvas: np.ndarray,
-    *,
-    label: str,
-    penalty: float,
-    detail: str,
-    layout: Literal["talk", "social"],
-) -> None:
-    from world_cup_projects.common.visual import draw_text_shadow
-
-    scale = _ui_scale(layout)
-    pad = 14
-    badge_h = int(46 + 6 * scale)
-    px, py = pad, pad + badge_h + 10
-    pw = int(min(canvas.shape[1] * 0.27, 300))
-    ph = int(88 * scale)
-    overlay = canvas.copy()
-    cv2.rectangle(overlay, (px, py), (px + pw, py + ph), _PANEL_BG, -1)
-    cv2.rectangle(overlay, (px, py), (px + pw, py + ph), (55, 55, 65), 1)
-    canvas[:] = cv2.addWeighted(overlay, 0.92, canvas, 0.08, 0)
-    draw_text_shadow(
-        canvas, label, (px + 12, py + int(22 * scale)),
-        font_scale=0.48 * scale, color_bgr=_PENALTY_BGR, thickness=2,
-    )
-    draw_text_shadow(
-        canvas, detail, (px + 12, py + int(42 * scale)),
-        font_scale=0.38 * scale, color_bgr=(190, 190, 200), thickness=1,
-    )
-    label_w = 52
-    bar_w = pw - label_w - 58
-    _draw_score_bar(
-        canvas, px + 12, py + int(62 * scale), "deduct", penalty, 0.25,
-        color=_PENALTY_BGR, label_w=label_w, bar_w=bar_w, scale=scale, negative=True,
-    )
 
 
 def draw_forward_on_frame(
@@ -1336,7 +1330,9 @@ def draw_space_distance_label(
 
 def draw_space_on_radar(radar: np.ndarray, draw: RadarMetricDraw) -> np.ndarray:
     out = radar.copy()
+    c_pt = _radar_pt(draw.carrier_cm)
     recv_pt = _radar_pt(draw.receiver_cm)
+    cv2.line(out, c_pt, recv_pt, draw.rank_color, 2, cv2.LINE_AA)
     ref_poly = _draw_projected_radar_circle(
         out,
         draw.receiver_cm,
@@ -1463,6 +1459,9 @@ def draw_penalty_run_on_frame(
             _label_segment(
                 out, c, motion_pt, "CARRIER RUN", _MOTION_BGR, along=0.55, offset_px=-18,
             )
+            _draw_angle_arc(
+                out, c, r, motion_pt, color=_ANGLE_ARC_BGR, radius_px=38.0, thickness=2
+            )
     return out
 
 
@@ -1476,6 +1475,9 @@ def draw_penalty_run_on_radar(radar: np.ndarray, draw: PenaltyRadarDraw) -> np.n
         m_pt = _radar_pt(draw.motion_end_cm)
         _draw_metric_chevron(out, c_pt, m_pt, _MOTION_BGR, thickness=1, head_len=6.0)
         _label_radar_segment(out, draw.carrier_cm, draw.motion_end_cm, "RUN", _MOTION_BGR)
+        _draw_angle_arc(
+            out, c_pt, r_pt, m_pt, color=_ANGLE_ARC_BGR, radius_px=14.0, thickness=1
+        )
     return out
 
 

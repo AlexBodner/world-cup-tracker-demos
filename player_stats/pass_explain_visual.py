@@ -21,6 +21,11 @@ from world_cup_projects.common.pitch import (
     render_radar_simple,
 )
 from world_cup_projects.common.possession import ball_xy
+from world_cup_projects.common.possession_config import (
+    AERIAL_DY_THRESHOLD_PX,
+    CONTROL_MAX_DISTANCE_PX,
+    RECEPTION_MAX_DISTANCE_PX,
+)
 from world_cup_projects.common.visual import (
     ROBOFLOW_PURPLE_BGR,
     annotate_ball,
@@ -55,6 +60,9 @@ _BADGE_BG_BGR = (24, 24, 30)
 _BRANDING = "Roboflow | pass detection"
 _MIN_CONTROL = PassDetectionConfig().min_control_frames
 _MIN_ARRIVAL = PassDetectionConfig().min_arrival_frames
+# Explain lock waits for the ball to sit inside the player ellipse — tighter than
+# pass-detection control range, which can credit while the ball is still above the feet.
+_RECEIVER_EXPLAIN_TIGHT_PX = 12.0
 _PANEL_W = 960
 _PANEL_H = 540
 _GUTTER_W = 152
@@ -70,6 +78,8 @@ class PassStripPlan:
     flight_frames: tuple[int, ...]
     receiver_frames: tuple[int, ...]
     summary_frame: int
+    passer_confirm_frame: int
+    receiver_confirm_frame: int
 
 
 @dataclass(frozen=True)
@@ -294,13 +304,49 @@ def _flight_start_frame(
     return min(release + 1, arrival)
 
 
-def _known_ball_positions(
+def _pass_anchor_points(
+    pass_event: InferredPass,
     dets_by_frame: dict[int, sv.Detections],
-    start: int,
-    end: int,
+) -> tuple[tuple[int, int], tuple[int, int]]:
+    """Pass corridor endpoints: passer feet at release, receiver feet at arrival."""
+    release = pass_event.frame_idx
+    arrival = release + pass_event.gap_frames
+    release_dets = dets_by_frame[release]
+    arrival_dets = dets_by_frame.get(arrival, release_dets)
+    p0 = _feet_for_tid(release_dets, pass_event.passer_tid)
+    if p0 is None:
+        ball = ball_xy(release_dets)
+        p0 = (int(ball[0]), int(ball[1])) if ball is not None else (0, 0)
+    p1 = _feet_for_tid(arrival_dets, pass_event.receiver_tid)
+    if p1 is None:
+        ball = ball_xy(arrival_dets)
+        p1 = (int(ball[0]), int(ball[1])) if ball is not None else p0
+    return p0, p1
+
+
+def _ball_along_pass_segment(
+    fi: int,
+    release: int,
+    arrival: int,
+    p0: tuple[int, int],
+    p1: tuple[int, int],
+) -> tuple[int, int]:
+    gap = max(arrival - release, 1)
+    t = float(np.clip((fi - release) / gap, 0.0, 1.0))
+    x = p0[0] + t * (p1[0] - p0[0])
+    y = p0[1] + t * (p1[1] - p0[1])
+    return int(x), int(y)
+
+
+def _pass_known_ball_positions(
+    pass_event: InferredPass,
+    dets_by_frame: dict[int, sv.Detections],
 ) -> dict[int, tuple[float, float]]:
+    """Raw detector ball positions across the pass window (no feet-based filtering)."""
+    release = pass_event.frame_idx
+    arrival = release + pass_event.gap_frames
     known: dict[int, tuple[float, float]] = {}
-    for fi in range(start, end + 1):
+    for fi in range(release, arrival + 1):
         dets = dets_by_frame.get(fi)
         if dets is None:
             continue
@@ -338,30 +384,198 @@ def _interpolate_ball_xy(
     return None
 
 
-def _ball_point_for_frame(
+def _pass_ball_track_point(
+    pass_event: InferredPass,
     fi: int,
-    dets: sv.Detections,
+    dets_by_frame: dict[int, sv.Detections],
     *,
-    known_balls: dict[int, tuple[float, float]],
+    known_balls: dict[int, tuple[float, float]] | None = None,
+) -> tuple[int, int]:
+    """Raw ball when detected; else interpolate gaps; else walk the pass chord."""
+    release = pass_event.frame_idx
+    arrival = release + pass_event.gap_frames
+    p0, p1 = _pass_anchor_points(pass_event, dets_by_frame)
+    segment_pt = _ball_along_pass_segment(fi, release, arrival, p0, p1)
+
+    dets = dets_by_frame.get(fi)
+    if dets is not None:
+        raw = ball_xy(dets)
+        if raw is not None:
+            return int(raw[0]), int(raw[1])
+
+    known = known_balls or _pass_known_ball_positions(pass_event, dets_by_frame)
+    before = [f for f in known if f <= fi]
+    after = [f for f in known if f >= fi]
+    if before and after and min(after) > max(before):
+        bridged = _interpolate_ball_xy(fi, known)
+        if bridged is not None:
+            return bridged
+    return segment_pt
+
+
+def _pass_ball_point_for_frame(
+    pass_event: InferredPass,
+    fi: int,
+    dets_by_frame: dict[int, sv.Detections],
+    *,
+    dets: sv.Detections | None = None,
+    known_balls: dict[int, tuple[float, float]] | None = None,
 ) -> tuple[int, int] | None:
-    ball = ball_xy(dets)
-    if ball is not None:
-        return int(ball[0]), int(ball[1])
-    return _interpolate_ball_xy(fi, known_balls)
+    """Ball marker — same as the main demo: trust ``ball_xy``, bridge only when missing."""
+    return _pass_ball_track_point(
+        pass_event, fi, dets_by_frame, known_balls=known_balls
+    )
+
+
+def _find_passer_demo_confirm_frame(
+    pass_event: InferredPass,
+    timeline_by_frame: dict[int, CarrierFrameState],
+    *,
+    min_control_frames: int,
+) -> int:
+    """Last control-touch frame before release — same streak as pass-detection demo."""
+    release = pass_event.frame_idx
+    control_run = _find_passer_control_run(
+        release,
+        pass_event.passer_tid,
+        timeline_by_frame,
+        min_control_frames=min_control_frames,
+    )
+    if control_run:
+        return control_run[-1]
+    return release
+
+
+def _receiver_confirm_search_end(
+    pass_event: InferredPass,
+    dets_by_frame: dict[int, sv.Detections] | None,
+    *,
+    lookahead: int = 12,
+) -> int:
+    arrival = pass_event.frame_idx + pass_event.gap_frames
+    end = arrival + lookahead
+    if dets_by_frame:
+        end = max(end, max(dets_by_frame))
+    return end
+
+
+def _find_receiver_control_run(
+    release: int,
+    receiver_tid: int,
+    timeline_by_frame: dict[int, CarrierFrameState],
+    *,
+    search_end: int,
+) -> tuple[int, ...]:
+    """First post-release control streak at the receiver — same kind as pass demo."""
+    current: list[int] = []
+    for fi in range(release + 1, search_end + 1):
+        st = timeline_by_frame.get(fi)
+        in_control = (
+            st is not None
+            and not st.in_flight
+            and st.active_tid == receiver_tid
+            and st.active_kind == "control"
+        )
+        if in_control:
+            current.append(fi)
+        elif current:
+            break
+    return tuple(current)
+
+
+def _find_receiver_tight_feet_frame(
+    pass_event: InferredPass,
+    dets_by_frame: dict[int, sv.Detections],
+    *,
+    search_end: int,
+    start_frame: int | None = None,
+    max_distance_px: float = _RECEIVER_EXPLAIN_TIGHT_PX,
+) -> int | None:
+    """First frame with the ball sitting inside the tight feet ellipse."""
+    release = pass_event.frame_idx
+    receiver_tid = pass_event.receiver_tid
+    begin = release + 1 if start_frame is None else start_frame
+    for fi in range(begin, search_end + 1):
+        dets = dets_by_frame.get(fi)
+        if dets is None:
+            continue
+        ball = ball_xy(dets)
+        feet = _feet_for_tid(dets, receiver_tid)
+        if ball is None or feet is None:
+            continue
+        dy = abs(float(ball[1] - feet[1]))
+        if dy > AERIAL_DY_THRESHOLD_PX:
+            continue
+        if float(np.hypot(ball[0] - feet[0], ball[1] - feet[1])) <= max_distance_px:
+            return fi
+    return None
+
+
+def _find_receiver_visual_confirm_frame(
+    pass_event: InferredPass,
+    dets_by_frame: dict[int, sv.Detections],
+    *,
+    timeline_by_frame: dict[int, CarrierFrameState] | None = None,
+    min_control_frames: int = _MIN_CONTROL,
+) -> int:
+    """Explain-only receiver lock — demo control streak plus a tight feet frame.
+
+    Requires ``min_control_frames`` consecutive demo ``control`` touches at the
+    receiver (same streak gate as pass detection), then freezes on the first
+    frame where the ball sits inside the tight feet ellipse (≤12px). Does not
+    affect which passes are inferred for the full video.
+    """
+    release = pass_event.frame_idx
+    arrival = release + pass_event.gap_frames
+    search_end = _receiver_confirm_search_end(pass_event, dets_by_frame)
+
+    if not timeline_by_frame:
+        return arrival
+
+    control_run = _find_receiver_control_run(
+        release,
+        pass_event.receiver_tid,
+        timeline_by_frame,
+        search_end=search_end,
+    )
+    if len(control_run) < min_control_frames:
+        return arrival
+
+    tight = _find_receiver_tight_feet_frame(
+        pass_event,
+        dets_by_frame,
+        search_end=search_end,
+        start_frame=control_run[0],
+    )
+    if tight is not None:
+        return tight
+    return control_run[min_control_frames - 1]
+
+
+def _receiver_arrival_panels(
+    release: int,
+    confirm: int,
+    *,
+    min_arrival_frames: int,
+) -> tuple[int, ...]:
+    """Panels leading up to visual control confirm — tail ends on the lock frame."""
+    start = max(release + 1, confirm - min_arrival_frames + 1)
+    return tuple(range(start, confirm + 1))
 
 
 def _pick_flight_frame(
+    pass_event: InferredPass,
     release: int,
     arrival: int,
     passer_tid: int,
     timeline_by_frame: dict[int, CarrierFrameState],
     dets_by_frame: dict[int, sv.Detections] | None,
 ) -> int:
-    """In-flight frame with visible (or bridged) ball, well separated from passer."""
+    """In-flight frame with bridged ball, well separated from passer."""
     start = _flight_start_frame(release, arrival, passer_tid, timeline_by_frame)
     if not dets_by_frame:
         return start
-    known = _known_ball_positions(dets_by_frame, release, arrival)
+    known = _pass_known_ball_positions(pass_event, dets_by_frame)
     gap = max(arrival - start, 1)
     # Stay in mid-flight — not at reception where the receiver arrives.
     search_end = max(start, arrival - max(6, gap // 4))
@@ -371,7 +585,9 @@ def _pick_flight_frame(
         dets = dets_by_frame.get(fi)
         if dets is None:
             continue
-        ball_pt = _ball_point_for_frame(fi, dets, known_balls=known)
+        ball_pt = _pass_ball_point_for_frame(
+            pass_event, fi, dets_by_frame, known_balls=known
+        )
         if ball_pt is None:
             continue
         passer_feet = _feet_for_tid(dets, passer_tid)
@@ -379,14 +595,33 @@ def _pick_flight_frame(
             dist = 120.0
         else:
             dist = float(np.hypot(ball_pt[0] - passer_feet[0], ball_pt[1] - passer_feet[1]))
-        detected = ball_xy(dets) is not None
         mid = start + gap * 0.45
         mid_bonus = 80.0 - min(abs(fi - mid) * 2.0, 80.0)
-        score = dist + (400.0 if detected else 0.0) + mid_bonus
+        score = dist + mid_bonus
         if score > best_score:
             best_score = score
             best = fi
     return best
+
+
+def build_fixed_strip_plan(pass_event: InferredPass) -> PassStripPlan:
+    """Anchor panels on release/arrival when carrier timeline is too sparse to infer them."""
+    release = pass_event.frame_idx
+    arrival = release + pass_event.gap_frames
+    flight = release + max(1, pass_event.gap_frames // 2)
+    passer_frames = (max(1, release - 2), max(1, release - 1), release)
+    confirm = arrival
+    recv = _receiver_arrival_panels(
+        release, confirm, min_arrival_frames=_MIN_ARRIVAL
+    )
+    return PassStripPlan(
+        passer_frames=passer_frames,
+        flight_frames=(flight,),
+        receiver_frames=recv,
+        summary_frame=arrival,
+        passer_confirm_frame=passer_frames[-1],
+        receiver_confirm_frame=confirm,
+    )
 
 
 def build_strip_plan(
@@ -418,6 +653,7 @@ def build_strip_plan(
         )
 
     flight_frame = _pick_flight_frame(
+        pass_event,
         passer_frames[-1],
         arrival,
         passer_tid,
@@ -425,26 +661,30 @@ def build_strip_plan(
         dets_by_frame,
     )
 
-    first_recv: int | None = None
-    for fi in range(release + 1, arrival + 1):
-        st = timeline_by_frame.get(fi)
-        if st is not None and st.arrival_candidate_tid == receiver_tid:
-            first_recv = fi
-            break
-    if first_recv is None:
-        first_recv = max(release + 1, arrival - min_arrival_frames + 1)
-    receiver_frames = list(range(first_recv, min(first_recv + min_arrival_frames, arrival + 1)))
-    if len(receiver_frames) < min_arrival_frames:
-        receiver_frames = list(
-            range(max(release + 1, arrival - min_arrival_frames + 1), arrival + 1)
-        )
+    dets_map = dets_by_frame or {}
+    passer_confirm = _find_passer_demo_confirm_frame(
+        pass_event,
+        timeline_by_frame,
+        min_control_frames=min_control_frames,
+    )
+    confirm = _find_receiver_visual_confirm_frame(
+        pass_event,
+        dets_map,
+        timeline_by_frame=timeline_by_frame,
+        min_control_frames=min_control_frames,
+    )
+    receiver_frames = _receiver_arrival_panels(
+        release, confirm, min_arrival_frames=min_arrival_frames
+    )
 
     # First N touches of the run — when control is earned, not the tail of a long dribble.
     return PassStripPlan(
         passer_frames=tuple(passer_frames[:min_control_frames]),
         flight_frames=(flight_frame,),
-        receiver_frames=tuple(receiver_frames[:min_arrival_frames]),
+        receiver_frames=receiver_frames,
         summary_frame=arrival,
+        passer_confirm_frame=passer_confirm,
+        receiver_confirm_frame=confirm,
     )
 
 
@@ -543,6 +783,24 @@ def _highlight_ball_at(image: np.ndarray, ball_pt: tuple[int, int]) -> None:
     cv2.circle(image, (bx, by), 4, (255, 255, 255), -1, cv2.LINE_AA)
 
 
+def _draw_pass_ball_marker(
+    image: np.ndarray,
+    dets: sv.Detections,
+    ball_pt: tuple[int, int] | None,
+) -> np.ndarray:
+    """Ring + detector marker when the highlight sits on a live ball detection."""
+    if ball_pt is None:
+        return image
+    _highlight_ball_at(image, ball_pt)
+    raw = ball_xy(dets)
+    if raw is None:
+        return image
+    rx, ry = int(raw[0]), int(raw[1])
+    if abs(rx - ball_pt[0]) <= 10 and abs(ry - ball_pt[1]) <= 10:
+        return annotate_ball(image, dets)
+    return image
+
+
 def _highlight_ball(image: np.ndarray, dets: sv.Detections) -> None:
     pos = ball_xy(dets)
     if pos is None:
@@ -606,7 +864,7 @@ def _build_flight_frame(
         out = draw_carrier_spotlight(
             out, full, ball_pt, radius=220, strength=0.88
         )
-        _highlight_ball_at(out, ball_pt)
+        out = _draw_pass_ball_marker(out, dets, ball_pt)
         if passer_feet is not None:
             _draw_dashed_line(out, passer_feet, ball_pt, color_bgr)
     return out
@@ -807,24 +1065,16 @@ def _compose_panel_row(
     stripe_color = ROBOFLOW_PURPLE_BGR if locked else accent
     cv2.rectangle(gutter, (0, 0), (stripe_w, _PANEL_H), stripe_color, -1)
     _draw_gutter_progress_bar(gutter, emphasis=emphasis, accent_bgr=accent)
-    draw_text_shadow(
-        gutter,
-        f"frame {frame_idx}",
-        (16, int(30 * scale)),
-        font_scale=0.34 * scale,
-        color_bgr=(150, 150, 160),
-        thickness=1,
-    )
     label_scale = (0.50 if locked else 0.44) * scale
     draw_text_shadow(
         gutter,
         label,
-        (14, int(58 * scale)),
+        (14, int(36 * scale)),
         font_scale=label_scale,
         color_bgr=ROBOFLOW_PURPLE_BGR if locked else (230, 230, 235),
         thickness=1,
     )
-    y_extra = int(94 * scale)
+    y_extra = int(72 * scale)
     if step is not None and step_total is not None and step_total > 1:
         _draw_gutter_step_dots(
             gutter,
@@ -832,16 +1082,6 @@ def _compose_panel_row(
             total=step_total,
             color_bgr=accent,
             origin=(18, y_extra),
-        )
-        y_extra += int(26 * scale)
-    if sublabel:
-        draw_text_shadow(
-            gutter,
-            sublabel,
-            (16, y_extra),
-            font_scale=0.34 * scale,
-            color_bgr=(150, 150, 160),
-            thickness=1,
         )
     return np.hstack([gutter, frame_img])
 
@@ -950,12 +1190,13 @@ def _build_passer_control_frame(
     *,
     emphasis: float,
     locked: bool = False,
+    ball_pt: tuple[int, int] | None = None,
 ) -> np.ndarray:
     """Passer strip: each step looks visibly different (dim world -> lit -> locked)."""
     dim_level = 0.30 - 0.14 * emphasis
     dimmed = _dim_frame(full, dim_level)
     passer_feet = _feet_for_tid(dets, passer_tid)
-    ball = ball_xy(dets)
+    ball = ball_pt
 
     if emphasis < 0.45:
         out = dimmed
@@ -970,13 +1211,13 @@ def _build_passer_control_frame(
     if passer_feet is not None:
         centers.append(passer_feet)
     if emphasis >= 0.55 and ball is not None:
-        centers.append((int(ball[0]), int(ball[1])))
+        centers.append(ball)
     strength = 0.40 + 0.52 * emphasis
     radius = int(120 + 100 * emphasis)
     out = _apply_focus_spotlights(
         dimmed, full, centers, radius=radius, strength=strength
     )
-    show_locked = locked or emphasis >= 0.95
+    show_locked = locked
     _draw_focus_player(
         out,
         dets,
@@ -986,12 +1227,12 @@ def _build_passer_control_frame(
         locked=show_locked,
     )
     if emphasis >= 0.55 and ball is not None and passer_feet is not None:
-        _highlight_ball_at(out, (int(ball[0]), int(ball[1])))
+        out = _draw_pass_ball_marker(out, dets, ball)
         if show_locked:
             cv2.line(
                 out,
                 passer_feet,
-                (int(ball[0]), int(ball[1])),
+                ball,
                 color_bgr,
                 3,
                 cv2.LINE_AA,
@@ -1008,12 +1249,13 @@ def _build_receiver_arrival_frame(
     *,
     emphasis: float,
     locked: bool = False,
+    ball_pt: tuple[int, int] | None = None,
 ) -> np.ndarray:
     """Receiver strip: passer stays dim; receiver ramps up like passer control."""
     dim_level = 0.30 - 0.14 * emphasis
     dimmed = _dim_frame(full, dim_level)
     receiver_feet = _feet_for_tid(dets, receiver_tid)
-    ball = ball_xy(dets)
+    ball = ball_pt
 
     if emphasis < 0.45:
         out = dimmed
@@ -1029,7 +1271,7 @@ def _build_receiver_arrival_frame(
     if receiver_feet is not None:
         centers.append(receiver_feet)
     if emphasis >= 0.55 and ball is not None:
-        centers.append((int(ball[0]), int(ball[1])))
+        centers.append(ball)
     out = _apply_focus_spotlights(
         dimmed,
         full,
@@ -1038,7 +1280,7 @@ def _build_receiver_arrival_frame(
         strength=0.40 + 0.52 * emphasis,
     )
     _draw_anchor_player(out, dets, passer_tid, color_bgr)
-    show_locked = locked or emphasis >= 0.95
+    show_locked = locked
     _draw_focus_player(
         out,
         dets,
@@ -1048,17 +1290,32 @@ def _build_receiver_arrival_frame(
         locked=show_locked,
     )
     if emphasis >= 0.55 and ball is not None and receiver_feet is not None:
-        _highlight_ball_at(out, (int(ball[0]), int(ball[1])))
+        out = _draw_pass_ball_marker(out, dets, ball)
         if show_locked:
             cv2.line(
                 out,
                 receiver_feet,
-                (int(ball[0]), int(ball[1])),
+                ball,
                 color_bgr,
                 3,
                 cv2.LINE_AA,
             )
     return out
+
+
+def _pass_ball_for_ctx(
+    ctx: PassExplainContext,
+    frame_idx: int,
+    *,
+    known_balls: dict[int, tuple[float, float]] | None = None,
+) -> tuple[int, int] | None:
+    return _pass_ball_point_for_frame(
+        ctx.pass_event,
+        frame_idx,
+        ctx.dets_by_frame,
+        dets=ctx.dets_by_frame.get(frame_idx),
+        known_balls=known_balls,
+    )
 
 
 def _render_passer_panel(
@@ -1080,10 +1337,11 @@ def _render_passer_panel(
         if emphasis is not None
         else _passer_control_emphasis(ctx, frame_idx)
     )
+    confirm = ctx.strip_plan.passer_confirm_frame
     locked = (
         show_locked
         if show_locked is not None
-        else frame_idx == panels[-1]
+        else frame_idx >= confirm
     )
     frame_img = _build_passer_control_frame(
         ctx.frames[frame_idx],
@@ -1092,6 +1350,7 @@ def _render_passer_panel(
         color,
         emphasis=level,
         locked=locked,
+        ball_pt=_pass_ball_for_ctx(ctx, frame_idx),
     )
     sublabel = _explain_streak_sublabel(
         panel_idx, len(panels), locked=locked, kind="control"
@@ -1125,8 +1384,8 @@ def _render_flight_panel(
     color = _team_color(p.team)
     release = p.frame_idx
     arrival = release + p.gap_frames
-    known = _known_ball_positions(ctx.dets_by_frame, release, arrival)
-    ball_pt = _ball_point_for_frame(frame_idx, dets, known_balls=known)
+    known = _pass_known_ball_positions(p, ctx.dets_by_frame)
+    ball_pt = _pass_ball_for_ctx(ctx, frame_idx, known_balls=known)
     frame_img = _build_flight_frame(
         ctx.frames[frame_idx], dets, p.passer_tid, color, ball_pt=ball_pt
     )
@@ -1161,10 +1420,11 @@ def _render_receiver_panel(
     color = _team_color(p.team)
     panels = ctx.strip_plan.receiver_frames
     panel_idx = panels.index(frame_idx) + 1 if frame_idx in panels else 1
+    confirm = ctx.strip_plan.receiver_confirm_frame
     locked = (
         show_locked
         if show_locked is not None
-        else frame_idx == panels[-1]
+        else frame_idx >= confirm
     )
     level = (
         emphasis
@@ -1179,6 +1439,7 @@ def _render_receiver_panel(
         color,
         emphasis=level,
         locked=locked,
+        ball_pt=_pass_ball_for_ctx(ctx, frame_idx),
     )
     sublabel = _explain_streak_sublabel(
         panel_idx, len(panels), locked=locked, kind="arrival"
@@ -1283,10 +1544,7 @@ def render_strip_flight(
     fi = ctx.strip_plan.flight_frames[0]
     p = ctx.pass_event
     dets = ctx.dets_by_frame[fi]
-    release = p.frame_idx
-    arrival = release + p.gap_frames
-    known = _known_ball_positions(ctx.dets_by_frame, release, arrival)
-    ball_pt = _ball_point_for_frame(fi, dets, known_balls=known)
+    ball_pt = _pass_ball_for_ctx(ctx, fi)
     points = _action_focus_points(dets, p.passer_tid, ball_pt=ball_pt)
     crop = _crop_rect_from_points(ctx.frames[fi].shape, points)
     panel = _render_flight_panel(ctx, fi, layout=layout, crop=crop)
@@ -1319,7 +1577,7 @@ def render_strip_receiver(
     out = _compose_strip(
         panels,
         title="LOCK THE RECEIVER",
-        subtitle="teammate touch streak after release",
+        subtitle="buildup then lock when pass is credited to receiver",
         layout=layout,
         accent_bgr=ROBOFLOW_PURPLE_BGR,
     )
@@ -1355,26 +1613,6 @@ def render_summary(
         target_w=_PANEL_W + _GUTTER_W,
         target_h=_PANEL_H,
     )
-
-    scale = _ui_scale(layout)
-    pad = 16
-    checks = [
-        "same team",
-        f"gap {p.gap_frames}f",
-        f"{p.pass_length_m:.1f} m" if p.pass_length_m else "travel ok",
-        f"Q {p.quality_score:.2f}" if p.quality_score is not None else "scored",
-    ]
-    y = pad + int(8 * scale)
-    for line in checks:
-        draw_text_shadow(
-            out,
-            f"+  {line}",
-            (pad, y),
-            font_scale=0.42 * scale,
-            color_bgr=(200, 180, 255),
-            thickness=1,
-        )
-        y += int(26 * scale)
 
     _draw_strip_title(out, "PASS CREDITED", f"#{p.passer_tid} -> #{p.receiver_tid}", layout=layout)
     out = _attach_radar_summary(out, ctx, fi)
@@ -1549,14 +1787,16 @@ def build_pass_explain_context(
     metric: bool = True,
     min_control_frames: int = _MIN_CONTROL,
     min_arrival_frames: int = _MIN_ARRIVAL,
+    strip_plan: PassStripPlan | None = None,
 ) -> PassExplainContext:
-    strip_plan = build_strip_plan(
-        pass_event,
-        timeline_by_frame,
-        dets_by_frame=dets_by_frame,
-        min_control_frames=min_control_frames,
-        min_arrival_frames=min_arrival_frames,
-    )
+    if strip_plan is None:
+        strip_plan = build_strip_plan(
+            pass_event,
+            timeline_by_frame,
+            dets_by_frame=dets_by_frame,
+            min_control_frames=min_control_frames,
+            min_arrival_frames=min_arrival_frames,
+        )
     needed = set(frames_by_idx.keys()) & set(dets_by_frame.keys())
     for fi in (
         *strip_plan.passer_frames,
@@ -1586,20 +1826,15 @@ def build_pass_explain_context(
 
 
 def explain_video_frame_range(strip_plan: PassStripPlan) -> tuple[int, int]:
-    """Inclusive source-frame span — through pass credit, not just the 3rd touch panel."""
-    return strip_plan.passer_frames[0], strip_plan.summary_frame
+    """Inclusive source-frame span — through visual receiver confirm and pass credit."""
+    end = max(strip_plan.summary_frame, strip_plan.receiver_confirm_frame)
+    return strip_plan.passer_frames[0], end
 
 
-def _explain_lock_frames(
-    ctx: PassExplainContext, *, nudge: int = 5
-) -> tuple[int, int]:
-    """When to hold the passer/receiver locked beats (nudge before credit)."""
-    p = ctx.pass_event
-    release = p.frame_idx
-    arrival = release + p.gap_frames
-    passer_lock = release
-    receiver_lock = max(release + 1, arrival - max(0, nudge))
-    return passer_lock, receiver_lock
+def _explain_lock_frames(ctx: PassExplainContext) -> tuple[int, int]:
+    """When to hold the passer/receiver locked beats in the annotated video."""
+    plan = ctx.strip_plan
+    return plan.passer_confirm_frame, plan.receiver_confirm_frame
 
 
 def frames_needed_for_explain(
@@ -1611,6 +1846,8 @@ def frames_needed_for_explain(
     needed.update(strip_plan.flight_frames)
     needed.update(strip_plan.receiver_frames)
     needed.add(strip_plan.summary_frame)
+    needed.add(strip_plan.passer_confirm_frame)
+    needed.add(strip_plan.receiver_confirm_frame)
     if include_video:
         start, end = explain_video_frame_range(strip_plan)
         needed.update(range(start, end + 1))
@@ -1620,19 +1857,19 @@ def frames_needed_for_explain(
 def _video_phase(
     ctx: PassExplainContext, frame_idx: int
 ) -> Literal["passer", "flight", "receiver"]:
-    release = ctx.pass_event.frame_idx
-    first_recv = ctx.strip_plan.receiver_frames[0]
-    if frame_idx <= release:
+    passer_confirm = ctx.strip_plan.passer_confirm_frame
+    receiver_confirm = ctx.strip_plan.receiver_confirm_frame
+    if frame_idx <= passer_confirm:
         return "passer"
-    if frame_idx < first_recv:
+    if frame_idx < receiver_confirm:
         return "flight"
     return "receiver"
 
 
 def _passer_emphasis_for_video(ctx: PassExplainContext, frame_idx: int) -> float:
     panels = ctx.strip_plan.passer_frames
-    release = ctx.pass_event.frame_idx
-    if frame_idx >= panels[-1] or frame_idx >= release:
+    confirm = ctx.strip_plan.passer_confirm_frame
+    if frame_idx >= confirm:
         return 1.0
     if frame_idx < panels[0]:
         return 0.35
@@ -1644,7 +1881,7 @@ def _passer_emphasis_for_video(ctx: PassExplainContext, frame_idx: int) -> float
 def _receiver_emphasis_for_video(ctx: PassExplainContext, frame_idx: int) -> float:
     panels = ctx.strip_plan.receiver_frames
     if frame_idx not in panels:
-        return 1.0
+        return 0.85
     return (panels.index(frame_idx) + 1) / len(panels)
 
 
@@ -1697,15 +1934,20 @@ def render_explain_video_frame(ctx: PassExplainContext, frame_idx: int) -> np.nd
         emph = _passer_emphasis_for_video(ctx, frame_idx)
         locked = frame_idx >= passer_lock
         out = _build_passer_control_frame(
-            full, dets, p.passer_tid, color, emphasis=emph, locked=locked
+            full,
+            dets,
+            p.passer_tid,
+            color,
+            emphasis=emph,
+            locked=locked,
+            ball_pt=_pass_ball_for_ctx(ctx, frame_idx),
         )
         panels = plan.passer_frames
         panel_idx = panels.index(frame_idx) + 1 if frame_idx in panels else len(panels)
         badge = _passer_panel_badge(panel_idx, len(panels), locked=locked)
         title = "LOCK THE PASSER"
     elif phase == "flight":
-        known = _known_ball_positions(ctx.dets_by_frame, release, arrival)
-        ball_pt = _ball_point_for_frame(frame_idx, dets, known_balls=known)
+        ball_pt = _pass_ball_for_ctx(ctx, frame_idx)
         out = _build_flight_frame(full, dets, p.passer_tid, color, ball_pt=ball_pt)
         badge = "IN FLIGHT"
         title = "BALL TRAVELLING"
@@ -1721,6 +1963,7 @@ def render_explain_video_frame(ctx: PassExplainContext, frame_idx: int) -> np.nd
             color,
             emphasis=emph,
             locked=locked,
+            ball_pt=_pass_ball_for_ctx(ctx, frame_idx),
         )
         panels = plan.receiver_frames
         panel_idx = panels.index(frame_idx) + 1 if frame_idx in panels else len(panels)
@@ -1759,23 +2002,6 @@ def render_explain_video_summary(ctx: PassExplainContext) -> np.ndarray:
         locked=True,
         accent_bgr=ROBOFLOW_PURPLE_BGR,
     )
-    checks = [
-        "same team",
-        f"gap {p.gap_frames}f",
-        f"{p.pass_length_m:.1f} m" if p.pass_length_m else "travel ok",
-        f"Q {p.quality_score:.2f}" if p.quality_score is not None else "scored",
-    ]
-    y = 58
-    for line in checks:
-        draw_text_shadow(
-            out,
-            f"+  {line}",
-            (16, y),
-            font_scale=0.52,
-            color_bgr=(200, 180, 255),
-            thickness=1,
-        )
-        y += 28
     return draw_branding_tag(out, _BRANDING)
 
 
@@ -1799,9 +2025,7 @@ def build_pass_explain_video_sequence(
     """Walk consecutive source frames with overlays — smooth slow motion."""
     plan = ctx.strip_plan
     start, end = explain_video_frame_range(plan)
-    passer_lock, receiver_lock = _explain_lock_frames(
-        ctx, nudge=timing.lock_nudge_frames
-    )
+    passer_lock, receiver_lock = _explain_lock_frames(ctx)
     locked_frames = {passer_lock, receiver_lock}
     hold_n = max(1, int(round(timing.hold_locked_seconds * timing.output_fps)))
     summary_n = max(1, int(round(timing.summary_hold_seconds * timing.output_fps)))

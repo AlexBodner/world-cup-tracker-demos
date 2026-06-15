@@ -74,11 +74,11 @@ from world_cup_projects.pass_alternatives.explain_conference_metrics import (
     draw_space_distance_label,
     draw_space_on_frame,
     draw_space_on_radar,
+    _align_angle_deg,
     _draw_attack_axis_panel,
-    _draw_penalty_panel,
-    _draw_single_metric_panel,
-    _fmt_lane_clearance,
+    _draw_step_panel,
     _m_per_px,
+    _MOTION_BGR,
 )
 from world_cup_projects.pass_alternatives.lane_visual import _RANK_BGR as LANE_RANK_BGR
 from world_cup_projects.pass_alternatives.pass_options import (
@@ -191,6 +191,8 @@ def attach_conference_radar(
         prebuilt_radar=radar,
         debug_keypoints=False,
         scale_frac=0.33,
+        # Full opacity — 0.5 washes yellow/orange lane lines into the green pitch.
+        opacity=1.0,
     )
 
 
@@ -318,19 +320,44 @@ def _metric_lane_bundle(ctx: ExplainContext, rank: int):
     }
 
 
-def _metric_radar_overlay(ctx: ExplainContext, option, geom: LaneMetricGeometry, draw_fn):
+def _metric_radar_overlay(
+    ctx: ExplainContext,
+    option,
+    geom: LaneMetricGeometry,
+    draw_fn,
+    *,
+    rank_color: tuple[int, int, int],
+):
     """Bind metric draw helpers to sports-radar pitch cm (same H as lane corridors)."""
 
     def overlay(radar: np.ndarray, pitch_cm: np.ndarray) -> np.ndarray:
-        draw = build_radar_metric_draw(ctx, option, geom, pitch_cm)
+        draw = build_radar_metric_draw(
+            ctx, option, geom, pitch_cm, rank_color=rank_color
+        )
         return draw_fn(radar, draw)
 
     return overlay
 
 
-def _penalty_radar_overlay(ctx: ExplainContext, option, penalty: PenaltyGeometry, draw_fn):
+def _penalty_radar_overlay(
+    ctx: ExplainContext,
+    option,
+    penalty: PenaltyGeometry,
+    draw_fn,
+    *,
+    rank_color: tuple[int, int, int],
+):
+    radar_h = _sports_radar_homography(ctx)
+
     def overlay(radar: np.ndarray, pitch_cm: np.ndarray) -> np.ndarray:
-        draw = build_penalty_radar_draw(ctx, option, penalty, pitch_cm)
+        draw = build_penalty_radar_draw(
+            ctx,
+            option,
+            penalty,
+            pitch_cm,
+            rank_color=rank_color,
+            radar_transformer=radar_h,
+        )
         return draw_fn(radar, draw)
 
     return overlay
@@ -358,16 +385,19 @@ def _conference_step_order(ctx: ExplainContext, *, rank: int = 0) -> list[str]:
     ]
     bundle = _metric_lane_bundle(ctx, rank)
     if bundle is not None:
+        order.append("03_pen_run")
         for kind in _penalty_kinds(bundle["breakdown"]):
-            order.append(f"03_pen_{kind}")
+            if kind != "run":
+                order.append(f"03_pen_{kind}")
     order.append("04_ranking")
     return order
 
 
-def _metric_title(rank: int, metric: str) -> str:
+def _metric_badge(rank: int, metric: str) -> tuple[str, str]:
+    """Step badge title + subtitle (lane rank shown on its own line)."""
     if len(metric) > 0 and rank >= 0:
-        return f"{metric}  ·  LANE #{rank + 1}"
-    return metric
+        return metric, f"LANE #{rank + 1}"
+    return metric, ""
 
 
 def _attack_axis_radar_overlay(ctx: ExplainContext, axis):
@@ -461,22 +491,24 @@ def render_metric_open(
     )
     out = annotate_players(out, ctx.dets, show_tracker_ids=True)
     out = annotate_ball(out, ctx.dets)
-    _draw_single_metric_panel(
+    opp_open = geom.opponent_openness_m
+    if opp_open >= ctx.weights.open_ref * 0.99:
+        open_just = "lane clear"
+    elif geom.openness_rival_idx is not None:
+        open_just = f"{opp_open:.0f} m to blocker"
+    else:
+        open_just = "open corridor"
+    _draw_step_panel(
         out,
         label="OPENNESS",
-        raw=geom.openness_m,
-        ref=ctx.weights.open_ref,
-        term=bundle["breakdown"].openness_term,
-        weight=ctx.weights.openness,
+        score=bundle["breakdown"].openness_term,
+        justification=open_just,
         color=(80, 220, 60),
         layout=layout,
-        detail=(
-            f"opp corridor {geom.lane_width_m or ctx.weights.lane_width:.1f} m  |  "
-            f"tm corridor {geom.teammate_lane_width_m or 0.0:.1f} m"
-        ),
     )
+    open_title, open_sub = _metric_badge(rank_i, "OPEN")
     _draw_step_badge(
-        out, step=3, total=4, title=_metric_title(rank_i, "OPEN"), subtitle="", layout=layout
+        out, step=3, total=4, title=open_title, subtitle=open_sub, layout=layout
     )
     return draw_branding_tag(
         attach_conference_radar(
@@ -485,7 +517,11 @@ def render_metric_open(
             lane_opts,
             display_ranks=bundle["ranks"],
             radar_overlay=_metric_radar_overlay(
-                ctx, bundle["option"], geom, draw_openness_on_radar
+                ctx,
+                bundle["option"],
+                geom,
+                draw_openness_on_radar,
+                rank_color=bundle["rank_color"],
             ),
         ),
         "Roboflow · pass lane AI",
@@ -518,18 +554,21 @@ def render_metric_forward(
     )
     out = annotate_players(out, ctx.dets, show_tracker_ids=True)
     out = annotate_ball(out, ctx.dets)
-    _draw_single_metric_panel(
+    if geom.forward_gain_m > 0.05:
+        fwd_just = f"+{geom.forward_gain_m:.1f} m toward goal"
+    else:
+        fwd_just = "backward or lateral"
+    _draw_step_panel(
         out,
         label="FORWARD",
-        raw=geom.forward_gain_m,
-        ref=ctx.weights.forward_ref,
-        term=bundle["breakdown"].forward_term,
-        weight=ctx.weights.forward,
+        score=bundle["breakdown"].forward_term,
+        justification=fwd_just,
         color=(0, 200, 255),
         layout=layout,
     )
+    fwd_title, fwd_sub = _metric_badge(rank_i, "FORWARD")
     _draw_step_badge(
-        out, step=3, total=4, title=_metric_title(rank_i, "FORWARD"), subtitle="", layout=layout
+        out, step=3, total=4, title=fwd_title, subtitle=fwd_sub, layout=layout
     )
     return draw_branding_tag(
         attach_conference_radar(
@@ -538,7 +577,11 @@ def render_metric_forward(
             lane_opts,
             display_ranks=bundle["ranks"],
             radar_overlay=_metric_radar_overlay(
-                ctx, bundle["option"], geom, draw_forward_on_radar
+                ctx,
+                bundle["option"],
+                geom,
+                draw_forward_on_radar,
+                rank_color=bundle["rank_color"],
             ),
         ),
         "Roboflow · pass lane AI",
@@ -572,18 +615,17 @@ def render_metric_space(
         out, geom, lane_t, m_per_px=bundle["mpp"], avoid_pts=avoid_pts
     )
     out = annotate_ball(out, ctx.dets)
-    _draw_single_metric_panel(
+    _draw_step_panel(
         out,
         label="SPACE",
-        raw=geom.space_m,
-        ref=ctx.weights.space_ref,
-        term=bundle["breakdown"].space_term,
-        weight=ctx.weights.space,
+        score=bundle["breakdown"].space_term,
+        justification=f"{geom.space_m:.0f} m around receiver",
         color=(200, 140, 255),
         layout=layout,
     )
+    space_title, space_sub = _metric_badge(rank_i, "SPACE")
     _draw_step_badge(
-        out, step=3, total=4, title=_metric_title(rank_i, "SPACE"), subtitle="", layout=layout
+        out, step=3, total=4, title=space_title, subtitle=space_sub, layout=layout
     )
     return draw_branding_tag(
         attach_conference_radar(
@@ -592,7 +634,11 @@ def render_metric_space(
             lane_opts,
             display_ranks=bundle["ranks"],
             radar_overlay=_metric_radar_overlay(
-                ctx, bundle["option"], geom, draw_space_on_radar
+                ctx,
+                bundle["option"],
+                geom,
+                draw_space_on_radar,
+                rank_color=bundle["rank_color"],
             ),
         ),
         "Roboflow · pass lane AI",
@@ -616,19 +662,28 @@ def render_penalty_teammate(
     )
     out = annotate_players(out, ctx.dets, show_tracker_ids=True)
     out = annotate_ball(out, ctx.dets)
-    _draw_penalty_panel(
-        out, label="TEAMMATE", penalty=bundle["breakdown"].teammate_penalty,
-        detail=f"clearance {penalty.teammate_openness_m:.1f} m", layout=layout,
+    _draw_step_panel(
+        out,
+        label="TEAMMATE",
+        score=bundle["breakdown"].teammate_penalty,
+        justification=f"{penalty.teammate_openness_m:.0f} m teammate clearance",
+        color=(70, 70, 220),
+        layout=layout,
+        negative=True,
     )
+    tm_title, tm_sub = _metric_badge(bundle["rank"], "TEAMMATE")
     _draw_step_badge(
-        out, step=3, total=4,
-        title=_metric_title(bundle["rank"], "PEN · TM"), subtitle="", layout=layout,
+        out, step=3, total=4, title=tm_title, subtitle=tm_sub, layout=layout,
     )
     return draw_branding_tag(
         attach_conference_radar(
             out, ctx, bundle["lane_opts"], display_ranks=bundle["ranks"],
             radar_overlay=_penalty_radar_overlay(
-                ctx, bundle["option"], penalty, draw_penalty_teammate_on_radar
+                ctx,
+                bundle["option"],
+                penalty,
+                draw_penalty_teammate_on_radar,
+                rank_color=bundle["rank_color"],
             ),
         ),
         "Roboflow · pass lane AI",
@@ -652,19 +707,30 @@ def render_penalty_run(
     )
     out = annotate_players(out, ctx.dets, show_tracker_ids=True)
     out = annotate_ball(out, ctx.dets)
-    _draw_penalty_panel(
-        out, label="RUN", penalty=bundle["breakdown"].backward_run_penalty,
-        detail=f"align cos {penalty.pass_align:.2f}", layout=layout,
+    angle_deg = _align_angle_deg(penalty.pass_align)
+    run_pen = bundle["breakdown"].backward_run_penalty
+    _draw_step_panel(
+        out,
+        label="RUN",
+        score=run_pen,
+        justification=f"{angle_deg:.0f} deg pass vs run (pitch)",
+        color=(70, 70, 220) if run_pen > 0.005 else _MOTION_BGR,
+        layout=layout,
+        negative=run_pen > 0.005,
     )
+    run_title, run_sub = _metric_badge(bundle["rank"], "RUN")
     _draw_step_badge(
-        out, step=3, total=4,
-        title=_metric_title(bundle["rank"], "PEN · RUN"), subtitle="", layout=layout,
+        out, step=3, total=4, title=run_title, subtitle=run_sub, layout=layout,
     )
     return draw_branding_tag(
         attach_conference_radar(
             out, ctx, bundle["lane_opts"], display_ranks=bundle["ranks"],
             radar_overlay=_penalty_radar_overlay(
-                ctx, bundle["option"], penalty, draw_penalty_run_on_radar
+                ctx,
+                bundle["option"],
+                penalty,
+                draw_penalty_run_on_radar,
+                rank_color=bundle["rank_color"],
             ),
         ),
         "Roboflow · pass lane AI",
@@ -688,19 +754,28 @@ def render_penalty_back(
     )
     out = annotate_players(out, ctx.dets, show_tracker_ids=True)
     out = annotate_ball(out, ctx.dets)
-    _draw_penalty_panel(
-        out, label="BACK", penalty=bundle["breakdown"].backward_attack_penalty,
-        detail=f"fwd {geom.forward_gain_m:.1f} m", layout=layout,
+    _draw_step_panel(
+        out,
+        label="BACK",
+        score=bundle["breakdown"].backward_attack_penalty,
+        justification=f"{geom.forward_gain_m:.1f} m vs attack axis",
+        color=(70, 70, 220),
+        layout=layout,
+        negative=True,
     )
+    back_title, back_sub = _metric_badge(bundle["rank"], "BACKWARD")
     _draw_step_badge(
-        out, step=3, total=4,
-        title=_metric_title(bundle["rank"], "PEN · BACK"), subtitle="", layout=layout,
+        out, step=3, total=4, title=back_title, subtitle=back_sub, layout=layout,
     )
     return draw_branding_tag(
         attach_conference_radar(
             out, ctx, bundle["lane_opts"], display_ranks=bundle["ranks"],
             radar_overlay=_penalty_radar_overlay(
-                ctx, bundle["option"], penalty, draw_penalty_back_on_radar
+                ctx,
+                bundle["option"],
+                penalty,
+                draw_penalty_back_on_radar,
+                rank_color=bundle["rank_color"],
             ),
         ),
         "Roboflow · pass lane AI",
@@ -720,12 +795,11 @@ def _rank_scoring_segments(
         render_metric_open(ctx, layout=layout, rank=rank),
         render_metric_forward(ctx, layout=layout, rank=rank),
         render_metric_space(ctx, layout=layout, rank=rank),
+        render_penalty_run(ctx, layout=layout, rank=rank),
     ]
     for kind in _penalty_kinds(bundle["breakdown"]):
         if kind == "tm":
             segments.append(render_penalty_teammate(ctx, layout=layout, rank=rank))
-        elif kind == "run":
-            segments.append(render_penalty_run(ctx, layout=layout, rank=rank))
         elif kind == "back":
             segments.append(render_penalty_back(ctx, layout=layout, rank=rank))
     return segments
@@ -910,14 +984,13 @@ def render_conference_steps(
         "03_open": render_metric_open(ctx, layout=layout, rank=0),
         "03_forward": render_metric_forward(ctx, layout=layout, rank=0),
         "03_space": render_metric_space(ctx, layout=layout, rank=0),
+        "03_pen_run": render_penalty_run(ctx, layout=layout, rank=0),
     }
     bundle = _metric_lane_bundle(ctx, 0)
     if bundle is not None:
         for kind in _penalty_kinds(bundle["breakdown"]):
             if kind == "tm":
                 steps["03_pen_tm"] = render_penalty_teammate(ctx, layout=layout, rank=0)
-            elif kind == "run":
-                steps["03_pen_run"] = render_penalty_run(ctx, layout=layout, rank=0)
             elif kind == "back":
                 steps["03_pen_back"] = render_penalty_back(ctx, layout=layout, rank=0)
     steps["04_ranking"] = render_step4_ranking(ctx, layout=layout)

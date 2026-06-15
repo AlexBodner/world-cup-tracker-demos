@@ -405,26 +405,46 @@ def collect_referee_tracker_ids(
     return frozenset(flagged)
 
 
-def _best_ball_detection(balls: sv.Detections) -> sv.Detections:
-    """Keep the highest-confidence ball box when the model returns duplicates."""
+def _best_ball_detection(
+    balls: sv.Detections,
+    *,
+    players: sv.Detections | None = None,
+) -> sv.Detections:
+    """When multiple balls are detected, prefer the one nearest the pitch players."""
     if len(balls) <= 1:
         return balls
+    if players is not None and len(players):
+        from world_cup_projects.common.possession import feet_xy
+
+        feet = feet_xy(players)
+        if len(feet):
+            cx = (balls.xyxy[:, 0] + balls.xyxy[:, 2]) / 2
+            cy = balls.xyxy[:, 3]
+            centers = np.column_stack([cx, cy])
+            dists = np.linalg.norm(
+                centers[:, None, :] - feet[None, :, :], axis=2
+            ).min(axis=1)
+            pick = int(np.argmin(dists))
+            return balls[pick : pick + 1]
     if balls.confidence is None:
         return balls[:1]
-    return balls[int(np.argmax(balls.confidence)) : int(np.argmax(balls.confidence)) + 1]
+    pick = int(np.argmax(balls.confidence))
+    return balls[pick : pick + 1]
 
 
-def _merge_ball_detections(primary: sv.Detections, secondary: sv.Detections) -> sv.Detections:
-    """Prefer the higher-confidence ball between two detectors."""
+def _merge_ball_detections(
+    primary: sv.Detections,
+    secondary: sv.Detections,
+    *,
+    players: sv.Detections | None = None,
+) -> sv.Detections:
+    """Merge two ball detectors, then disambiguate duplicates near the action."""
     if len(primary) == 0:
-        return _best_ball_detection(secondary)
+        return _best_ball_detection(secondary, players=players)
     if len(secondary) == 0:
-        return _best_ball_detection(primary)
-    p = _best_ball_detection(primary)
-    s = _best_ball_detection(secondary)
-    if p.confidence is not None and s.confidence is not None:
-        return p if float(p.confidence[0]) >= float(s.confidence[0]) else s
-    return p if len(primary) else s
+        return _best_ball_detection(primary, players=players)
+    combined = sv.Detections.merge([primary, secondary])
+    return _best_ball_detection(combined, players=players)
 
 
 def _map_inference_fp_detections(inference_result, *, confidence: float) -> sv.Detections:
@@ -790,14 +810,15 @@ def iter_football_detections(
             continue
 
         det = detector.detect(image)
-        balls = det[det.class_id == ROLE_BALL]
-        if ball_detector is not None:
-            extra_balls = ball_detector.detect(image)
-            balls = _merge_ball_detections(balls, extra_balls)
-        balls = _best_ball_detection(balls)
         players = det[det.class_id == ROLE_PLAYER]
         gks = det[det.class_id == ROLE_GOALKEEPER]
         refs = det[det.class_id == ROLE_REFEREE]
+        on_pitch = sv.Detections.merge([players, gks]) if len(players) or len(gks) else None
+        balls = det[det.class_id == ROLE_BALL]
+        if ball_detector is not None:
+            extra_balls = ball_detector.detect(image)
+            balls = _merge_ball_detections(balls, extra_balls, players=on_pitch)
+        balls = _best_ball_detection(balls, players=on_pitch)
         players = suppress_players_overlapping_referees(players, refs)
 
         trackable = sv.Detections.merge([players, gks])
