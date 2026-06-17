@@ -69,6 +69,7 @@ from world_cup_projects.common.possession_touch import (
     ball_redirected_at_touch,
     is_aerial_flyby_below_feet,
     is_aerial_touch,
+    is_release_inbound_flyby,
     is_valid_possession_touch,
     reception_aerial_veto_threshold,
 )
@@ -214,6 +215,7 @@ class PassDetectionConfig:
             max_plausible_transit_speed_m_s=self.max_plausible_transit_speed_m_s,
             ball_speed_lookback_frames=self.ball_speed_lookback_frames,
             ball_speed_min_lookback_frames=self.ball_speed_min_lookback_frames,
+            gravity_flyby_min_release_gap_frames=self.adjacent_pass_max_gap_frames,
         )
 
     def tracking_config(self) -> CarrierTrackingConfig:
@@ -597,6 +599,18 @@ def _touch_valid_or_redirect(
         **kwargs,
     ):
         return True
+    release_gap_frames = kwargs.get("release_gap_frames")
+    if (
+        release_ball is not None
+        and release_gap_frames is not None
+        and is_release_inbound_flyby(
+            release_ball,
+            carrier.ball,
+            release_gap_frames=release_gap_frames,
+            config=touch_cfg,
+        )
+    ):
+        return False
     if not _ball_redirected(frames_by_idx, frame_idx, config=config):
         return False
     if touch_kind == "control" and is_aerial_touch(
@@ -685,9 +699,10 @@ def _opponent_control_streak_between(
     metric: bool,
     min_streak: int,
     fps: float = 25.0,
+    release_frame: int | None = None,
+    release_ball: np.ndarray | None = None,
 ) -> bool:
     """True if an opponent had ``min_streak`` consecutive control frames in window."""
-    touch_cfg = config.touch_validation_config()
     streak = 0
     for frame_idx in range(start_frame + 1, end_frame):
         dets = frames_by_idx.get(frame_idx)
@@ -705,20 +720,18 @@ def _opponent_control_streak_between(
         if touch_kind != "control":
             streak = 0
             continue
-        if not is_valid_possession_touch(
+        if not _touch_valid_or_redirect(
             dets,
             carrier,
             touch_kind=touch_kind,
-            config=touch_cfg,
-            **_touch_validation_kwargs(
-                frames_by_idx,
-                frame_idx,
-                transformers=transformers,
-                metric=metric,
-                fps=fps,
-                max_lookback=config.ball_speed_lookback_frames,
-                min_lookback=config.ball_speed_min_lookback_frames,
-            ),
+            frames_by_idx=frames_by_idx,
+            frame_idx=frame_idx,
+            config=config,
+            transformers=transformers,
+            metric=metric,
+            fps=fps,
+            release_ball=release_ball,
+            release_frame=release_frame,
         ):
             streak = 0
             continue
@@ -737,12 +750,11 @@ def _opponent_active_control_frames(
     config: PassDetectionConfig,
     transformers: dict[int, object],
     metric: bool,
+    fps: float = 25.0,
+    release_frame: int | None = None,
+    release_ball: np.ndarray | None = None,
 ) -> int:
-    """Count in-window frames where an opponent holds *tight* control carry.
-
-    Uses the stricter long-gap opponent carrier so a passer's own loose carry or
-    an aerial fly-by near an opponent does not falsely block a long pass.
-    """
+    """Count in-window frames where an opponent holds validated tight control."""
     count = 0
     for frame_idx in range(start_frame + 1, end_frame):
         dets = frames_by_idx.get(frame_idx)
@@ -752,12 +764,28 @@ def _opponent_active_control_frames(
         carrier, touch_kind = _long_gap_opponent_carrier(
             dets, transformer=transformer, config=config
         )
+        touch_kind = touch_kind or "reception"
         if (
-            carrier is not None
-            and int(carrier.team) != passer_team
-            and touch_kind == "control"
+            carrier is None
+            or int(carrier.team) == passer_team
+            or touch_kind != "control"
         ):
-            count += 1
+            continue
+        if not _touch_valid_or_redirect(
+            dets,
+            carrier,
+            touch_kind=touch_kind,
+            frames_by_idx=frames_by_idx,
+            frame_idx=frame_idx,
+            config=config,
+            transformers=transformers,
+            metric=metric,
+            fps=fps,
+            release_ball=release_ball,
+            release_frame=release_frame,
+        ):
+            continue
+        count += 1
     return count
 
 
@@ -847,6 +875,8 @@ def _opponent_blocks_between(
             metric=metric,
             min_streak=config.min_long_gap_opponent_control_streak,
             fps=fps,
+            release_frame=release_frame,
+            release_ball=release_ball,
         ):
             return True
         return (
@@ -858,6 +888,9 @@ def _opponent_blocks_between(
                 config=config,
                 transformers=transformers,
                 metric=metric,
+                fps=fps,
+                release_frame=release_frame,
+                release_ball=release_ball,
             )
             >= config.min_long_gap_opponent_control_streak
         )
@@ -2004,6 +2037,13 @@ def _invalidate_passes_for_turnover(
         if (
             p.passer_tid == turnover.passer_tid
             and p.team == turnover.passer_team
+            and p.frame_idx == turnover.release_frame
+            and arrival < turnover.interception_frame
+        ):
+            return True
+        if (
+            p.passer_tid == turnover.passer_tid
+            and p.team == turnover.passer_team
             and p.frame_idx >= origin_lo
             and arrival <= turnover.interception_frame
             and _opponent_blocks_between(
@@ -2355,6 +2395,39 @@ def _try_emit_turnover(
     if gap < config.min_turnover_gap_frames or gap > config.max_pass_gap_frames:
         return False
 
+    if (
+        frames_by_idx is not None
+        and release_carrier is not None
+        and release_frame is not None
+    ):
+        int_dets = frames_by_idx.get(interception_frame)
+        if int_dets is None:
+            return False
+        transformer = transformers.get(interception_frame) if metric and transformers else None
+        int_carrier, int_kind = _active_carrier(
+            int_dets, transformer=transformer, config=config
+        )
+        int_kind = int_kind or "reception"
+        if (
+            int_carrier is None
+            or int_dets.tracker_id is None
+            or int(int_dets.tracker_id[int_carrier.index]) != interceptor_tid
+            or not _touch_valid_or_redirect(
+                int_dets,
+                int_carrier,
+                touch_kind=int_kind,
+                frames_by_idx=frames_by_idx,
+                frame_idx=interception_frame,
+                config=config,
+                transformers=transformers or {},
+                metric=metric,
+                fps=fps,
+                release_ball=release_carrier.ball,
+                release_frame=release_frame,
+            )
+        ):
+            return False
+
     if _recent_turnover_duplicate(
         turnovers,
         passer_tid,
@@ -2447,6 +2520,50 @@ def _arrival_ready_for_pass(
     if touch_kind == "reception":
         return True
     return arrival_control_streak >= config.min_arrival_control_frames
+
+
+def _try_emit_intermediate_hop(
+    passes: list[InferredPass],
+    state: _TeamPossessionState,
+    *,
+    frame_idx: int,
+    dets: sv.Detections,
+    carrier: Carrier,
+    tid: int,
+    touch_kind: str,
+    scorer: PassQualityScorer,
+    config: PassDetectionConfig,
+    metric: bool,
+    transformers: dict[int, object],
+) -> bool:
+    """Emit a short teammate relay when a new carrier settles during an in-flight pass."""
+    release = state.release
+    if release is None or touch_kind != "control":
+        return False
+    release_frame, release_dets, release_carrier, release_tid = release
+    if release_tid == tid:
+        return False
+    if (
+        state.arrival_candidate_tid >= 0
+        and state.arrival_candidate_tid != tid
+        and state.arrival_streak > 0
+    ):
+        return False
+    return _try_emit_pass(
+        passes,
+        release_frame=release_frame,
+        release_dets=release_dets,
+        release_carrier=release_carrier,
+        passer_tid=release_tid,
+        receiver_tid=tid,
+        arrival_frame=frame_idx,
+        arrival_carrier=carrier,
+        touch_kind=touch_kind,
+        scorer=scorer,
+        config=config,
+        metric=metric,
+        transformers=transformers,
+    )
 
 
 def _on_confirmed_possession(
@@ -2613,6 +2730,19 @@ def _queue_turnover_emit(
     release_frame, passer_tid = snapshot
     if interception_frame - release_frame < config.adjacent_pass_max_gap_frames:
         return
+    release_ball: np.ndarray | None = None
+    release_dets = frames_by_idx.get(release_frame)
+    if release_dets is not None:
+        rel_transformer = transformers.get(release_frame) if metric else None
+        rel_carrier, _ = _active_carrier(
+            release_dets, transformer=rel_transformer, config=config
+        )
+        if (
+            rel_carrier is not None
+            and release_dets.tracker_id is not None
+            and int(release_dets.tracker_id[rel_carrier.index]) == passer_tid
+        ):
+            release_ball = rel_carrier.ball
     first_opp = _first_opponent_touch_in_window(
         frames_by_idx,
         start_frame=release_frame,
@@ -2624,6 +2754,8 @@ def _queue_turnover_emit(
         require_control=True,
         player_tid=interceptor_tid,
         fps=fps,
+        release_frame=release_frame,
+        release_ball=release_ball,
     )
     if first_opp is None:
         return
@@ -2955,11 +3087,32 @@ def scan_possession_events(
             if not skip_last_touch_update:
                 state.last_touch = (frame_idx, dets, carrier, tid)
             if state.control_streak >= min_control:
-                # Keep an in-flight teammate pass anchor (release passer != receiver)
-                # until emit; do not retarget release to the arriving player early.
-                _on_confirmed_possession(
-                    state, frame_idx, dets, carrier, tid
-                )
+                if (
+                    state.control_streak == min_control
+                    and state.release is not None
+                    and state.release[3] != tid
+                ):
+                    _try_emit_intermediate_hop(
+                        passes,
+                        state,
+                        frame_idx=frame_idx,
+                        dets=dets,
+                        carrier=carrier,
+                        tid=tid,
+                        touch_kind=touch_kind,
+                        scorer=scorer,
+                        config=config,
+                        metric=metric,
+                        transformers=transformers,
+                    )
+                    _confirm_release(state, frame_idx, dets, carrier, tid)
+                    state.arrival_candidate_tid = -1
+                    state.arrival_streak = 0
+                    state.arrival_control_streak = 0
+                else:
+                    _on_confirmed_possession(
+                        state, frame_idx, dets, carrier, tid
+                    )
                 if state.control_streak == min_control:
                     _queue_turnover_emit(
                         pending_turnovers,
@@ -3048,6 +3201,7 @@ def scan_possession_events(
             release_ball=release_carrier.ball,
         )
         if opponent_blocked:
+            turnover_emitted = False
             first_opp = _first_opponent_touch_in_window(
                 frames_by_idx,
                 start_frame=release_frame,
@@ -3074,7 +3228,7 @@ def scan_possession_events(
                     fps=fps,
                 )
                 if secured is not None:
-                    _try_emit_turnover(
+                    turnover_emitted = _try_emit_turnover(
                         state,
                         interceptor_tid=opp_tid,
                         interceptor_team=1 - team,
@@ -3099,10 +3253,13 @@ def scan_possession_events(
                         config=config,
                         transformers=transformers,
                         metric=metric,
+                        fps=fps,
+                        release_frame=release_frame,
+                        release_ball=release_carrier.ball,
                     )
                     >= config.min_long_gap_opponent_control_streak
                 ):
-                    _try_emit_turnover(
+                    turnover_emitted = _try_emit_turnover(
                         state,
                         interceptor_tid=opp_tid,
                         interceptor_team=1 - team,
@@ -3126,8 +3283,34 @@ def scan_possession_events(
                 state.arrival_streak = 0
                 state.arrival_control_streak = 0
                 continue
-            # Stale anchors survive opponent possession; credit the arriving teammate
-            # without emitting a pass through the press.
+            if not turnover_emitted and tid == state.arrival_candidate_tid and _try_emit_pass(
+                passes,
+                release_frame=release_frame,
+                release_dets=release_dets,
+                release_carrier=release_carrier,
+                passer_tid=release_tid,
+                receiver_tid=tid,
+                arrival_frame=frame_idx,
+                arrival_carrier=carrier,
+                touch_kind=touch_kind,
+                scorer=scorer,
+                config=config,
+                metric=metric,
+                transformers=transformers,
+            ):
+                _try_emit_snapshot_turnover(
+                    other_state,
+                    interceptor_tid=release_tid,
+                    interceptor_team=team,
+                    interception_frame=frame_idx,
+                    turnovers=turnovers,
+                    passes=passes,
+                    frames_by_idx=frames_by_idx,
+                    config=config,
+                    transformers=transformers,
+                    metric=metric,
+                    fps=fps,
+                )
             _confirm_release(state, frame_idx, dets, carrier, tid)
             state.arrival_candidate_tid = -1
             state.arrival_streak = 0

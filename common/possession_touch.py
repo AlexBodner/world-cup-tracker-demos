@@ -36,6 +36,8 @@ class TouchValidationConfig:
     redirect_min_angle_deg: float = 28.0
     redirect_min_speed_ratio: float = 1.35
     redirect_min_segment_px: float = 10.0
+    # In-flight opponent touch during a known release: no path redirect ⇒ gravity fly-by.
+    gravity_flyby_min_release_gap_frames: int = 15
 
 
 def nearest_player_tid(dets: sv.Detections, ball: np.ndarray) -> int | None:
@@ -264,17 +266,15 @@ def is_transit_flyby_control(
     )
 
 
-def ball_redirected_at_touch(
+def _ball_touch_path_metrics(
     frames_by_idx: dict[int, sv.Detections],
     touch_frame: int,
     *,
     lookback: int = 5,
     lookahead: int = 5,
-    min_angle_deg: float = 28.0,
-    min_speed_ratio: float = 1.35,
     min_segment_px: float = 10.0,
-) -> bool:
-    """True when inbound/outbound ball vectors diverge at ``touch_frame`` (kick, not fly-by)."""
+) -> tuple[float, float] | None:
+    """Inbound angle (deg) and outbound/inbound speed ratio at ``touch_frame``."""
     from world_cup_projects.common.geometry import unit
 
     samples: list[tuple[int, np.ndarray]] = []
@@ -286,12 +286,12 @@ def ball_redirected_at_touch(
         if ball is not None:
             samples.append((frame_idx, np.asarray(ball, dtype=np.float64)))
     if len(samples) < 4:
-        return False
+        return None
 
     before = [(f, p) for f, p in samples if f <= touch_frame]
     after = [(f, p) for f, p in samples if f >= touch_frame]
     if len(before) < 2 or len(after) < 2:
-        return False
+        return None
 
     pivot = before[-1][1]
     for frame_idx, point in samples:
@@ -303,24 +303,75 @@ def ball_redirected_at_touch(
     v_in = pivot - (p_in0 if f_in0 < touch_frame else before[-1][1])
     in_len = float(np.linalg.norm(v_in))
     if in_len < min_segment_px:
-        return False
+        return None
 
     after_touch = [(f, p) for f, p in after if f >= touch_frame]
     if len(after_touch) < 2:
-        return False
+        return None
     _, p_out1 = after_touch[1]
     v_out = p_out1 - pivot
     out_len = float(np.linalg.norm(v_out))
     if out_len < min_segment_px:
-        return False
+        return None
 
     u_in, u_out = unit(v_in), unit(v_out)
     if u_in is None or u_out is None:
-        return False
+        return None
     cos_angle = float(np.clip(np.dot(u_in, u_out), -1.0, 1.0))
     angle_deg = float(np.degrees(np.arccos(cos_angle)))
     speed_ratio = out_len / max(in_len, 1e-6)
-    return angle_deg >= min_angle_deg or speed_ratio >= min_speed_ratio
+    return angle_deg, speed_ratio
+
+
+def ball_redirected_at_touch(
+    frames_by_idx: dict[int, sv.Detections],
+    touch_frame: int,
+    *,
+    lookback: int = 5,
+    lookahead: int = 5,
+    min_angle_deg: float = 28.0,
+    min_speed_ratio: float = 1.35,
+    min_segment_px: float = 10.0,
+) -> bool:
+    """True when inbound/outbound ball vectors diverge at ``touch_frame`` (kick, not fly-by)."""
+    metrics = _ball_touch_path_metrics(
+        frames_by_idx,
+        touch_frame,
+        lookback=lookback,
+        lookahead=lookahead,
+        min_segment_px=min_segment_px,
+    )
+    if metrics is None:
+        return False
+    angle_deg, speed_ratio = metrics
+    return (
+        speed_ratio >= min_speed_ratio
+        or (min_angle_deg <= angle_deg <= 135.0)
+    )
+
+
+def is_gravity_arc_flyby_at_touch(
+    frames_by_idx: dict[int, sv.Detections],
+    touch_frame: int,
+    *,
+    lookback: int = 5,
+    lookahead: int = 5,
+    max_angle_deg: float = 28.0,
+    max_speed_ratio: float = 1.35,
+    min_segment_px: float = 10.0,
+) -> bool:
+    """True when the ball continues on the same arc through ``touch_frame`` (gravity only)."""
+    metrics = _ball_touch_path_metrics(
+        frames_by_idx,
+        touch_frame,
+        lookback=lookback,
+        lookahead=lookahead,
+        min_segment_px=min_segment_px,
+    )
+    if metrics is None:
+        return False
+    angle_deg, speed_ratio = metrics
+    return angle_deg < max_angle_deg and speed_ratio < max_speed_ratio
 
 
 def is_valid_possession_touch(
@@ -361,7 +412,20 @@ def is_valid_possession_touch(
         release_ball=release_ball,
         release_gap_frames=release_gap_frames,
     )
+    ball = carrier.ball
+    release_inbound_flyby = (
+        release_ball is not None
+        and release_gap_frames is not None
+        and is_release_inbound_flyby(
+            release_ball,
+            ball,
+            release_gap_frames=release_gap_frames,
+            config=config,
+        )
+    )
     if is_transit_flyby_touch(dets, carrier, **transit_kwargs):
+        if release_inbound_flyby:
+            return False
         if (
             frames_by_idx is not None
             and frame_idx is not None
@@ -378,6 +442,23 @@ def is_valid_possession_touch(
             pass
         else:
             return False
+    if (
+        release_ball is not None
+        and release_gap_frames is not None
+        and release_gap_frames >= config.gravity_flyby_min_release_gap_frames
+        and frames_by_idx is not None
+        and frame_idx is not None
+        and is_gravity_arc_flyby_at_touch(
+            frames_by_idx,
+            frame_idx,
+            lookback=config.redirect_lookback_frames,
+            lookahead=config.redirect_lookahead_frames,
+            max_angle_deg=config.redirect_min_angle_deg,
+            max_speed_ratio=config.redirect_min_speed_ratio,
+            min_segment_px=config.redirect_min_segment_px,
+        )
+    ):
+        return False
     if touch_kind == "control" and is_aerial_touch(
         dets, carrier, threshold_px=config.aerial_dy_threshold_px
     ):

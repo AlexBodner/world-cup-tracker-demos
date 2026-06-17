@@ -9,6 +9,7 @@ import supervision as sv
 from world_cup_projects.common.possession_touch import (
     ball_departed_for_one_touch,
     ball_redirected_at_touch,
+    is_gravity_arc_flyby_at_touch,
 )
 from world_cup_projects.common.soccernet import ROLE_BALL, ROLE_PLAYER
 
@@ -184,3 +185,25 @@ def test_ball_redirected_detects_direction_change():
         )
     assert ball_redirected_at_touch(frames_by_idx, 4, lookback=3, lookahead=2)
     assert not ball_redirected_at_touch(frames_by_idx, 2, lookback=2, lookahead=2)
+
+
+def test_gravity_arc_flyby_rejects_unredirected_touch():
+    frames_by_idx: dict[int, sv.Detections] = {}
+    balls = [
+        (100.0, 180.0),
+        (130.0, 200.0),
+        (160.0, 230.0),
+        (190.0, 270.0),
+        (220.0, 320.0),
+        (250.0, 380.0),
+    ]
+    for fi, ball in enumerate(balls, start=1):
+        frames_by_idx[fi] = _player_ball_detections(
+            passer_tid=10,
+            receiver_tid=20,
+            team=0,
+            passer_feet=(100.0, 220.0),
+            receiver_feet=(420.0, 220.0),
+            ball=ball,
+        )
+    assert is_gravity_arc_flyby_at_touch(frames_by_idx, 3, lookback=2, lookahead=2)

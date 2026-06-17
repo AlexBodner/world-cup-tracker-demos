@@ -25,6 +25,7 @@ from world_cup_projects.common.visual import (
     draw_hud_bar,
     draw_pitch_keypoints_debug,
     draw_radar_minimap,
+    draw_score_chip,
     draw_text_shadow,
     ease_out_cubic,
 )
@@ -52,7 +53,7 @@ TEAM_COLORS_BGR = [c.as_bgr() for c in TEAM_COLORS[:2]]
 RANK_COLORS_BGR = [(80, 220, 60), (40, 220, 240), (40, 140, 255)]
 RANK_LABELS = ["BEST", "2ND", "3RD"]
 NEUTRAL_BGR = (200, 200, 200)
-TURNOVER_ACCENT_BGR = (72, 72, 255)
+TURNOVER_ARROW_BGR = (48, 168, 255)
 CARRIER_SHADOW_BGR = (228, 228, 228)
 
 
@@ -136,8 +137,8 @@ def _draw_turnover_notice(
     *,
     transformer=None,
 ) -> None:
-    """Banner + player highlights when possession is lost to the opponent."""
-    hold_frames = max(12, int(round(1.6 * frame_rate)))
+    """Compact turnover callout aligned with pass highlight styling."""
+    hold_frames = max(10, int(round(1.2 * frame_rate)))
     start = turnover.interception_frame
     if frame_idx < start or frame_idx > start + hold_frames:
         return
@@ -145,44 +146,18 @@ def _draw_turnover_notice(
     elapsed = frame_idx - start
     fade = 1.0 - ease_out_cubic(min(1.0, elapsed / max(hold_frames, 1)))
     h, w = image.shape[:2]
-    panel_h = 78
 
-    overlay = image.copy()
-    cv2.rectangle(overlay, (0, 0), (w, panel_h), (18, 18, 24), -1)
-    cv2.addWeighted(overlay, 0.88 * fade, image, 1.0 - 0.88 * fade, 0, image)
-    cv2.line(image, (0, panel_h), (w, panel_h), TURNOVER_ACCENT_BGR, 2)
-
-    cx = w // 2
-    _draw_centered_label(
-        image,
-        "POSSESSION LOST",
-        center_x=cx,
-        y=30,
-        font_scale=0.78,
-        color_bgr=TURNOVER_ACCENT_BGR,
-        thickness=2,
-    )
-    detail = f"#{turnover.passer_tid}  intercepted by  #{turnover.interceptor_tid}"
-    _draw_centered_label(
-        image,
-        detail,
-        center_x=cx,
-        y=58,
-        font_scale=0.52,
-        color_bgr=(220, 220, 220),
-        thickness=1,
-    )
-
-    pulse = 0.55 + 0.35 * np.sin(elapsed / max(frame_rate / 6, 1) * np.pi)
     passer_box = _get_player_box(dets, turnover.passer_tid)
     interceptor_box = _get_player_box(dets, turnover.interceptor_tid)
+    pulse = 0.5 + 0.3 * np.sin(elapsed / max(frame_rate / 5, 1) * np.pi)
+
     if passer_box is not None:
         _draw_ground_highlight(
             image,
             passer_box,
             _team_color(turnover.passer_team),
-            alpha=0.45 * fade,
-            scale=1.05,
+            alpha=0.42 * fade,
+            scale=1.0,
             transformer=transformer,
         )
     if interceptor_box is not None:
@@ -191,7 +166,7 @@ def _draw_turnover_notice(
             interceptor_box,
             _team_color(turnover.interceptor_team),
             alpha=pulse * fade,
-            scale=1.15,
+            scale=1.08,
             transformer=transformer,
         )
         feet = _get_player_feet(dets, turnover.interceptor_tid)
@@ -200,11 +175,31 @@ def _draw_turnover_notice(
                 image,
                 feet,
                 transformer=transformer,
-                color_bgr=TURNOVER_ACCENT_BGR,
-                radius_m=0.58,
-                alpha=pulse * fade,
-                pulse_t=min(1.0, elapsed / max(frame_rate * 0.25, 1)),
+                color_bgr=TURNOVER_ARROW_BGR,
+                radius_m=0.52,
+                alpha=pulse * fade * 0.85,
+                pulse_t=min(1.0, elapsed / max(frame_rate * 0.2, 1)),
             )
+
+    if passer_box is not None and interceptor_box is not None:
+        p_feet = (int((passer_box[0] + passer_box[2]) / 2), int(passer_box[3]))
+        r_feet = (int((interceptor_box[0] + interceptor_box[2]) / 2), int(interceptor_box[3]))
+        draw_glow_arrow(
+            image,
+            p_feet,
+            r_feet,
+            TURNOVER_ARROW_BGR,
+            thickness=3,
+            alpha=0.4 * fade,
+        )
+
+    chip_y = h - 36
+    draw_score_chip(
+        image,
+        f"TURNOVER  #{turnover.passer_tid} \u2192 #{turnover.interceptor_tid}",
+        (w // 2, chip_y),
+        bg_bgr=(18, 18, 22),
+    )
 
 
 def _draw_pass_highlights(
@@ -303,6 +298,14 @@ def _draw_pass_highlights(
                     if np.hypot(current_tip_x - damped_origin_x, current_tip_y - damped_origin_y) > 5:
                         # Lower alpha to make it less invasive (0.35 instead of 0.8)
                         draw_glow_arrow(image, damped_origin, current_tip, color, alpha=0.35)
+
+                if p.gap_frames >= 40:
+                    draw_score_chip(
+                        image,
+                        f"#{p.passer_tid} \u2192 #{p.receiver_tid}",
+                        (image.shape[1] // 2, 52),
+                        bg_bgr=(18, 18, 22),
+                    )
 
             elif frame_idx <= end_idx and draw_player_halos:
                 # 2. Reception Phase: Twinkle 2 times, arrow removed
@@ -504,6 +507,30 @@ def _stats_end_card(size: tuple[int, int], network: PassNetwork) -> np.ndarray:
     )
 
     y_links = 170
+    if network.turnovers:
+        draw_text_shadow(
+            card,
+            "TURNOVERS",
+            (40, y_links),
+            font_scale=0.72,
+            color_bgr=TURNOVER_ARROW_BGR,
+            thickness=2,
+        )
+        for rank, turnover in enumerate(network.turnovers[:4], 1):
+            line = (
+                f"{rank}.  #{turnover.passer_tid} \u2192 #{turnover.interceptor_tid}"
+                f"   (f{turnover.release_frame}\u2013{turnover.interception_frame})"
+            )
+            draw_text_shadow(
+                card,
+                line,
+                (44, y_links + rank * 34),
+                font_scale=0.58,
+                color_bgr=(210, 210, 215),
+                thickness=1,
+            )
+        y_links += 4 * 34 + 28
+
     draw_text_shadow(
         card,
         "TOP COLLABORATORS",
