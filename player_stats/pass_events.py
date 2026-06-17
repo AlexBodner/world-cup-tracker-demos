@@ -70,6 +70,7 @@ from world_cup_projects.common.possession_touch import (
     is_aerial_flyby_below_feet,
     is_aerial_touch,
     is_release_inbound_flyby,
+    redirect_overrides_transit_flyby,
     is_valid_possession_touch,
     reception_aerial_veto_threshold,
 )
@@ -611,7 +612,18 @@ def _touch_valid_or_redirect(
         )
     ):
         return False
-    if not _ball_redirected(frames_by_idx, frame_idx, config=config):
+    if (
+        release_ball is not None
+        and release_gap_frames is not None
+        and not redirect_overrides_transit_flyby(
+            frames_by_idx,
+            frame_idx,
+            config=touch_cfg,
+            release_gap_frames=release_gap_frames,
+        )
+    ):
+        return False
+    elif not _ball_redirected(frames_by_idx, frame_idx, config=config):
         return False
     if touch_kind == "control" and is_aerial_touch(
         dets, carrier, threshold_px=touch_cfg.aerial_dy_threshold_px

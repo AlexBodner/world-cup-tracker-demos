@@ -187,6 +187,36 @@ def test_ball_redirected_detects_direction_change():
     assert not ball_redirected_at_touch(frames_by_idx, 2, lookback=2, lookahead=2)
 
 
+def test_redirect_overrides_transit_flyby_requires_angle_during_release():
+    from world_cup_projects.common.possession_touch import (
+        TouchValidationConfig,
+        redirect_overrides_transit_flyby,
+    )
+
+    frames_by_idx: dict[int, sv.Detections] = {}
+    balls = [
+        (100.0, 200.0),
+        (130.0, 205.0),
+        (160.0, 212.0),
+        (190.0, 220.0),
+        (220.0, 228.0),
+        (250.0, 236.0),
+    ]
+    for fi, ball in enumerate(balls, start=1):
+        frames_by_idx[fi] = _player_ball_detections(
+            passer_tid=10,
+            receiver_tid=20,
+            team=0,
+            passer_feet=(100.0, 220.0),
+            receiver_feet=(420.0, 220.0),
+            ball=ball,
+        )
+    cfg = TouchValidationConfig(gravity_flyby_min_release_gap_frames=15)
+    assert not redirect_overrides_transit_flyby(
+        frames_by_idx, 4, config=cfg, release_gap_frames=27
+    )
+
+
 def test_gravity_arc_flyby_rejects_unredirected_touch():
     frames_by_idx: dict[int, sv.Detections] = {}
     balls = [

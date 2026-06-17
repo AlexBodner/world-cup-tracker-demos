@@ -374,6 +374,40 @@ def is_gravity_arc_flyby_at_touch(
     return angle_deg < max_angle_deg and speed_ratio < max_speed_ratio
 
 
+def redirect_overrides_transit_flyby(
+    frames_by_idx: dict[int, sv.Detections],
+    touch_frame: int,
+    *,
+    config: TouchValidationConfig,
+    release_gap_frames: int | None = None,
+) -> bool:
+    """True when a touch redirected the ball path enough to count as possession."""
+    metrics = _ball_touch_path_metrics(
+        frames_by_idx,
+        touch_frame,
+        lookback=config.redirect_lookback_frames,
+        lookahead=config.redirect_lookahead_frames,
+        min_segment_px=config.redirect_min_segment_px,
+    )
+    if metrics is None:
+        return False
+    angle_deg, speed_ratio = metrics
+    min_angle = config.redirect_min_angle_deg
+    min_ratio = config.redirect_min_speed_ratio
+    if (
+        release_gap_frames is not None
+        and release_gap_frames >= config.gravity_flyby_min_release_gap_frames
+    ):
+        return (
+            min_angle <= angle_deg <= 135.0
+            or (speed_ratio >= min_ratio and angle_deg >= min_angle)
+        )
+    return (
+        speed_ratio >= min_ratio
+        or (min_angle <= angle_deg <= 135.0)
+    )
+
+
 def is_valid_possession_touch(
     dets: sv.Detections,
     carrier: Carrier,
@@ -429,14 +463,11 @@ def is_valid_possession_touch(
         if (
             frames_by_idx is not None
             and frame_idx is not None
-            and ball_redirected_at_touch(
+            and redirect_overrides_transit_flyby(
                 frames_by_idx,
                 frame_idx,
-                lookback=config.redirect_lookback_frames,
-                lookahead=config.redirect_lookahead_frames,
-                min_angle_deg=config.redirect_min_angle_deg,
-                min_speed_ratio=config.redirect_min_speed_ratio,
-                min_segment_px=config.redirect_min_segment_px,
+                config=config,
+                release_gap_frames=release_gap_frames,
             )
         ):
             pass
