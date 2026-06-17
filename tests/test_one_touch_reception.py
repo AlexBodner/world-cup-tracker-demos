@@ -217,6 +217,35 @@ def test_redirect_overrides_transit_flyby_requires_angle_during_release():
     )
 
 
+def test_ball_path_samples_drop_single_frame_teleport():
+    from world_cup_projects.common.possession_touch import _ball_path_samples
+
+    frames_by_idx: dict[int, sv.Detections] = {}
+    frame_balls = {
+        441: (1400.0, 490.0),
+        442: (1420.0, 480.0),
+        443: (1440.0, 487.0),
+        444: (1460.0, 495.0),
+        445: (1477.0, 503.0),
+        446: (1495.0, 515.0),
+        448: (891.0, 730.0),  # one-frame teleport
+        449: (1548.0, 541.0),
+        450: (1567.0, 555.0),
+        451: (1582.0, 564.0),
+    }
+    for fi, ball in frame_balls.items():
+        frames_by_idx[fi] = _player_ball_detections(
+            passer_tid=10,
+            receiver_tid=20,
+            team=0,
+            passer_feet=(100.0, 220.0),
+            receiver_feet=(420.0, 220.0),
+            ball=ball,
+        )
+    samples = _ball_path_samples(frames_by_idx, 446, lookback=5, lookahead=5)
+    assert [f for f, _ in samples] == [441, 442, 443, 444, 445, 446, 449, 450, 451]
+
+
 def test_gravity_arc_flyby_rejects_unredirected_touch():
     frames_by_idx: dict[int, sv.Detections] = {}
     balls = [

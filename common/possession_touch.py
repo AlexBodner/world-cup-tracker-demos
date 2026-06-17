@@ -266,6 +266,40 @@ def is_transit_flyby_control(
     )
 
 
+_MAX_BALL_PATH_JUMP_PX_PER_FRAME = 180.0
+
+
+def _ball_path_samples(
+    frames_by_idx: dict[int, sv.Detections],
+    touch_frame: int,
+    *,
+    lookback: int,
+    lookahead: int,
+    max_jump_px_per_frame: float = _MAX_BALL_PATH_JUMP_PX_PER_FRAME,
+) -> list[tuple[int, np.ndarray]]:
+    """Ball positions near a touch, dropping single-frame detection teleports."""
+    samples: list[tuple[int, np.ndarray]] = []
+    prev_ball: np.ndarray | None = None
+    prev_frame: int | None = None
+    for frame_idx in range(touch_frame - lookback, touch_frame + lookahead + 1):
+        dets = frames_by_idx.get(frame_idx)
+        if dets is None:
+            continue
+        ball = ball_xy(dets)
+        if ball is None:
+            continue
+        point = np.asarray(ball, dtype=np.float64)
+        if prev_ball is not None and prev_frame is not None:
+            gap = max(1, frame_idx - prev_frame)
+            jump = float(np.hypot(point[0] - prev_ball[0], point[1] - prev_ball[1]))
+            if jump > max_jump_px_per_frame * gap:
+                continue
+        samples.append((frame_idx, point))
+        prev_ball = point
+        prev_frame = frame_idx
+    return samples
+
+
 def _ball_touch_path_metrics(
     frames_by_idx: dict[int, sv.Detections],
     touch_frame: int,
@@ -273,18 +307,24 @@ def _ball_touch_path_metrics(
     lookback: int = 5,
     lookahead: int = 5,
     min_segment_px: float = 10.0,
+    filter_teleports: bool = False,
 ) -> tuple[float, float] | None:
     """Inbound angle (deg) and outbound/inbound speed ratio at ``touch_frame``."""
     from world_cup_projects.common.geometry import unit
 
-    samples: list[tuple[int, np.ndarray]] = []
-    for frame_idx in range(touch_frame - lookback, touch_frame + lookahead + 1):
-        dets = frames_by_idx.get(frame_idx)
-        if dets is None:
-            continue
-        ball = ball_xy(dets)
-        if ball is not None:
-            samples.append((frame_idx, np.asarray(ball, dtype=np.float64)))
+    if filter_teleports:
+        samples = _ball_path_samples(
+            frames_by_idx, touch_frame, lookback=lookback, lookahead=lookahead
+        )
+    else:
+        samples: list[tuple[int, np.ndarray]] = []
+        for frame_idx in range(touch_frame - lookback, touch_frame + lookahead + 1):
+            dets = frames_by_idx.get(frame_idx)
+            if dets is None:
+                continue
+            ball = ball_xy(dets)
+            if ball is not None:
+                samples.append((frame_idx, np.asarray(ball, dtype=np.float64)))
     if len(samples) < 4:
         return None
 
@@ -388,6 +428,10 @@ def redirect_overrides_transit_flyby(
         lookback=config.redirect_lookback_frames,
         lookahead=config.redirect_lookahead_frames,
         min_segment_px=config.redirect_min_segment_px,
+        filter_teleports=(
+            release_gap_frames is not None
+            and release_gap_frames >= config.gravity_flyby_min_release_gap_frames
+        ),
     )
     if metrics is None:
         return False
@@ -398,6 +442,8 @@ def redirect_overrides_transit_flyby(
         release_gap_frames is not None
         and release_gap_frames >= config.gravity_flyby_min_release_gap_frames
     ):
+        if speed_ratio > 4.0:
+            return False
         return (
             min_angle <= angle_deg <= 135.0
             or (speed_ratio >= min_ratio and angle_deg >= min_angle)
@@ -470,7 +516,14 @@ def is_valid_possession_touch(
                 release_gap_frames=release_gap_frames,
             )
         ):
-            pass
+            if (
+                release_gap_frames is not None
+                and release_gap_frames >= config.gravity_flyby_min_release_gap_frames
+                and is_aerial_touch(
+                    dets, carrier, threshold_px=config.aerial_dy_threshold_px
+                )
+            ):
+                return False
         else:
             return False
     if (
