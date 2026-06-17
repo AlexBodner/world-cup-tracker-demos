@@ -299,14 +299,6 @@ def _draw_pass_highlights(
                         # Lower alpha to make it less invasive (0.35 instead of 0.8)
                         draw_glow_arrow(image, damped_origin, current_tip, color, alpha=0.35)
 
-                if p.gap_frames >= 40:
-                    draw_score_chip(
-                        image,
-                        f"#{p.passer_tid} \u2192 #{p.receiver_tid}",
-                        (image.shape[1] // 2, 52),
-                        bg_bgr=(18, 18, 22),
-                    )
-
             elif frame_idx <= end_idx and draw_player_halos:
                 # 2. Reception Phase: Twinkle 2 times, arrow removed
                 if receiver_box is not None:
