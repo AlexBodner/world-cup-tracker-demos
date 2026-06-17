@@ -7,12 +7,14 @@ import supervision as sv
 from trackers.utils.state_representations import XCYCWHStateEstimator, XYXYStateEstimator
 
 from world_cup_projects.common.geometry import unit
-from world_cup_projects.common.player_tracker import TrackerKind, create_player_tracker
+from world_cup_projects.common.player_tracker import (
+    DEFAULT_TRACK_ACTIVATION_THRESHOLD,
+    TrackerKind,
+    create_player_tracker,
+)
 from world_cup_projects.common.soccernet import ROLE_GOALKEEPER, ROLE_PLAYER
 
 DEFAULT_MIN_SPEED_PX = 0.5
-PLAYER_HEIGHT_M = 1.8
-DEFAULT_SPEED_HOMOGRAPHY_WEIGHT = 0.3
 
 
 def kalman_velocity_by_tracker_id(tracker, *, min_speed: float = DEFAULT_MIN_SPEED_PX) -> dict[int, np.ndarray]:
@@ -121,49 +123,27 @@ def kalman_ground_speed_m_s(
     transformer,
     *,
     fps: float,
-    box_height_px: float | None = None,
-    min_speed_px: float = DEFAULT_MIN_SPEED_PX,
-    homography_weight: float = DEFAULT_SPEED_HOMOGRAPHY_WEIGHT,
+    min_speed_px: float = 0.0,
 ) -> float | None:
-    """Ground speed (m/s) from Kalman image velocity.
-
-    Blends pitch-homography displacement with a player-height meters-per-pixel
-    estimate so broadcast homography scale error does not inflate labels.
-    """
+    """Ground speed (m/s) from Kalman image velocity via pitch homography."""
+    if transformer is None or fps <= 0:
+        return None
     vel = np.asarray(vel_px, dtype=np.float64).reshape(2)
     vx, vy = float(vel[0]), float(vel[1])
-    if not np.isfinite(vx) or not np.isfinite(vy) or fps <= 0:
-        return None
+    if not np.isfinite(vx) or not np.isfinite(vy):
+        return 0.0
     speed_px = float(np.hypot(vx, vy))
     if speed_px < min_speed_px:
+        return 0.0
+    from world_cup_projects.common.pitch import image_to_pitch_m
+
+    feet = np.asarray(feet_px, dtype=np.float64).reshape(2)
+    p0 = image_to_pitch_m(feet.reshape(1, 2), transformer)
+    p1 = image_to_pitch_m((feet + vel).reshape(1, 2), transformer)
+    if p0 is None or p1 is None:
         return None
-
-    homo_ms: float | None = None
-    if transformer is not None:
-        from world_cup_projects.common.pitch import image_to_pitch_m
-
-        feet = np.asarray(feet_px, dtype=np.float64).reshape(2)
-        p0 = image_to_pitch_m(feet.reshape(1, 2), transformer)
-        p1 = image_to_pitch_m((feet + vel).reshape(1, 2), transformer)
-        if p0 is not None and p1 is not None:
-            delta_m = p1[0] - p0[0]
-            speed_m_per_frame = float(np.linalg.norm(delta_m))
-            if speed_m_per_frame >= 1e-9:
-                homo_ms = speed_m_per_frame * float(fps)
-
-    height_ms: float | None = None
-    if box_height_px is not None and box_height_px > 1.0:
-        mpp = PLAYER_HEIGHT_M / float(box_height_px)
-        height_ms = speed_px * mpp * float(fps)
-
-    if homo_ms is None and height_ms is None:
-        return None
-    if homo_ms is None:
-        return height_ms
-    if height_ms is None:
-        return homo_ms
-    w = float(np.clip(homography_weight, 0.0, 1.0))
-    return w * homo_ms + (1.0 - w) * height_ms
+    delta_m = p1[0] - p0[0]
+    return float(np.linalg.norm(delta_m)) * float(fps)
 
 
 class KalmanSpeedDisplaySmoother:
@@ -216,7 +196,7 @@ class KalmanFacingReplay:
         frame_rate: float,
         *,
         tracker_kind: TrackerKind = "bytetrack",
-        track_activation_threshold: float = 0.4,
+        track_activation_threshold: float = DEFAULT_TRACK_ACTIVATION_THRESHOLD,
         min_speed: float = DEFAULT_MIN_SPEED_PX,
     ) -> None:
         self._min_speed = min_speed

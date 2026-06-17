@@ -48,7 +48,7 @@ class CarrierTrackingConfig:
     min_arrival_frames: int = 3
     min_reception_arrival_frames: int = 2
     min_arrival_control_frames: int = 1
-    min_control_frames: int = 3
+    min_control_frames: int = 2
     min_gk_control_frames: int = 1
     pre_flight_release_window: int = 10
     adjacent_pass_max_gap_frames: int = 15

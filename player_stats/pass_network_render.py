@@ -20,40 +20,19 @@ from world_cup_projects.common.visual import (
     annotate_ball,
     annotate_players,
     draw_branding_tag,
-    draw_carrier_pulse,
+    draw_carrier_ground_ellipse,
     draw_glow_arrow,
     draw_hud_bar,
     draw_pitch_keypoints_debug,
     draw_radar_minimap,
     draw_text_shadow,
+    ease_out_cubic,
 )
 from world_cup_projects.pass_alternatives.lane_visual import (
     draw_blocking_rivals_on_frame,
     draw_pass_corridors_on_frame,
     draw_pass_lane_legend,
 )
-from world_cup_projects.common.visual import (
-    ROBOFLOW_PURPLE_BGR,
-    TEAM_COLORS,
-    annotate_ball,
-    annotate_players,
-    draw_branding_tag,
-    draw_carrier_halo,
-    draw_carrier_pulse,
-    draw_carrier_spotlight,
-    draw_glow_arrow,
-    draw_hud_bar,
-    draw_pass_analysis_panel,
-    draw_pitch_keypoints_debug,
-    draw_radar_minimap,
-    draw_score_chip,
-    draw_text_shadow,
-    ease_out_cubic,
-)
-def _format_quality(value: float | None) -> str:
-    return "n/a" if value is None else f"{value:.2f}"
-
-
 from world_cup_projects.player_stats.carrier_tracking import CarrierFrameState
 from world_cup_projects.player_stats.pass_events import (
     InferredPass,
@@ -65,11 +44,16 @@ from world_cup_projects.player_stats.pass_network import (
     strongest_collaboration_pair,
 )
 
+
+def _format_quality(value: float | None) -> str:
+    return "n/a" if value is None else f"{value:.2f}"
+
 TEAM_COLORS_BGR = [c.as_bgr() for c in TEAM_COLORS[:2]]
 RANK_COLORS_BGR = [(80, 220, 60), (40, 220, 240), (40, 140, 255)]
 RANK_LABELS = ["BEST", "2ND", "3RD"]
 NEUTRAL_BGR = (200, 200, 200)
 TURNOVER_ACCENT_BGR = (72, 72, 255)
+CARRIER_SHADOW_BGR = (228, 228, 228)
 
 
 def _team_color(team: int) -> tuple[int, int, int]:
@@ -92,22 +76,24 @@ def _draw_ground_highlight(
     *,
     alpha: float = 1.0,
     scale: float = 1.0,
+    transformer=None,
 ) -> None:
-    """Draw a perspective-aware ellipse on the ground at the player's feet."""
+    """Draw a pitch-projected ground ellipse at the player's feet."""
     x0, y0, x1, y1 = box
-    cx, cy = int((x0 + x1) / 2), int(y1)
-    w = int((x1 - x0) * 0.8 * scale)
-    h = int(w / 3)
-    
-    overlay = image.copy()
-    # Fill the ellipse with a semi-transparent version of the team color
-    cv2.ellipse(overlay, (cx, cy), (w, h), 0, 0, 360, color_bgr, -1, cv2.LINE_AA)
-    cv2.addWeighted(overlay, alpha * 0.4, image, 1.0 - alpha * 0.4, 0, image)
-    
-    # Draw a solid outline
-    overlay_outline = image.copy()
-    cv2.ellipse(overlay_outline, (cx, cy), (w, h), 0, 0, 360, color_bgr, 3, cv2.LINE_AA)
-    cv2.addWeighted(overlay_outline, alpha, image, 1.0 - alpha, 0, image)
+    feet = np.array([(x0 + x1) * 0.5, y1], dtype=np.float64)
+    radius_m = 0.45 * scale
+    radius_px = max(int((x1 - x0) * 0.35 * scale), 10)
+    draw_carrier_ground_ellipse(
+        image,
+        feet,
+        transformer=transformer,
+        color_bgr=color_bgr,
+        radius_m=radius_m,
+        radius_px=radius_px,
+        alpha=alpha,
+        thickness=2,
+        filled=True,
+    )
 
 
 def _draw_centered_label(
@@ -132,12 +118,23 @@ def _draw_centered_label(
     )
 
 
+def _get_player_feet(dets: sv.Detections, tid: int) -> np.ndarray | None:
+    if dets.tracker_id is None:
+        return None
+    idx = np.flatnonzero(dets.tracker_id == tid)
+    if len(idx) == 0:
+        return None
+    return feet_xy(dets)[idx[0]]
+
+
 def _draw_turnover_notice(
     image: np.ndarray,
     dets: sv.Detections,
     turnover: InferredTurnover,
     frame_idx: int,
     frame_rate: float,
+    *,
+    transformer=None,
 ) -> None:
     """Banner + player highlights when possession is lost to the opponent."""
     hold_frames = max(12, int(round(1.6 * frame_rate)))
@@ -186,6 +183,7 @@ def _draw_turnover_notice(
             _team_color(turnover.passer_team),
             alpha=0.45 * fade,
             scale=1.05,
+            transformer=transformer,
         )
     if interceptor_box is not None:
         _draw_ground_highlight(
@@ -194,13 +192,19 @@ def _draw_turnover_notice(
             _team_color(turnover.interceptor_team),
             alpha=pulse * fade,
             scale=1.15,
+            transformer=transformer,
         )
-        pcx = int((interceptor_box[0] + interceptor_box[2]) / 2)
-        pcy = int(interceptor_box[3])
-        draw_carrier_pulse(
-            image, (pcx, pcy), min(1.0, elapsed / max(frame_rate * 0.25, 1)),
-            color_bgr=TURNOVER_ACCENT_BGR,
-        )
+        feet = _get_player_feet(dets, turnover.interceptor_tid)
+        if feet is not None:
+            draw_carrier_ground_ellipse(
+                image,
+                feet,
+                transformer=transformer,
+                color_bgr=TURNOVER_ACCENT_BGR,
+                radius_m=0.58,
+                alpha=pulse * fade,
+                pulse_t=min(1.0, elapsed / max(frame_rate * 0.25, 1)),
+            )
 
 
 def _draw_pass_highlights(
@@ -213,11 +217,25 @@ def _draw_pass_highlights(
     frame_transforms: dict | None = None,
     *,
     draw_player_halos: bool = True,
+    transformer=None,
 ) -> None:
     """Highlight active passes: pulse passer/receiver and draw the lane arrow."""
     from world_cup_projects.common.possession import ball_xy
+    from world_cup_projects.player_stats.pass_events import passes_for_overlay
+
+    passes = passes_for_overlay(passes)
+
+    in_flight = [
+        p
+        for p in passes
+        if p.frame_idx <= frame_idx <= p.frame_idx + p.gap_frames
+    ]
+    if len(in_flight) > 1:
+        in_flight.sort(key=lambda p: (p.frame_idx, -(p.quality_score or 0.0)))
+        in_flight = in_flight[:1]
+    highlight_passes = tuple(in_flight) if in_flight else passes
     
-    for p in passes:
+    for p in highlight_passes:
         # Window: from release frame to 0.5s after reception
         receive_idx = p.frame_idx + p.gap_frames
         twinkle_duration = int(frame_rate * 0.5)
@@ -235,9 +253,13 @@ def _draw_pass_highlights(
                 
                 if draw_player_halos:
                     if passer_box is not None:
-                        _draw_ground_highlight(image, passer_box, color, alpha=pulse_alpha)
+                        _draw_ground_highlight(
+                            image, passer_box, color, alpha=pulse_alpha, transformer=transformer
+                        )
                     if receiver_box is not None:
-                        _draw_ground_highlight(image, receiver_box, color, alpha=pulse_alpha)
+                        _draw_ground_highlight(
+                            image, receiver_box, color, alpha=pulse_alpha, transformer=transformer
+                        )
 
                 # Smooth the arrow by fixing the origin if possible
                 if passer_box is not None and receiver_box is not None:
@@ -301,6 +323,7 @@ def _draw_pass_highlights(
                         color,
                         alpha=twinkle_alpha * 0.9,
                         scale=twinkle_scale,
+                        transformer=transformer,
                     )
 
 
@@ -557,6 +580,8 @@ def _draw_carrier_debug(
     image: np.ndarray,
     dets: sv.Detections,
     state: CarrierFrameState,
+    *,
+    transformer=None,
 ) -> None:
     """HUD + highlights showing how possession is resolved on this frame."""
     h, w = image.shape[:2]
@@ -579,23 +604,33 @@ def _draw_carrier_debug(
         lines.append(f"CONTROL: #{state.control_tid}  ({dist})")
         box = _get_player_box(dets, state.control_tid)
         if box is not None:
-            _draw_ground_highlight(image, box, (60, 220, 60), alpha=0.9, scale=1.1)
+            _draw_ground_highlight(
+                image, box, (60, 220, 60), alpha=0.9, scale=1.1, transformer=transformer
+            )
 
     if state.reception_tid is not None and state.reception_tid != state.control_tid:
         dist = f"{state.reception_dist:.2f}m" if state.reception_dist is not None else "?"
         lines.append(f"RECEPTION: #{state.reception_tid}  ({dist})")
         box = _get_player_box(dets, state.reception_tid)
         if box is not None:
-            _draw_ground_highlight(image, box, (40, 200, 255), alpha=0.7, scale=0.95)
+            _draw_ground_highlight(
+                image, box, (40, 200, 255), alpha=0.7, scale=0.95, transformer=transformer
+            )
 
     if state.active_tid is not None:
         lines.append(f"ACTIVE: #{state.active_tid}  [{state.active_kind}]")
-        box = _get_player_box(dets, state.active_tid)
-        if box is not None:
-            cx = int((box[0] + box[2]) / 2)
-            cy = int(box[3])
+        feet = _get_player_feet(dets, state.active_tid)
+        if feet is not None:
             t = (state.frame_idx % 30) / 30.0
-            draw_carrier_pulse(image, (cx, cy), t, color_bgr=(80, 255, 120))
+            draw_carrier_ground_ellipse(
+                image,
+                feet,
+                transformer=transformer,
+                color_bgr=(80, 255, 120),
+                radius_m=0.52,
+                alpha=0.8,
+                pulse_t=t,
+            )
     else:
         flight = " (IN FLIGHT)" if state.in_flight else ""
         lines.append(f"ACTIVE: none{flight}")
@@ -696,20 +731,40 @@ def render_pass_network_demo(
         )
         if carrier is not None:
             feet = feet_xy(dets)[carrier.index]
-            draw_carrier_halo(image, (int(feet[0]), int(feet[1])))
+            draw_carrier_ground_ellipse(
+                image,
+                feet,
+                transformer=transformer if metric else None,
+                color_bgr=CARRIER_SHADOW_BGR,
+                radius_m=0.5,
+                alpha=0.42,
+                filled=True,
+                thickness=1,
+            )
 
         # 2. Historical Network (Collaboration Web)
         _draw_collaboration_web(image, dets, frame_idx, network.passes)
 
         # 3. Active Pass Events (Highlights + Arrow)
         _draw_pass_highlights(
-            image, dets, frame_idx, network.passes, sequence.frame_rate
+            image,
+            dets,
+            frame_idx,
+            network.passes,
+            sequence.frame_rate,
+            frame_transforms=frame_transforms,
+            transformer=transformer if metric else None,
         )
 
         # 4. Turnovers (possession lost)
         for turnover in network.turnovers:
             _draw_turnover_notice(
-                image, dets, turnover, frame_idx, sequence.frame_rate
+                image,
+                dets,
+                turnover,
+                frame_idx,
+                sequence.frame_rate,
+                transformer=transformer if metric else None,
             )
 
         # 5. Predictive Freeze (If applicable)
@@ -776,7 +831,9 @@ def render_pass_network_demo(
         if debug_carrier and carrier_timeline is not None:
             state = carrier_timeline.get(frame_idx)
             if state is not None:
-                _draw_carrier_debug(image, dets, state)
+                _draw_carrier_debug(
+                    image, dets, state, transformer=transformer if metric else None
+                )
 
         # 7. Metadata/Debug
         if metric and transformer is None and frame_transforms is not None:

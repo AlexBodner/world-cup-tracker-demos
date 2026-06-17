@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import colorsys
 from typing import TYPE_CHECKING, Literal
 
 if TYPE_CHECKING:
@@ -21,6 +22,8 @@ from world_cup_projects.common.pitch import (
     draw_pitch,
     draw_points_on_pitch,
     image_to_pitch_cm,
+    image_to_pitch_m,
+    pitch_circle_to_image,
     pitch_cm_to_image,
     pitch_keypoint_accept_mask,
     pitch_keypoint_confidence,
@@ -57,6 +60,38 @@ _BALL_TRI = sv.TriangleAnnotator(
 )
 _GK_ELLIPSE = sv.EllipseAnnotator(
     color=sv.Color.from_hex("#E8E8E8"), thickness=2
+)
+
+
+def track_id_palette(*, size: int = 64) -> sv.ColorPalette:
+    """Distinct hues for ``ColorLookup.TRACK`` (stable color per ``tracker_id``)."""
+    colors: list[sv.Color] = []
+    for i in range(size):
+        hue = (i * 0.618033988749895) % 1.0
+        red, green, blue = colorsys.hsv_to_rgb(hue, 0.85, 0.95)
+        colors.append(
+            sv.Color(
+                r=int(red * 255),
+                g=int(green * 255),
+                b=int(blue * 255),
+            )
+        )
+    return sv.ColorPalette(colors)
+
+
+_TRACK_ID_PALETTE = track_id_palette()
+_TRACK_ELLIPSE = sv.EllipseAnnotator(
+    color=_TRACK_ID_PALETTE,
+    color_lookup=sv.ColorLookup.TRACK,
+    thickness=2,
+)
+_TRACK_LABEL = sv.LabelAnnotator(
+    text_position=sv.Position.BOTTOM_CENTER,
+    text_scale=0.45,
+    text_thickness=1,
+    border_radius=4,
+    color=_TRACK_ID_PALETTE,
+    color_lookup=sv.ColorLookup.TRACK,
 )
 
 
@@ -269,7 +304,129 @@ def _dot_radius_for_ellipse(semi_axis_a: float) -> int:
     return int(np.clip(round(semi_axis_a * 0.13), 3, 8))
 
 
-KALMAN_SPEED_MS_TO_KMH = 3.6
+_KALMAN_SPEED_BADGE_BG_BGR = (16, 18, 24)
+KALMAN_SPEED_SPRINT_MS = 5.0
+
+
+def format_kalman_speed_value(speed_m_s: float) -> str:
+    """Round to 1 decimal m/s — readable without false precision."""
+    speed_m_s = max(0.0, float(speed_m_s))
+    return f"{round(speed_m_s, 1):.1f}"
+
+
+def _kalman_speed_badge_radial(
+    cx: float,
+    cy: float,
+    px: float,
+    py: float,
+    vx: float,
+    vy: float,
+    *,
+    min_speed_px: float = 0.5,
+) -> tuple[float, float]:
+    """Outward ray for the badge: stick direction, else Kalman velocity, else up."""
+    dx, dy = float(px - cx), float(py - cy)
+    dist = float(np.hypot(dx, dy))
+    if dist >= 1.0:
+        return dx / dist, dy / dist
+    speed = float(np.hypot(vx, vy))
+    if np.isfinite(vx) and np.isfinite(vy) and speed >= min_speed_px:
+        return vx / speed, vy / speed
+    return 0.0, -1.0
+
+
+def draw_kalman_speed_badge(
+    frame: np.ndarray,
+    speed_m_s: float,
+    cx: float,
+    cy: float,
+    px: int,
+    py: int,
+    vx: float,
+    vy: float,
+    *,
+    team_bgr: tuple[int, int, int],
+    dot_radius: int,
+    min_speed_px: float = 0.5,
+) -> None:
+    """Speed chip riding just outside the smoothed joystick dot along the stick ray."""
+    value = format_kalman_speed_value(speed_m_s)
+    font = cv2.FONT_HERSHEY_DUPLEX
+    value_scale, value_thick = 0.48, 1
+
+    (vw, vh), baseline = cv2.getTextSize(value, font, value_scale, value_thick)
+    pad_x, pad_y = 3, 2
+    rail_w = 2
+    box_w = vw + pad_x * 2 + rail_w
+    box_h = vh + baseline + pad_y * 2
+
+    ux, uy = _kalman_speed_badge_radial(
+        cx, cy, float(px), float(py), vx, vy, min_speed_px=min_speed_px
+    )
+    outward = float(dot_radius) + 5.0 + box_h * 0.5
+    bcx = float(px) + ux * outward
+    bcy = float(py) + uy * outward
+
+    x0 = int(round(bcx - box_w * 0.5))
+    y0 = int(round(bcy - box_h * 0.5))
+    x1 = x0 + box_w
+    y1 = y0 + box_h
+
+    fh, fw = frame.shape[:2]
+    x0 = int(np.clip(x0, 2, max(2, fw - box_w - 2)))
+    x1 = x0 + box_w
+    y0 = int(np.clip(y0, 2, max(2, fh - box_h - 2)))
+    y1 = y0 + box_h
+
+    border = (
+        team_bgr
+        if speed_m_s >= KALMAN_SPEED_SPRINT_MS
+        else tuple(int(c * 0.7) for c in team_bgr)
+    )
+
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (x0, y0), (x1, y1), _KALMAN_SPEED_BADGE_BG_BGR, -1)
+    cv2.rectangle(overlay, (x0, y0), (x0 + rail_w, y1), team_bgr, -1)
+    cv2.rectangle(overlay, (x0, y0), (x1, y1), border, 1, cv2.LINE_AA)
+    frame[:] = cv2.addWeighted(overlay, 0.62, frame, 0.38, 0)
+
+    text_x = x0 + rail_w + pad_x
+    text_y = y0 + pad_y + vh
+    draw_text_shadow(
+        frame,
+        value,
+        (text_x, text_y),
+        font_scale=value_scale,
+        color_bgr=(240, 242, 248),
+        thickness=value_thick,
+        shadow_offset=(1, 1),
+    )
+
+
+def draw_kalman_speed_legend(frame: np.ndarray) -> np.ndarray:
+    """Global unit key — numbers on players are m/s."""
+    text = "speed  m/s"
+    font = cv2.FONT_HERSHEY_DUPLEX
+    scale, thick = 0.42, 1
+    (tw, th), baseline = cv2.getTextSize(text, font, scale, thick)
+    pad_x, pad_y = 8, 5
+    x0, y1 = 12, frame.shape[0] - 12
+    y0 = y1 - th - baseline - pad_y * 2
+    x1 = x0 + tw + pad_x * 2
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (x0, y0), (x1, y1), (16, 18, 24), -1)
+    cv2.rectangle(overlay, (x0, y0), (x1, y1), (70, 72, 82), 1, cv2.LINE_AA)
+    frame[:] = cv2.addWeighted(overlay, 0.62, frame, 0.38, 0)
+    draw_text_shadow(
+        frame,
+        text,
+        (x0 + pad_x, y0 + pad_y + th),
+        font_scale=scale,
+        color_bgr=(175, 180, 192),
+        thickness=thick,
+        shadow_offset=(1, 1),
+    )
+    return frame
 
 
 def draw_kalman_joystick_dots(
@@ -283,8 +440,9 @@ def draw_kalman_joystick_dots(
     transformer=None,
     fps: float = 25.0,
     show_speed: bool = False,
-    min_speed_kmh: float = 4.0,
-    speed_homography_weight: float = 0.3,
+    min_speed_ms: float = 0.0,
+    max_speed_labels: int = 0,
+    speed_source: str = "kalman",
 ) -> np.ndarray:
     """PlayStation-style direction dot on each player ellipse from Kalman velocity."""
     if len(dets) == 0 or dets.data is None:
@@ -304,6 +462,9 @@ def draw_kalman_joystick_dots(
     feet = feet_xy(dets) if show_speed else None
     teams = dets.data.get("team", np.full(len(dets), -1))
     tids = dets.tracker_id if dets.tracker_id is not None else np.full(len(dets), -1, dtype=int)
+    speed_badges: list[
+        tuple[float, int, int, int, int, int, float, float, tuple[int, int, int]]
+    ] = []
     for i in np.flatnonzero(pmask):
         team = int(teams[i])
         if team not in (0, 1):
@@ -338,31 +499,55 @@ def draw_kalman_joystick_dots(
             px, py = int(px), int(py)
         dot_color = TEAM_COLORS[team].as_bgr()
         cv2.circle(frame, (px, py), radius, dot_color, -1, cv2.LINE_AA)
-        if show_speed and feet is not None and speed_px >= min_speed_px:
-            box_h = float(dets.xyxy[i, 3] - dets.xyxy[i, 1])
-            speed_m_s = kalman_ground_speed_m_s(
-                feet[i],
-                np.array([vx, vy], dtype=np.float64),
-                transformer,
-                fps=fps,
-                box_height_px=box_h,
-                min_speed_px=min_speed_px,
-                homography_weight=speed_homography_weight,
-            )
-            if speed_m_s is not None:
+        if show_speed:
+            if speed_source == "multilag":
+                speed_arr = dets.data.get("speed_ms") if dets.data else None
+                speed_m_s = (
+                    float(speed_arr[i])
+                    if speed_arr is not None and np.isfinite(speed_arr[i])
+                    else 0.0
+                )
                 if speed_smoother is not None:
                     speed_m_s = speed_smoother.smooth(int(tids[i]), speed_m_s)
-                speed_kmh = speed_m_s * KALMAN_SPEED_MS_TO_KMH
-                if speed_kmh >= min_speed_kmh:
-                    label = f"{speed_kmh:.1f}"
-                    draw_text_shadow(
-                        frame,
-                        label,
-                        (px - 8, py - radius - 6),
-                        font_scale=0.42,
-                        color_bgr=dot_color,
-                        thickness=1,
+            elif feet is not None:
+                if np.isfinite(vx) and np.isfinite(vy):
+                    speed_m_s = kalman_ground_speed_m_s(
+                        feet[i],
+                        np.array([vx, vy], dtype=np.float64),
+                        transformer,
+                        fps=fps,
                     )
+                else:
+                    speed_m_s = 0.0
+                if speed_m_s is not None and speed_smoother is not None:
+                    speed_m_s = speed_smoother.smooth(int(tids[i]), speed_m_s)
+                elif speed_m_s is None:
+                    speed_m_s = 0.0
+            else:
+                speed_m_s = 0.0
+            if speed_m_s >= min_speed_ms:
+                speed_badges.append(
+                    (speed_m_s, cx, cy, px, py, radius, vx, vy, dot_color)
+                )
+
+    if show_speed and speed_badges:
+        if max_speed_labels > 0:
+            speed_badges.sort(key=lambda item: item[0], reverse=True)
+            speed_badges = speed_badges[:max_speed_labels]
+        for speed_m_s, cx, cy, px, py, radius, vx, vy, color in speed_badges:
+            draw_kalman_speed_badge(
+                frame,
+                speed_m_s,
+                float(cx),
+                float(cy),
+                px,
+                py,
+                vx,
+                vy,
+                team_bgr=color,
+                dot_radius=radius,
+                min_speed_px=min_speed_px,
+            )
     return frame
 
 
@@ -377,8 +562,9 @@ def annotate_kalman_motion_players(
     transformer=None,
     fps: float = 25.0,
     show_speed: bool = False,
-    min_speed_kmh: float = 4.0,
-    speed_homography_weight: float = 0.3,
+    min_speed_ms: float = 0.0,
+    max_speed_labels: int = 0,
+    speed_source: str = "kalman",
 ) -> np.ndarray:
     """Team ellipses + Kalman joystick dots only (no labels, ball, or radar)."""
     outfield = dets[dets.class_id == ROLE_PLAYER]
@@ -408,7 +594,7 @@ def annotate_kalman_motion_players(
         if (~has_team).any():
             frame = _GK_ELLIPSE.annotate(frame, gks[~has_team])
 
-    return draw_kalman_joystick_dots(
+    frame = draw_kalman_joystick_dots(
         frame,
         dets,
         min_speed_px=min_speed_px,
@@ -418,9 +604,13 @@ def annotate_kalman_motion_players(
         transformer=transformer,
         fps=fps,
         show_speed=show_speed,
-        min_speed_kmh=min_speed_kmh,
-        speed_homography_weight=speed_homography_weight,
+        min_speed_ms=min_speed_ms,
+        max_speed_labels=max_speed_labels,
+        speed_source=speed_source,
     )
+    if show_speed:
+        frame = draw_kalman_speed_legend(frame)
+    return frame
 
 
 def draw_facing_legend(frame: np.ndarray) -> np.ndarray:
@@ -442,6 +632,17 @@ def _tracker_id_labels(dets: sv.Detections) -> list[str]:
     n = len(dets)
     tids = dets.tracker_id if dets.tracker_id is not None else np.full(n, -1, dtype=int)
     return [f"#{int(tid)}" if int(tid) >= 0 else "" for tid in tids]
+
+
+def annotate_tracking_players(frame: np.ndarray, dets: sv.Detections) -> np.ndarray:
+    """Players + GKs with one stable color per ``tracker_id`` and ID labels."""
+    trackable = dets[np.isin(dets.class_id, (ROLE_PLAYER, ROLE_GOALKEEPER))]
+    if len(trackable):
+        frame = _TRACK_ELLIPSE.annotate(frame, trackable)
+        frame = _TRACK_LABEL.annotate(
+            frame, trackable, labels=_tracker_id_labels(trackable)
+        )
+    return frame
 
 
 def annotate_players(
@@ -938,6 +1139,135 @@ def draw_carrier_halo(
         0,
         255,
     ).astype(np.uint8)
+
+
+def _draw_projected_ground_zone(
+    frame: np.ndarray,
+    poly: np.ndarray,
+    color_bgr: tuple[int, int, int],
+    *,
+    alpha: float,
+    thickness: int,
+    filled: bool,
+) -> None:
+    """Fill and/or outline a perspective ellipse polygon on the broadcast view."""
+    if poly is None or len(poly) < 3:
+        return
+    if filled and alpha > 0.01:
+        overlay = frame.copy()
+        cv2.fillPoly(overlay, [poly], color_bgr, lineType=cv2.LINE_AA)
+        frame[:] = cv2.addWeighted(overlay, alpha * 0.45, frame, 1.0 - alpha * 0.45, 0)
+    if thickness > 0 and alpha > 0.01:
+        outline = frame.copy()
+        cv2.polylines(
+            outline,
+            [poly],
+            isClosed=True,
+            color=color_bgr,
+            thickness=thickness,
+            lineType=cv2.LINE_AA,
+        )
+        frame[:] = cv2.addWeighted(outline, alpha, frame, 1.0 - alpha, 0)
+
+
+def _image_space_ground_ellipse(
+    frame: np.ndarray,
+    center: tuple[int, int],
+    *,
+    radius_px: int,
+    color_bgr: tuple[int, int, int],
+    alpha: float,
+    thickness: int,
+    filled: bool,
+) -> None:
+    """Fallback ellipse at the feet when homography is unavailable."""
+    cx, cy = int(center[0]), int(center[1])
+    axes = (max(radius_px, 8), max(radius_px // 3, 4))
+    if filled and alpha > 0.01:
+        overlay = frame.copy()
+        cv2.ellipse(overlay, (cx, cy), axes, 0, 0, 360, color_bgr, -1, cv2.LINE_AA)
+        frame[:] = cv2.addWeighted(overlay, alpha * 0.45, frame, 1.0 - alpha * 0.45, 0)
+    if thickness > 0 and alpha > 0.01:
+        outline = frame.copy()
+        cv2.ellipse(outline, (cx, cy), axes, 0, 0, 360, color_bgr, thickness, cv2.LINE_AA)
+        frame[:] = cv2.addWeighted(outline, alpha, frame, 1.0 - alpha, 0)
+
+
+def draw_carrier_ground_ellipse(
+    frame: np.ndarray,
+    center: tuple[float, float] | np.ndarray,
+    *,
+    transformer: ViewTransformer | None = None,
+    color_bgr: tuple[int, int, int] = ROBOFLOW_PURPLE_BGR,
+    radius_m: float = 0.55,
+    radius_px: int = 28,
+    alpha: float = 0.7,
+    thickness: int = 2,
+    filled: bool = True,
+    pulse_t: float | None = None,
+) -> bool:
+    """Highlight the carrier zone as a pitch-space circle (ellipse on the turf).
+
+    With homography, samples a ground circle in meters and projects it through H.
+    Without homography, falls back to a feet-centered image ellipse.
+    """
+    feet = np.asarray(center, dtype=np.float64).reshape(1, 2)
+    center_px = (int(round(feet[0, 0])), int(round(feet[0, 1])))
+
+    if pulse_t is not None:
+        for i, base_r in enumerate((0.40, 0.56, 0.72)):
+            phase = (pulse_t + i * 0.22) % 1.0
+            wave = 0.5 + 0.5 * np.sin(phase * 2.0 * np.pi)
+            ring_r = base_r * radius_m * (0.92 + 0.12 * wave)
+            ring_alpha = 0.18 + 0.16 * wave
+            if transformer is not None:
+                center_m = image_to_pitch_m(feet, transformer)
+                if center_m is not None:
+                    poly = pitch_circle_to_image(center_m[0], ring_r, transformer)
+                    _draw_projected_ground_zone(
+                        frame,
+                        poly,
+                        color_bgr,
+                        alpha=ring_alpha,
+                        thickness=2,
+                        filled=False,
+                    )
+                    continue
+            ring_px = int(radius_px * (0.75 + 0.35 * (i + 1) / 3.0) * (0.92 + 0.12 * wave))
+            _image_space_ground_ellipse(
+                frame,
+                center_px,
+                radius_px=ring_px,
+                color_bgr=color_bgr,
+                alpha=ring_alpha,
+                thickness=2,
+                filled=False,
+            )
+
+    if transformer is not None:
+        center_m = image_to_pitch_m(feet, transformer)
+        if center_m is not None:
+            poly = pitch_circle_to_image(center_m[0], radius_m, transformer)
+            _draw_projected_ground_zone(
+                frame,
+                poly,
+                color_bgr,
+                alpha=alpha,
+                thickness=thickness,
+                filled=filled,
+            )
+            return True
+
+    _image_space_ground_ellipse(
+        frame,
+        center_px,
+        radius_px=radius_px,
+        color_bgr=color_bgr,
+        alpha=alpha,
+        thickness=thickness,
+        filled=filled,
+    )
+    return False
 
 
 def draw_carrier_pulse(

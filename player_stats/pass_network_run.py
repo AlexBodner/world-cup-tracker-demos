@@ -148,9 +148,25 @@ def main() -> None:
     )
     parser.add_argument(
         "--ball-detector-backend",
-        choices=("none", "inference"),
-        default="none",
-        help="Optional dedicated ball model via Inference (needs ROBOFLOW_API_KEY)",
+        choices=("none", "yolo", "inference"),
+        default="yolo",
+        help=(
+            "Dedicated ball model stacked on the player detector (default: yolo). "
+            "'yolo' uses local football-ball-detection weights; "
+            "'inference' uses Roboflow Inference (needs ROBOFLOW_API_KEY); "
+            "'none' uses only the player model ball head."
+        ),
+    )
+    parser.add_argument(
+        "--ball-ensemble",
+        choices=("fallback", "merge"),
+        default="fallback",
+        dest="ball_ensemble_mode",
+        help=(
+            "How to combine player-model ball with --ball-detector-backend: "
+            "'fallback' runs the secondary model only when the primary missed; "
+            "'merge' always runs both and picks the ball nearest the action."
+        ),
     )
     parser.add_argument(
         "--ball-model-id",
@@ -294,10 +310,20 @@ def main() -> None:
     detections_source = _load_detections_source(args, sequence)
     end = args.max_frames if args.max_frames is not None else sequence.length
     frames = list(detections_source(sequence, start=1, end=end))
+    print(
+        f"Possession scan: sequence={sequence.name} "
+        f"tracker={args.tracker} device={args.device} frames={len(frames)}"
+    )
     if args.source in ("football", "rfdetr"):
-        from world_cup_projects.common.teams import stabilize_teams_by_tracklet
+        from world_cup_projects.common.teams import (
+            enforce_one_goalkeeper_per_team_frames,
+            stabilize_teams_by_tracklet,
+        )
 
         frames = stabilize_teams_by_tracklet(frames)
+        frames = enforce_one_goalkeeper_per_team_frames(
+            frames, frame_width=float(sequence.width)
+        )
 
     # Perform pitch transformation and goalkeeper stabilization early
     frame_transforms: dict = {}
@@ -321,7 +347,7 @@ def main() -> None:
 
         locked_goals = None
         cache_ok = False
-        if not args.refresh_detections_cache and cache_path.exists():
+        if cache_path.exists():
             import pickle
             with open(cache_path, "rb") as f:
                 cached_data = pickle.load(f)
@@ -376,6 +402,7 @@ def main() -> None:
                 locked_goal_defenders=locked_goals,
                 keypoints_by_frame=frame_keypoints,
                 pitch_confidence=args.pitch_confidence,
+                frame_width=float(sequence.width),
             )
 
     weights = PassWeights.metric() if args.metric else PassWeights()

@@ -25,6 +25,17 @@ class TouchValidationConfig:
     max_plausible_transit_speed_m_s: float = 35.0
     ball_speed_lookback_frames: int = 10
     ball_speed_min_lookback_frames: int = 3
+    # Long in-flight path from a known release point: slow average inbound speed
+    # means the ball is dropping through a zone, not possession at the feet.
+    transit_min_release_travel_px: float = 450.0
+    transit_min_release_gap_frames: int = 50
+    transit_release_flyby_max_speed_px_per_frame: float = 8.0
+    # Ball path redirect at a touch (one-touch kick / intercept) vs straight fly-by.
+    redirect_lookback_frames: int = 5
+    redirect_lookahead_frames: int = 5
+    redirect_min_angle_deg: float = 28.0
+    redirect_min_speed_ratio: float = 1.35
+    redirect_min_segment_px: float = 10.0
 
 
 def nearest_player_tid(dets: sv.Detections, ball: np.ndarray) -> int | None:
@@ -98,6 +109,67 @@ def ball_instant_speed_m_s(
     return dist_m * fps / frame_gap
 
 
+def inbound_speed_px_per_frame(
+    ref_ball: np.ndarray,
+    ball: np.ndarray,
+    *,
+    frame_gap: int,
+) -> tuple[float, float]:
+    """Return ``(travel_px, speed_px_per_frame)`` for an inbound ball path."""
+    gap = max(1, frame_gap)
+    travel_px = float(np.linalg.norm(ball - ref_ball))
+    return travel_px, travel_px / gap
+
+
+def is_fast_inbound_transit(
+    ref_ball: np.ndarray,
+    ball: np.ndarray,
+    *,
+    frame_gap: int,
+    config: TouchValidationConfig,
+    fps: float = 25.0,
+    transformer=None,
+    prev_transformer=None,
+) -> bool:
+    """Primary speed gate: fast inbound ball transit, independent of aerial dy or feet px."""
+    gap = max(1, frame_gap)
+    travel_px, speed_px_f = inbound_speed_px_per_frame(ref_ball, ball, frame_gap=gap)
+    if speed_px_f >= config.transit_min_speed_px_per_frame:
+        return True
+    speed_m_s = ball_instant_speed_m_s(
+        ref_ball,
+        ball,
+        fps=fps,
+        transformer=transformer,
+        frame_gap=gap,
+        prev_transformer=prev_transformer,
+    )
+    return (
+        speed_m_s is not None
+        and speed_m_s <= config.max_plausible_transit_speed_m_s
+        and speed_m_s >= config.transit_min_speed_m_s
+    )
+
+
+def is_release_inbound_flyby(
+    release_ball: np.ndarray,
+    ball: np.ndarray,
+    *,
+    release_gap_frames: int,
+    config: TouchValidationConfig,
+) -> bool:
+    """Ball traveled far from a pass release but arrived slowly — dropping through a zone."""
+    if release_gap_frames < config.transit_min_release_gap_frames:
+        return False
+    travel_px, speed_px_f = inbound_speed_px_per_frame(
+        release_ball, ball, frame_gap=release_gap_frames
+    )
+    return (
+        travel_px >= config.transit_min_release_travel_px
+        and speed_px_f < config.transit_release_flyby_max_speed_px_per_frame
+    )
+
+
 def is_transit_flyby_touch(
     dets: sv.Detections,
     carrier: Carrier,
@@ -111,34 +183,55 @@ def is_transit_flyby_touch(
     speed_prev_ball: np.ndarray | None = None,
     speed_frame_gap: int | None = None,
     speed_prev_transformer=None,
+    release_ball: np.ndarray | None = None,
+    release_gap_frames: int | None = None,
 ) -> bool:
     """Fast ball through a player's zone without settling at feet (not real possession)."""
-    ref_ball = speed_prev_ball if speed_prev_ball is not None else prev_ball
-    if ref_ball is None:
-        return False
     ball = ball_xy(dets)
     if ball is None:
         return False
+
+    ref_ball = speed_prev_ball if speed_prev_ball is not None else prev_ball
+    if ref_ball is not None:
+        gap = max(1, speed_frame_gap if speed_prev_ball is not None else frame_gap)
+        ref_t = speed_prev_transformer if speed_prev_ball is not None else prev_transformer
+        if is_fast_inbound_transit(
+            ref_ball,
+            ball,
+            frame_gap=gap,
+            config=config,
+            fps=fps,
+            transformer=transformer,
+            prev_transformer=ref_t,
+        ):
+            return True
+
+    if (
+        release_ball is not None
+        and release_gap_frames is not None
+        and is_release_inbound_flyby(
+            release_ball,
+            ball,
+            release_gap_frames=release_gap_frames,
+            config=config,
+        )
+    ):
+        return True
+
+    if ref_ball is None:
+        return False
+
     feet = feet_xy(dets)[carrier.index]
     feet_dist_px = float(np.hypot(ball[0] - feet[0], ball[1] - feet[1]))
-    if feet_dist_px < config.transit_min_feet_px:
+    zone_px = feet_dist_px
+    if transformer is None and carrier.distance <= CONTROL_MAX_DISTANCE_PX:
+        zone_px = max(feet_dist_px, float(carrier.distance))
+    if zone_px < config.transit_min_feet_px:
         return False
 
     gap = max(1, speed_frame_gap if speed_prev_ball is not None else frame_gap)
-    ref_t = speed_prev_transformer if speed_prev_ball is not None else prev_transformer
-    speed_m_s = ball_instant_speed_m_s(
-        ref_ball,
-        ball,
-        fps=fps,
-        transformer=transformer,
-        frame_gap=gap,
-        prev_transformer=ref_t,
-    )
-    if speed_m_s is not None and speed_m_s <= config.max_plausible_transit_speed_m_s:
-        return speed_m_s >= config.transit_min_speed_m_s
-
-    instant_px_f = float(np.linalg.norm(ball - ref_ball)) / gap
-    return instant_px_f >= config.transit_min_speed_px_per_frame
+    _, speed_px_f = inbound_speed_px_per_frame(ref_ball, ball, frame_gap=gap)
+    return speed_px_f >= config.transit_min_speed_px_per_frame
 
 
 def is_transit_flyby_control(
@@ -171,10 +264,63 @@ def is_transit_flyby_control(
     )
 
 
-def _reception_beyond_control_range(carrier: Carrier) -> bool:
-    """Reception gate is looser than control; only vetoes transit beyond dribble range."""
-    d = carrier.distance
-    return d > CONTROL_MAX_DISTANCE_PX or d > CONTROL_MAX_DISTANCE_M
+def ball_redirected_at_touch(
+    frames_by_idx: dict[int, sv.Detections],
+    touch_frame: int,
+    *,
+    lookback: int = 5,
+    lookahead: int = 5,
+    min_angle_deg: float = 28.0,
+    min_speed_ratio: float = 1.35,
+    min_segment_px: float = 10.0,
+) -> bool:
+    """True when inbound/outbound ball vectors diverge at ``touch_frame`` (kick, not fly-by)."""
+    from world_cup_projects.common.geometry import unit
+
+    samples: list[tuple[int, np.ndarray]] = []
+    for frame_idx in range(touch_frame - lookback, touch_frame + lookahead + 1):
+        dets = frames_by_idx.get(frame_idx)
+        if dets is None:
+            continue
+        ball = ball_xy(dets)
+        if ball is not None:
+            samples.append((frame_idx, np.asarray(ball, dtype=np.float64)))
+    if len(samples) < 4:
+        return False
+
+    before = [(f, p) for f, p in samples if f <= touch_frame]
+    after = [(f, p) for f, p in samples if f >= touch_frame]
+    if len(before) < 2 or len(after) < 2:
+        return False
+
+    pivot = before[-1][1]
+    for frame_idx, point in samples:
+        if frame_idx == touch_frame:
+            pivot = point
+            break
+
+    f_in0, p_in0 = before[-2]
+    v_in = pivot - (p_in0 if f_in0 < touch_frame else before[-1][1])
+    in_len = float(np.linalg.norm(v_in))
+    if in_len < min_segment_px:
+        return False
+
+    after_touch = [(f, p) for f, p in after if f >= touch_frame]
+    if len(after_touch) < 2:
+        return False
+    _, p_out1 = after_touch[1]
+    v_out = p_out1 - pivot
+    out_len = float(np.linalg.norm(v_out))
+    if out_len < min_segment_px:
+        return False
+
+    u_in, u_out = unit(v_in), unit(v_out)
+    if u_in is None or u_out is None:
+        return False
+    cos_angle = float(np.clip(np.dot(u_in, u_out), -1.0, 1.0))
+    angle_deg = float(np.degrees(np.arccos(cos_angle)))
+    speed_ratio = out_len / max(in_len, 1e-6)
+    return angle_deg >= min_angle_deg or speed_ratio >= min_speed_ratio
 
 
 def is_valid_possession_touch(
@@ -191,14 +337,47 @@ def is_valid_possession_touch(
     speed_prev_ball: np.ndarray | None = None,
     speed_frame_gap: int | None = None,
     speed_prev_transformer=None,
+    release_ball: np.ndarray | None = None,
+    release_gap_frames: int | None = None,
+    frames_by_idx: dict[int, sv.Detections] | None = None,
+    frame_idx: int | None = None,
 ) -> bool:
-    """Reject aerial fly-bys and nearest-player mismatches.
+    """Reject fly-bys and nearest-player mismatches.
 
-    Control uses symmetric vertical offset; reception only vetoes fly-bys below
-    the feet so chest-height first contacts still count. Transit fly-by veto
-    applies to ``control`` always; for ``reception`` only when beyond control
-    range (tight one-touch receptions are unchanged).
+    Speed-based transit fly-by is evaluated first and is independent of aerial
+    dy / chest-height checks. Aerial vetoes only apply to clearly off-ground
+    contacts in image space.
     """
+    transit_kwargs = dict(
+        prev_ball=prev_ball,
+        config=config,
+        fps=fps,
+        transformer=transformer,
+        frame_gap=frame_gap,
+        prev_transformer=prev_transformer,
+        speed_prev_ball=speed_prev_ball,
+        speed_frame_gap=speed_frame_gap,
+        speed_prev_transformer=speed_prev_transformer,
+        release_ball=release_ball,
+        release_gap_frames=release_gap_frames,
+    )
+    if is_transit_flyby_touch(dets, carrier, **transit_kwargs):
+        if (
+            frames_by_idx is not None
+            and frame_idx is not None
+            and ball_redirected_at_touch(
+                frames_by_idx,
+                frame_idx,
+                lookback=config.redirect_lookback_frames,
+                lookahead=config.redirect_lookahead_frames,
+                min_angle_deg=config.redirect_min_angle_deg,
+                min_speed_ratio=config.redirect_min_speed_ratio,
+                min_segment_px=config.redirect_min_segment_px,
+            )
+        ):
+            pass
+        else:
+            return False
     if touch_kind == "control" and is_aerial_touch(
         dets, carrier, threshold_px=config.aerial_dy_threshold_px
     ):
@@ -209,39 +388,38 @@ def is_valid_possession_touch(
         threshold_px=reception_aerial_veto_threshold(config),
     ):
         return False
-    if touch_kind == "control" and is_transit_flyby_touch(
-        dets,
-        carrier,
-        prev_ball=prev_ball,
-        config=config,
-        fps=fps,
-        transformer=transformer,
-        frame_gap=frame_gap,
-        prev_transformer=prev_transformer,
-        speed_prev_ball=speed_prev_ball,
-        speed_frame_gap=speed_frame_gap,
-        speed_prev_transformer=speed_prev_transformer,
-    ):
-        return False
-    if (
-        touch_kind == "reception"
-        and _reception_beyond_control_range(carrier)
-        and is_transit_flyby_touch(
-            dets,
-            carrier,
-            prev_ball=prev_ball,
-            config=config,
-            fps=fps,
-            transformer=transformer,
-            frame_gap=frame_gap,
-            prev_transformer=prev_transformer,
-            speed_prev_ball=speed_prev_ball,
-            speed_frame_gap=speed_frame_gap,
-            speed_prev_transformer=speed_prev_transformer,
-        )
-    ):
-        return False
     ball = carrier.ball
     tid = int(dets.tracker_id[carrier.index]) if dets.tracker_id is not None else -1
     nearest_tid = nearest_player_tid(dets, ball)
     return nearest_tid is not None and nearest_tid == tid
+
+
+def ball_departed_for_one_touch(
+    touch_ball: np.ndarray,
+    in_flight_ball: np.ndarray | None,
+    *,
+    touch_frame: int,
+    in_flight_frame: int,
+    depart_min_px: float,
+    frame_balls: list[tuple[int, np.ndarray]] | None = None,
+) -> bool:
+    """True when the ball left the one-touch passer zone (not a stationary fly-by).
+
+    When the ball is missing on every in-flight frame we allow the release anchor.
+    ``frame_balls`` lists ``(frame_idx, ball_xy)`` samples after the touch so slow
+    roll-outs can satisfy the departure threshold a few frames later.
+    """
+    max_travel = 0.0
+    samples = list(frame_balls or [])
+    if in_flight_ball is not None:
+        samples.append((in_flight_frame, in_flight_ball))
+    if not samples:
+        return True
+    for sample_frame, ball in samples:
+        travel_px, _ = inbound_speed_px_per_frame(
+            touch_ball,
+            ball,
+            frame_gap=max(1, sample_frame - touch_frame),
+        )
+        max_travel = max(max_travel, travel_px)
+    return max_travel >= depart_min_px

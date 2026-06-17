@@ -14,9 +14,9 @@
   ],
   "turnovers": [
     {
-      "passer_tid": 14,
+      "passer_tid": 13,
       "interceptor_tid": 3,
-      "notes": "#14 release intercepted by #3"
+      "notes": "#13 release intercepted by #3 (GT label #14 = tracker #13)"
     }
   ]
 }

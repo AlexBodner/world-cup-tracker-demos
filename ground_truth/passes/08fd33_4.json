@@ -1,0 +1,33 @@
+{
+  "sequence": "08fd33_4",
+  "source": "user annotated (one-touch passes + turnover chain)",
+  "passes": [
+    {"passer_tid": 12, "receiver_tid": 9},
+    {"passer_tid": 9, "receiver_tid": 25},
+    {"passer_tid": 18, "receiver_tid": 31},
+    {"passer_tid": 31, "receiver_tid": 1},
+    {"passer_tid": 1, "receiver_tid": 13}
+  ],
+  "turnovers": [
+    {
+      "passer_tid": 25,
+      "interceptor_tid": 18,
+      "notes": "lost possession, one-touch redirect by #18"
+    },
+    {
+      "passer_tid": 18,
+      "interceptor_tid": 14,
+      "notes": "one-touch redirect by #14"
+    },
+    {
+      "passer_tid": 14,
+      "interceptor_tid": 18,
+      "notes": "turnover back to #18"
+    },
+    {
+      "passer_tid": 13,
+      "interceptor_tid": 3,
+      "notes": "intercepted; may bounce onward to #30"
+    }
+  ]
+}

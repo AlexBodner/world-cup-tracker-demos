@@ -194,6 +194,7 @@ def find_reception_carrier(
     transformer=None,
     max_distance_px: float = RECEPTION_MAX_DISTANCE_PX,
     max_distance_m: float = RECEPTION_MAX_DISTANCE_M,
+    require_both_spaces: bool = False,
 ) -> Carrier | None:
     """Nearest player within looser first-touch range (pass detection only)."""
     return find_ball_carrier(
@@ -201,6 +202,7 @@ def find_reception_carrier(
         max_distance_px=max_distance_px,
         transformer=transformer,
         max_distance_m=max_distance_m,
+        require_both_spaces=require_both_spaces,
     )
 
 
@@ -212,6 +214,7 @@ def find_active_carrier(
     control_max_distance_m: float = CONTROL_MAX_DISTANCE_M,
     reception_max_distance_px: float = RECEPTION_MAX_DISTANCE_PX,
     reception_max_distance_m: float = RECEPTION_MAX_DISTANCE_M,
+    require_both_spaces: bool = False,
 ) -> tuple[Carrier | None, str | None]:
     """Control carrier if any, else reception; matches pass-detection possession logic."""
     control = find_control_carrier(
@@ -219,6 +222,7 @@ def find_active_carrier(
         transformer=transformer,
         max_distance_px=control_max_distance_px,
         max_distance_m=control_max_distance_m,
+        require_both_spaces=require_both_spaces,
     )
     if control is not None:
         return control, "control"
@@ -227,6 +231,7 @@ def find_active_carrier(
         transformer=transformer,
         max_distance_px=reception_max_distance_px,
         max_distance_m=reception_max_distance_m,
+        require_both_spaces=require_both_spaces,
     )
     if reception is not None:
         return reception, "reception"

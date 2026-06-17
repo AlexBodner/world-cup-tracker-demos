@@ -1,0 +1,20 @@
+{
+  "sequence": "08fd33_8",
+  "source": "manual annotation",
+  "passes": [
+    {"passer_tid": 20, "receiver_tid": 3},
+    {"passer_tid": 3, "receiver_tid": 20},
+    {"passer_tid": 20, "receiver_tid": 7},
+    {"passer_tid": 7, "receiver_tid": 9},
+    {"passer_tid": 9, "receiver_tid": 16},
+    {"passer_tid": 16, "receiver_tid": 18, "notes": "quick one-touch from #16"},
+    {"passer_tid": 23, "receiver_tid": 12}
+  ],
+  "turnovers": [
+    {
+      "passer_tid": 18,
+      "interceptor_tid": 19,
+      "notes": "#18 pass attempt intercepted; tracker may show #23 due to id switch (#3→#23)"
+    }
+  ]
+}

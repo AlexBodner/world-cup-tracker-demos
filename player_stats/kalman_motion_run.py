@@ -20,10 +20,15 @@ if (_repo_root / "world_cup_projects" / "__init__.py").is_file():
         sys.path.insert(0, str(_repo_root))
 
 from world_cup_projects import DEFAULT_ASSETS_DIR
+from world_cup_projects.common.device import default_torch_device
 from world_cup_projects.common.detection_cache import wrap_detections_cache
 from world_cup_projects.common.detect import DEFAULT_BALL_DETECTION_THRESHOLD
+from world_cup_projects.common.player_tracker import tracker_cache_key_params
 from world_cup_projects.common.video import load_video_sequence
-from world_cup_projects.player_stats.kalman_motion_render import render_kalman_motion_video
+from world_cup_projects.player_stats.kalman_motion_render import (
+    compare_kalman_motion_speeds,
+    render_kalman_motion_video,
+)
 
 
 def _load_detections(args, sequence):
@@ -38,6 +43,7 @@ def _load_detections(args, sequence):
         threshold=0.5,
         ball_threshold=ball_thr,
         tracker=args.tracker,
+        **tracker_cache_key_params(),
     )
 
 
@@ -55,8 +61,16 @@ def main() -> None:
         default=None,
         help="Output MP4 path (default: assets/kalman_motion_<clip>.mp4)",
     )
-    parser.add_argument("--device", default="cpu", help="Detector + pitch keypoint device")
-    parser.add_argument("--tracker", default="bytetrack", choices=("bytetrack", "botsort"))
+    parser.add_argument(
+        "--device",
+        default=default_torch_device(),
+        help="Detector + pitch keypoint device (default: mps when available)",
+    )
+    parser.add_argument(
+        "--tracker",
+        default="botsort",
+        choices=("bytetrack", "botsort", "botsort_nocmc"),
+    )
     parser.add_argument("--max-frames", type=int, default=None)
     parser.add_argument(
         "--min-speed-px",
@@ -92,31 +106,43 @@ def main() -> None:
         "--team-flip-after",
         type=int,
         default=16,
-        help="Outfield team flip only after N consecutive jersey disagrees (tracklet lock)",
+        help="(Legacy) ignored — Kalman overlay uses per-tracklet majority shirt-color lock",
     )
     parser.add_argument(
         "--show-speed",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Show Kalman ground speed (km/h) near each joystick dot",
+        help="Show speed (m/s) on every player; unit explained once in corner legend",
     )
     parser.add_argument(
-        "--min-speed-kmh",
+        "--min-speed-ms",
         type=float,
-        default=4.0,
-        help="Hide speed label below this ground speed (km/h)",
+        default=0.0,
+        help="Hide speed badge below this ground speed (m/s); 0 = always show",
     )
     parser.add_argument(
-        "--speed-homography-weight",
-        type=float,
-        default=0.3,
-        help="Blend homography vs player-height speed (0=height only, 1=homography only)",
+        "--max-speed-labels",
+        type=int,
+        default=0,
+        help="Cap badges per frame to N fastest (0 = show all players)",
     )
     parser.add_argument(
         "--speed-smooth-alpha",
         type=float,
         default=0.22,
-        help="EMA weight on displayed km/h labels (lower = smoother)",
+        help="EMA weight on displayed m/s labels (lower = smoother)",
+    )
+    parser.add_argument(
+        "--speed-source",
+        choices=("kalman", "multilag", "compare"),
+        default="kalman",
+        help="Speed label source: Kalman homography, multi-lag pitch history, or compare both",
+    )
+    parser.add_argument(
+        "--speed-k-frames",
+        type=int,
+        default=5,
+        help="Lag window for multi-lag homography speed (compare / multilag only)",
     )
     parser.add_argument("--refresh-detections-cache", action="store_true")
     args = parser.parse_args()
@@ -126,11 +152,8 @@ def main() -> None:
 
     out_dir = DEFAULT_ASSETS_DIR
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = args.out or str(out_dir / f"kalman_motion_{sequence.name}.mp4")
 
-    manifest = render_kalman_motion_video(
-        sequence,
-        out_path,
+    render_kwargs = dict(
         detections_source=detections_source,
         max_frames=args.max_frames,
         tracker_kind=args.tracker,
@@ -142,9 +165,33 @@ def main() -> None:
         width_smooth_alpha=args.width_smooth_alpha,
         team_flip_after=args.team_flip_after,
         show_speed=args.show_speed,
-        min_speed_kmh=args.min_speed_kmh,
-        speed_homography_weight=args.speed_homography_weight,
+        min_speed_ms=args.min_speed_ms,
+        max_speed_labels=args.max_speed_labels,
         speed_smooth_alpha=args.speed_smooth_alpha,
+    )
+
+    if args.speed_source == "compare":
+        result = compare_kalman_motion_speeds(
+            sequence,
+            str(out_dir),
+            speed_k_frames=args.speed_k_frames,
+            **render_kwargs,
+        )
+        print(json.dumps(result, indent=2))
+        print(f"\nWrote {result['outputs']['kalman']}")
+        print(f"Wrote {result['outputs']['multilag']}")
+        print(f"Wrote {result['outputs']['stats']}")
+        return
+
+    suffix = "" if args.speed_source == "kalman" else f"_{args.speed_source}"
+    out_path = args.out or str(out_dir / f"kalman_motion_{sequence.name}{suffix}.mp4")
+
+    manifest = render_kalman_motion_video(
+        sequence,
+        out_path,
+        speed_source=args.speed_source,
+        speed_k_frames=args.speed_k_frames,
+        **render_kwargs,
     )
     manifest["output"] = out_path
     print(json.dumps(manifest, indent=2))

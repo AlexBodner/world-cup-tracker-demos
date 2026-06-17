@@ -8,14 +8,18 @@
     {"passer_tid": 13, "receiver_tid": 19},
     {"passer_tid": 19, "receiver_tid": 18},
     {"passer_tid": 18, "receiver_tid": 2, "notes": "long aerial pass"},
-    {"passer_tid": 2, "receiver_tid": 4},
-    {"passer_tid": 7, "receiver_tid": 3, "notes": "after interception, #7 kick received by #3"}
+    {"passer_tid": 2, "receiver_tid": 4}
   ],
   "turnovers": [
     {
       "passer_tid": 4,
       "interceptor_tid": 7,
       "notes": "#4 cross/center intercepted by #7"
+    },
+    {
+      "passer_tid": 7,
+      "interceptor_tid": 3,
+      "notes": "#7 kick-off lost to #3"
     }
   ]
 }

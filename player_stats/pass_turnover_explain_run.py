@@ -203,6 +203,7 @@ def main() -> None:
         config=config,
         metric=metric,
         transformers=frame_transforms,
+        fps=sequence.frame_rate,
     )
     turnovers = list(scan.turnovers)
     if not turnovers:
@@ -280,6 +281,7 @@ def main() -> None:
         config=config,
         transformers=frame_transforms,
         metric=metric,
+        fps=sequence.frame_rate,
         min_control_frames=config.min_control_frames,
         min_arrival_frames=config.min_arrival_frames,
     )

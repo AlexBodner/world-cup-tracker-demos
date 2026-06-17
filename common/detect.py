@@ -10,7 +10,7 @@ Both yield the same ``sv.Detections`` contract as :func:`common.soccernet.iter_g
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Iterable, Iterator
+from typing import Iterable, Iterator, Literal
 
 import cv2
 import numpy as np
@@ -18,7 +18,14 @@ import supervision as sv
 
 from trackers import ByteTrackTracker
 
-from world_cup_projects.common.player_tracker import TrackerKind, create_player_tracker
+from world_cup_projects.common.player_tracker import (
+    DEFAULT_HIGH_CONF_DET_THRESHOLD,
+    DEFAULT_MINIMUM_IOU_THRESHOLD_FIRST_ASSOC,
+    DEFAULT_TRACK_ACTIVATION_THRESHOLD,
+    TrackerKind,
+    create_player_tracker,
+    tracker_cache_key_params,
+)
 from world_cup_projects.common.tracking_facing import kalman_velocity_arrays
 from world_cup_projects.common.soccernet import (
     ROLE_BALL,
@@ -31,6 +38,7 @@ from world_cup_projects.common.soccernet import (
 from world_cup_projects.common.teams import (
     JerseyColorTeamClassifier,
     TrackletTeamStabilizer,
+    enforce_one_goalkeeper_per_team,
     get_crops,
 )
 from world_cup_projects.common.video import read_sequence_frame
@@ -63,6 +71,8 @@ BEST_FOOTBALL_PLAYERS_YOLO_MODEL_ID = FOOTBALL_PLAYERS_INFERENCE_V19
 DEFAULT_BALL_DETECTION_THRESHOLD = 0.20
 # Dedicated ball-only YOLOv8x (DFL / Bundesliga ball dataset).
 DEFAULT_FOOTBALL_BALL_MODEL_ID = "football-ball-detection-rejhg/4"
+BallEnsembleMode = Literal["fallback", "merge"]
+DEFAULT_BALL_ENSEMBLE_MODE: BallEnsembleMode = "fallback"
 KNOWN_FOOTBALL_PLAYER_MODELS = (
     FOOTBALL_PLAYERS_INFERENCE_V11,
     FOOTBALL_PLAYERS_INFERENCE_V19,
@@ -171,12 +181,13 @@ def iter_rfdetr_detections(
     *,
     start: int = 1,
     end: int | None = None,
-    track_activation_threshold: float = 0.4,
-) -> Iterator[tuple[int, sv.Detections]]:
+        track_activation_threshold: float = DEFAULT_TRACK_ACTIVATION_THRESHOLD,
+    ) -> Iterator[tuple[int, sv.Detections]]:
     """Detect + track players across the sequence, yielding GT-compatible detections."""
     tracker = ByteTrackTracker(
         frame_rate=sequence.frame_rate,
         track_activation_threshold=track_activation_threshold,
+        high_conf_det_threshold=DEFAULT_HIGH_CONF_DET_THRESHOLD,
     )
     last = sequence.length if end is None else min(end, sequence.length)
 
@@ -315,6 +326,21 @@ def _apply_fp_class_thresholds(
 
 REFEREE_PLAYER_IOU_THRESHOLD = 0.25
 REFEREE_TRACK_IOU_THRESHOLD = 0.4
+GOALKEEPER_PLAYER_IOU_THRESHOLD = 0.25
+
+
+def suppress_goalkeepers_overlapping_players(
+    goalkeepers: sv.Detections,
+    players: sv.Detections,
+    *,
+    iou_threshold: float = GOALKEEPER_PLAYER_IOU_THRESHOLD,
+) -> sv.Detections:
+    """Drop GK rows that duplicate an outfield player (class flicker on the same person)."""
+    if len(goalkeepers) == 0 or len(players) == 0:
+        return goalkeepers
+    ious = sv.box_iou_batch(goalkeepers.xyxy, players.xyxy)
+    drop = ious.max(axis=1) >= iou_threshold
+    return goalkeepers[~drop]
 
 
 def _detection_overlap_with_referees(
@@ -445,6 +471,25 @@ def _merge_ball_detections(
         return _best_ball_detection(primary, players=players)
     combined = sv.Detections.merge([primary, secondary])
     return _best_ball_detection(combined, players=players)
+
+
+def _ensemble_ball_detections(
+    primary: sv.Detections,
+    ball_detector: FootballBallInferenceDetector | FootballBallYoloDetector,
+    image: np.ndarray,
+    *,
+    players: sv.Detections | None = None,
+    mode: BallEnsembleMode = DEFAULT_BALL_ENSEMBLE_MODE,
+) -> sv.Detections:
+    """Combine player-model ball with a dedicated ball model.
+
+    ``fallback`` runs the secondary model only when the primary missed the ball.
+    ``merge`` always runs both and picks the detection nearest the action.
+    """
+    if mode == "merge" or len(primary) == 0:
+        secondary = ball_detector.detect(image)
+        return _merge_ball_detections(primary, secondary, players=players)
+    return _best_ball_detection(primary, players=players)
 
 
 def _map_inference_fp_detections(inference_result, *, confidence: float) -> sv.Detections:
@@ -681,6 +726,7 @@ def wrap_football_detections_cache(args, *, refresh: bool | None = None):
         "device": getattr(args, "device", "cpu"),
         "threshold": getattr(args, "detection_threshold", 0.5),
         "tracker": getattr(args, "tracker", "botsort"),
+        **tracker_cache_key_params(),
     }
     if not getattr(args, "legacy_detections_cache", False):
         cache_params["ball_threshold"] = getattr(
@@ -693,9 +739,11 @@ def wrap_football_detections_cache(args, *, refresh: bool | None = None):
         and ball_backend not in ("none", "off", "")
     ):
         cache_params["ball_backend"] = ball_backend
-        cache_params["ball_model_id"] = getattr(
-            args, "ball_model_id", DEFAULT_FOOTBALL_BALL_MODEL_ID
-        )
+        ball_model_id = getattr(args, "ball_model_id", DEFAULT_FOOTBALL_BALL_MODEL_ID)
+        cache_params["ball_mid"] = ball_model_id.rsplit("/", 1)[-1]
+        ball_ens = getattr(args, "ball_ensemble_mode", DEFAULT_BALL_ENSEMBLE_MODE)
+        if ball_ens != DEFAULT_BALL_ENSEMBLE_MODE:
+            cache_params["ball_ens"] = ball_ens
     if backend == "inference":
         cache_params["backend"] = backend
         cache_params["model_ver"] = model_id.rsplit("/", 1)[-1]
@@ -703,9 +751,21 @@ def wrap_football_detections_cache(args, *, refresh: bool | None = None):
     def _iter_football_cached(sequence, **kwargs):
         params = dict(kwargs)
         params.pop("model_ver", None)
+        params.pop("ball_mid", None)
+        ball_ens = params.pop("ball_ens", None)
+        if ball_ens is not None:
+            params["ball_ensemble_mode"] = ball_ens
+        elif "ball_ensemble_mode" not in params:
+            params["ball_ensemble_mode"] = getattr(
+                args, "ball_ensemble_mode", DEFAULT_BALL_ENSEMBLE_MODE
+            )
         params["backend"] = backend
         if backend == "inference":
             params["model_id"] = model_id
+        if "ball_model_id" not in params:
+            params["ball_model_id"] = getattr(
+                args, "ball_model_id", DEFAULT_FOOTBALL_BALL_MODEL_ID
+            )
         return iter_football_model_detections(sequence, **params)
 
     return wrap_detections_cache(
@@ -776,6 +836,7 @@ def fit_football_team_classifier(
 def _empty_detections_data(n: int) -> dict:
     return {
         "team": np.full(n, TEAM_NONE, dtype=int),
+        "team_jersey": np.full(n, TEAM_NONE, dtype=int),
         "jersey": np.asarray([""] * n, dtype=object),
         "kf_vx": np.full(n, np.nan, dtype=np.float32),
         "kf_vy": np.full(n, np.nan, dtype=np.float32),
@@ -789,16 +850,22 @@ def iter_football_detections(
     *,
     start: int = 1,
     end: int | None = None,
-    track_activation_threshold: float = 0.4,
+    track_activation_threshold: float = DEFAULT_TRACK_ACTIVATION_THRESHOLD,
+    high_conf_det_threshold: float = DEFAULT_HIGH_CONF_DET_THRESHOLD,
+    minimum_iou_threshold_first_assoc: float = DEFAULT_MINIMUM_IOU_THRESHOLD_FIRST_ASSOC,
     tracker: TrackerKind = "bytetrack",
     ball_detector: FootballBallInferenceDetector | FootballBallYoloDetector | None = None,
+    ball_ensemble_mode: BallEnsembleMode = DEFAULT_BALL_ENSEMBLE_MODE,
 ) -> Iterator[tuple[int, sv.Detections]]:
     """Detect + track with football-players-detection; refs excluded from teams."""
     player_tracker = create_player_tracker(
         sequence.frame_rate,
         kind=tracker,
         track_activation_threshold=track_activation_threshold,
+        high_conf_det_threshold=high_conf_det_threshold,
+        minimum_iou_threshold_first_assoc=minimum_iou_threshold_first_assoc,
     )
+    player_tracker.reset()
     needs_frame = tracker == "botsort"
     last = sequence.length if end is None else min(end, sequence.length)
     team_stabilizer = TrackletTeamStabilizer()
@@ -810,15 +877,25 @@ def iter_football_detections(
             continue
 
         det = detector.detect(image)
+        det = enforce_one_goalkeeper_per_team(
+            det, frame_width=float(image.shape[1])
+        )
         players = det[det.class_id == ROLE_PLAYER]
         gks = det[det.class_id == ROLE_GOALKEEPER]
+        gks = suppress_goalkeepers_overlapping_players(gks, players)
         refs = det[det.class_id == ROLE_REFEREE]
         on_pitch = sv.Detections.merge([players, gks]) if len(players) or len(gks) else None
         balls = det[det.class_id == ROLE_BALL]
         if ball_detector is not None:
-            extra_balls = ball_detector.detect(image)
-            balls = _merge_ball_detections(balls, extra_balls, players=on_pitch)
-        balls = _best_ball_detection(balls, players=on_pitch)
+            balls = _ensemble_ball_detections(
+                balls,
+                ball_detector,
+                image,
+                players=on_pitch,
+                mode=ball_ensemble_mode,
+            )
+        else:
+            balls = _best_ball_detection(balls, players=on_pitch)
         players = suppress_players_overlapping_referees(players, refs)
 
         trackable = sv.Detections.merge([players, gks])
@@ -857,6 +934,7 @@ def iter_football_detections(
                         class_id=subset.class_id.astype(int),
                         data={
                             "team": teams.astype(int),
+                            "team_jersey": teams.astype(int),
                             "jersey": np.asarray([""] * len(subset), dtype=object),
                             "kf_vx": kf_vx,
                             "kf_vy": kf_vy,
@@ -909,6 +987,10 @@ def iter_football_model_detections(
     tracker: TrackerKind = "bytetrack",
     ball_backend: str | None = None,
     ball_model_id: str = DEFAULT_FOOTBALL_BALL_MODEL_ID,
+    ball_ensemble_mode: BallEnsembleMode = DEFAULT_BALL_ENSEMBLE_MODE,
+    track_activation_threshold: float = DEFAULT_TRACK_ACTIVATION_THRESHOLD,
+    high_conf_det_threshold: float = DEFAULT_HIGH_CONF_DET_THRESHOLD,
+    minimum_iou_threshold_first_assoc: float = DEFAULT_MINIMUM_IOU_THRESHOLD_FIRST_ASSOC,
 ) -> Iterator[tuple[int, sv.Detections]]:
     """Convenience wrapper: football-players detect + track + jersey teams."""
     detector = create_football_players_detector(
@@ -936,4 +1018,8 @@ def iter_football_model_detections(
         end=end,
         tracker=tracker,
         ball_detector=ball_detector,
+        ball_ensemble_mode=ball_ensemble_mode,
+        track_activation_threshold=track_activation_threshold,
+        high_conf_det_threshold=high_conf_det_threshold,
+        minimum_iou_threshold_first_assoc=minimum_iou_threshold_first_assoc,
     )

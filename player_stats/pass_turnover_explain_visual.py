@@ -61,7 +61,6 @@ from world_cup_projects.player_stats.pass_explain_visual import (
     _crop_rect_from_points,
     _dim_frame,
     _draw_anchor_player,
-    _draw_dashed_line,
     _draw_focus_player,
     _draw_pass_ball_marker,
     _draw_strip_title,
@@ -73,7 +72,6 @@ from world_cup_projects.player_stats.pass_explain_visual import (
     _find_receiver_tight_feet_frame,
     _fit_social_square,
     _letterbox_frame,
-    _pass_anchor_points,
     _pass_ball_for_ctx,
     _pass_ball_point_for_frame,
     _passer_panel_badge,
@@ -164,8 +162,6 @@ def _player_team(dets: sv.Detections, tid: int) -> int | None:
 _EXPLAIN_TRANSIT_MIN_BALL_SPEED_PX = 10.0
 _EXPLAIN_TRANSIT_MIN_FEET_DISTANCE_PX = 30.0
 
-_FLYBY_CHIP_BGR = (22, 24, 28)
-_FLYBY_CHIP_ACCENT_BGR = (85, 140, 200)
 _FLYBY_SLATE_BGR = (95, 100, 108)
 
 
@@ -185,6 +181,7 @@ def _find_demo_opponent_control_in_flight(
     config: PassDetectionConfig,
     transformers: dict[int, object],
     metric: bool,
+    fps: float = 25.0,
 ) -> tuple[int | None, int | None]:
     """First opponent control in flight — same gate as ``_opponent_control_between``."""
     hit = _first_opponent_touch_in_window(
@@ -196,6 +193,7 @@ def _find_demo_opponent_control_in_flight(
         transformers=transformers,
         metric=metric,
         require_control=True,
+        fps=fps,
     )
     if hit is None:
         return None, None
@@ -235,6 +233,7 @@ def _resolve_inflight_opponent_control_for_explain(
     config: PassDetectionConfig,
     transformers: dict[int, object],
     metric: bool,
+    fps: float = 25.0,
 ) -> tuple[int | None, int | None, int | None, int | None]:
     """``(show_frame, show_tid, demo_frame, demo_tid)`` for inflight panels/copy."""
     demo_fi, demo_tid = _find_demo_opponent_control_in_flight(
@@ -243,6 +242,7 @@ def _resolve_inflight_opponent_control_for_explain(
         config=config,
         transformers=transformers,
         metric=metric,
+        fps=fps,
     )
     if demo_fi is None or demo_tid is None:
         return None, None, None, None
@@ -268,19 +268,8 @@ def _flight_flyby_skip_copy(
     frame: int | None,
 ) -> str:
     return (
-        f"Demo: #{opponent_tid} control credited at f{frame} (rule 5)  ·  "
-        "Explain: transit contact — not possession"
-    )
-
-
-def _flight_flyby_chip_lines(
-    logic: TurnoverExplainLogic,
-) -> tuple[str, str]:
-    tid = logic.demo_inflight_opponent_control_tid
-    fi = logic.demo_inflight_opponent_control_frame
-    return (
-        f"Rule 5 credits #{tid} at f{fi}",
-        "Filtered — ball in transit, not possession",
+        f"Demo tags #{opponent_tid} control at f{frame} (rule 5)  ·  "
+        "Ball passes by — explain does not credit possession"
     )
 
 
@@ -299,6 +288,7 @@ def _find_demo_interceptor_control_frame(
     transformers: dict[int, object],
     metric: bool,
     search_end: int,
+    fps: float = 25.0,
 ) -> int | None:
     """First interceptor control after reception — demo ``require_control`` gate."""
     hit = _first_opponent_touch_in_window(
@@ -311,6 +301,7 @@ def _find_demo_interceptor_control_frame(
         metric=metric,
         require_control=True,
         player_tid=turnover.interceptor_tid,
+        fps=fps,
     )
     if hit is None:
         return None
@@ -326,6 +317,7 @@ def _find_turnover_intercept_panels(
     transformers: dict[int, object],
     metric: bool,
     confirm_frame: int,
+    fps: float = 25.0,
     min_arrival_frames: int = _MIN_ARRIVAL,
 ) -> tuple[int, ...]:
     """Reception → interceptor control → visual lock (mirrors passer control strip)."""
@@ -339,6 +331,7 @@ def _find_turnover_intercept_panels(
         transformers=transformers,
         metric=metric,
         search_end=search_end,
+        fps=fps,
     )
     if control is not None and control != event:
         panels.append(control)
@@ -432,6 +425,7 @@ def build_turnover_explain_logic(
     config: PassDetectionConfig,
     transformers: dict[int, object] | None = None,
     metric: bool = True,
+    fps: float = 25.0,
 ) -> TurnoverExplainLogic:
     """Summarise rule 4 release + rule 5 interception gates for on-screen copy."""
     transformers = transformers or {}
@@ -462,6 +456,7 @@ def build_turnover_explain_logic(
         config=config,
         transformers=transformers,
         metric=metric,
+        fps=fps,
     )
     opp_control = False
     if first_touch is not None:
@@ -473,6 +468,7 @@ def build_turnover_explain_logic(
             config=config,
             transformers=transformers,
             metric=metric,
+            fps=fps,
         )
 
     gap = turnover.gap_frames
@@ -484,6 +480,7 @@ def build_turnover_explain_logic(
             config=config,
             transformers=transformers,
             metric=metric,
+            fps=fps,
         )
     )
     search_end = first_touch or turnover.interception_frame
@@ -494,6 +491,7 @@ def build_turnover_explain_logic(
         transformers=transformers,
         metric=metric,
         search_end=search_end + 12,
+        fps=fps,
     )
     flyby_skipped = _inflight_flyby_skipped(
         demo_frame=demo_inflight_fi,
@@ -724,6 +722,7 @@ def build_turnover_strip_plan(
     config: PassDetectionConfig = PassDetectionConfig(),
     transformers: dict[int, object] | None = None,
     metric: bool = True,
+    fps: float = 25.0,
     min_control_frames: int = _MIN_CONTROL,
     min_arrival_frames: int = _MIN_ARRIVAL,
 ) -> PassStripPlan:
@@ -754,6 +753,7 @@ def build_turnover_strip_plan(
         config=config,
         transformers=transformers,
         metric=metric,
+        fps=fps,
     )
     flight_frames: tuple[int, ...]
     if inflight_fi is not None and inflight_fi != flight_frame:
@@ -782,6 +782,7 @@ def build_turnover_strip_plan(
         metric=metric,
         confirm_frame=confirm,
         min_arrival_frames=min_arrival_frames,
+        fps=fps,
     )
     return PassStripPlan(
         passer_frames=passer_frames,
@@ -850,6 +851,7 @@ def build_turnover_explain_context(
             metric=metric,
             min_control_frames=min_control_frames,
             min_arrival_frames=min_arrival_frames,
+            fps=frame_rate,
         )
     pass_event = turnover_to_pass_adapter(turnover)
     pass_ctx = build_pass_explain_context(
@@ -872,6 +874,7 @@ def build_turnover_explain_context(
         config=detection_config,
         transformers=radar_transformers,
         metric=metric,
+        fps=frame_rate,
     )
     return TurnoverExplainContext(turnover=turnover, pass_ctx=pass_ctx, logic=logic)
 
@@ -952,31 +955,34 @@ def render_strip_turnover_passer(
     return draw_branding_tag(out, _TURNOVER_BRANDING)
 
 
+def _draw_turnover_passer_interceptor_link(
+    image: np.ndarray,
+    dets: sv.Detections,
+    passer_tid: int,
+    interceptor_tid: int,
+) -> None:
+    """Red turnover chord — only after the intercept is credited."""
+    passer_feet = _feet_for_tid(dets, passer_tid)
+    intercept_feet = _feet_for_tid(dets, interceptor_tid)
+    if passer_feet is None or intercept_feet is None:
+        return
+    cv2.line(image, passer_feet, intercept_feet, TURNOVER_ACCENT_BGR, 2, cv2.LINE_AA)
+
+
 def _build_turnover_flight_frame(
     ctx: TurnoverExplainContext,
     frame_idx: int,
 ) -> np.ndarray:
-    """Ball in flight with pass arrow toward the intercepting opponent."""
+    """Ball in flight — passer-to-ball chord only until intercept."""
     p = ctx.pass_ctx.pass_event
-    t = ctx.turnover
     full = ctx.pass_ctx.frames[frame_idx]
     dets = ctx.pass_ctx.dets_by_frame[frame_idx]
-    passer_color = _team_color(t.passer_team)
-    opp_color = _team_color(t.interceptor_team)
+    passer_color = _team_color(ctx.turnover.passer_team)
     ball_pt = _pass_ball_for_ctx(ctx.pass_ctx, frame_idx)
-    out = _build_flight_frame(full, dets, p.passer_tid, passer_color, ball_pt=ball_pt)
-
-    passer_feet = _feet_for_tid(dets, p.passer_tid)
-    p0, p1 = _pass_anchor_points(p, ctx.pass_ctx.dets_by_frame)
-    if passer_feet:
-        _draw_dashed_line(out, passer_feet, p1, opp_color, alpha=0.35)
-    intercept_feet = _feet_for_tid(dets, t.interceptor_tid)
-    if intercept_feet:
-        _draw_focus_player(out, dets, t.interceptor_tid, opp_color, prominent=False, emphasis=0.55)
-    return out
+    return _build_flight_frame(full, dets, p.passer_tid, passer_color, ball_pt=ball_pt)
 
 
-def _flyby_trajectory_points(
+def _flyby_ball_trail_points(
     pctx: PassExplainContext,
     frame_idx: int,
     *,
@@ -990,80 +996,21 @@ def _flyby_trajectory_points(
     return pts
 
 
-def _draw_ball_trajectory_arrow(
+def _draw_ball_transit_trail(
     image: np.ndarray,
     points: list[tuple[int, int]],
-    *,
-    color_bgr: tuple[int, int, int] = (210, 215, 225),
 ) -> None:
+    """Neutral ball path — transit only, not a pass link to any player."""
     if len(points) < 2:
         return
     layer = image.copy()
+    trail_bgr = (175, 180, 190)
     for i in range(len(points) - 1):
-        cv2.line(layer, points[i], points[i + 1], color_bgr, 2, cv2.LINE_AA)
-    cv2.circle(layer, points[0], 4, color_bgr, -1, cv2.LINE_AA)
-    cv2.arrowedLine(
-        layer,
-        points[-2],
-        points[-1],
-        color_bgr,
-        2,
-        tipLength=0.28,
-        line_type=cv2.LINE_AA,
-    )
-    image[:] = cv2.addWeighted(layer, 0.72, image, 0.28, 0)
-
-
-def _draw_transit_zone_veto(
-    image: np.ndarray,
-    feet: tuple[int, int],
-    *,
-    radius: int = 38,
-) -> None:
-    """Muted control-radius ring with slash — contact zone, not possession."""
-    layer = image.copy()
-    cv2.circle(layer, feet, radius, (88, 92, 100), 1, cv2.LINE_AA)
-    cv2.line(
-        layer,
-        (feet[0] - radius + 6, feet[1] + radius // 2),
-        (feet[0] + radius - 6, feet[1] - radius // 2),
-        (78, 82, 92),
-        2,
-        cv2.LINE_AA,
-    )
-    image[:] = cv2.addWeighted(layer, 0.65, image, 0.35, 0)
-
-
-def _draw_flyby_status_chip(
-    image: np.ndarray,
-    *,
-    line1: str,
-    line2: str,
-) -> None:
-    h, w = image.shape[:2]
-    bar_h = 50
-    y0 = h - bar_h - 12
-    overlay = image.copy()
-    cv2.rectangle(overlay, (14, y0), (w - 14, h - 12), _FLYBY_CHIP_BGR, -1)
-    image[:] = cv2.addWeighted(overlay, 0.80, image, 0.20, 0)
-    cv2.rectangle(image, (14, y0), (w - 14, h - 12), (58, 62, 72), 1, cv2.LINE_AA)
-    cv2.line(image, (14, y0), (14, y0 + bar_h), _FLYBY_CHIP_ACCENT_BGR, 3)
-    draw_text_shadow(
-        image,
-        line1,
-        (26, y0 + 20),
-        font_scale=0.50,
-        color_bgr=(228, 230, 236),
-        thickness=1,
-    )
-    draw_text_shadow(
-        image,
-        line2,
-        (26, y0 + 38),
-        font_scale=0.42,
-        color_bgr=(148, 152, 162),
-        thickness=1,
-    )
+        cv2.line(layer, points[i], points[i + 1], trail_bgr, 2, cv2.LINE_AA)
+    for pt in points[:-1]:
+        cv2.circle(layer, pt, 3, trail_bgr, -1, cv2.LINE_AA)
+    cv2.circle(layer, points[-1], 5, (235, 238, 245), -1, cv2.LINE_AA)
+    image[:] = cv2.addWeighted(layer, 0.55, image, 0.45, 0)
 
 
 def _build_flyby_skip_frame(
@@ -1072,45 +1019,36 @@ def _build_flyby_skip_frame(
     *,
     flyby_tid: int,
 ) -> np.ndarray:
-    """Ball transiting an opponent — demo credits control; explain filters."""
+    """Ball passing an opponent — no pass-chord lines, only transit + filtered mark."""
     pctx = ctx.pass_ctx
     t = ctx.turnover
     full = pctx.frames[frame_idx]
     dets = pctx.dets_by_frame[frame_idx]
     passer_color = _team_color(t.passer_team)
     flyby_team = _player_team(dets, flyby_tid)
-    flyby_color = _team_color(flyby_team if flyby_team is not None else t.interceptor_team)
+    flyby_color = _team_color(
+        flyby_team if flyby_team is not None else t.interceptor_team
+    )
     ball_pt = _pass_ball_for_ctx(pctx, frame_idx)
 
-    out = _dim_frame(full, 0.30)
+    out = _dim_frame(full, _FOCUS_DIM)
     _draw_anchor_player(out, dets, t.passer_tid, passer_color)
-    trajectory = _flyby_trajectory_points(pctx, frame_idx)
-    if trajectory:
-        _draw_ball_trajectory_arrow(out, trajectory)
+
+    trail = _flyby_ball_trail_points(pctx, frame_idx)
+    if trail:
+        _draw_ball_transit_trail(out, trail)
     if ball_pt is not None:
-        out = draw_carrier_spotlight(out, full, ball_pt, radius=160, strength=0.75)
+        out = draw_carrier_spotlight(out, full, ball_pt, radius=180, strength=0.82)
         out = _draw_pass_ball_marker(out, dets, ball_pt)
 
     flyby_feet = _feet_for_tid(dets, flyby_tid)
     if flyby_feet is not None:
-        _draw_transit_zone_veto(out, flyby_feet)
+        layer = out.copy()
+        cv2.circle(layer, flyby_feet, 34, (90, 94, 102), 1, cv2.LINE_AA)
+        out[:] = cv2.addWeighted(layer, 0.55, out, 0.45, 0)
         _draw_focus_player(
-            out, dets, flyby_tid, flyby_color, prominent=True, emphasis=0.32, locked=False
+            out, dets, flyby_tid, flyby_color, prominent=True, emphasis=0.38, locked=False
         )
-
-    intercept_feet = _feet_for_tid(dets, t.interceptor_tid)
-    if intercept_feet:
-        _draw_focus_player(
-            out,
-            dets,
-            t.interceptor_tid,
-            _team_color(t.interceptor_team),
-            prominent=False,
-            emphasis=0.38,
-        )
-
-    chip1, chip2 = _flight_flyby_chip_lines(ctx.logic)
-    _draw_flyby_status_chip(out, line1=chip1, line2=chip2)
     return out
 
 
@@ -1178,6 +1116,11 @@ def _render_intercept_panel(
             out = _draw_pass_ball_marker(out, dets, ball)
             if locked or is_control:
                 cv2.line(out, interceptor_feet, ball, opp_color, 3, cv2.LINE_AA)
+
+    if frame_idx >= t.interception_frame:
+        _draw_turnover_passer_interceptor_link(
+            out, dets, t.passer_tid, t.interceptor_tid
+        )
 
     is_reception = frame_idx == t.interception_frame
     badge = "INTERCEPT LOCKED" if locked else (
@@ -1270,17 +1213,16 @@ def _render_inflight_flyby_skip_panel(
         flyby_team if flyby_team is not None else ctx.turnover.interceptor_team
     )
     out = _build_flyby_skip_frame(ctx, frame_idx, flyby_tid=flyby_tid)
-    _draw_anchor_player(out, dets, ctx.turnover.passer_tid, _team_color(ctx.turnover.passer_team))
     return _compose_panel_row(
         out,
         frame_idx,
-        "IN-FLIGHT PRESSURE",
+        "PASS-BY",
         flyby_color,
         layout=layout,
         step=2,
         step_total=2,
         sublabel=_flight_flyby_skip_copy_from_logic(logic),
-        badge="NOT POSSESSION",
+        badge="FILTERED",
         emphasis=0.50,
         locked=False,
         accent_bgr=_FLYBY_SLATE_BGR,
@@ -1333,7 +1275,7 @@ def _render_flight_travel_panel(
     frame_img = _fit_panel_frame_turnover(frame_img, crop=crop)
     if logic.inflight_flyby_skipped:
         sublabel = (
-            "pass in flight — next panel: in-flight pressure (filtered)"
+            "pass in flight — next panel: ball passes opponent (demo tags, explain filters)"
         )
     else:
         sublabel = "pass attempt in flight — release still pending"
@@ -1608,7 +1550,7 @@ def build_turnover_explain_video_sequence(
             if flyby_skip_fi is not None and fi == flyby_skip_fi:
                 flyby_tid = logic.demo_inflight_opponent_control_tid or t.interceptor_tid
                 frame = _build_flyby_skip_frame(ctx, fi, flyby_tid=flyby_tid)
-                frame = draw_hud_bar(frame, "IN-FLIGHT PRESSURE")
+                frame = draw_hud_bar(frame, "BALL PASSES OPPONENT")
             else:
                 frame = _build_turnover_flight_frame(ctx, fi)
                 frame = draw_hud_bar(frame, "BALL TRAVELLING")
@@ -1627,7 +1569,7 @@ def build_turnover_explain_video_sequence(
                     opp,
                     emphasis=1.0,
                     locked=True,
-                    ball_pt=_pass_ball_for_ctx(pctx, fi),
+                    ball_pt=None,
                 )
                 _draw_anchor_player(frame, dets, t.passer_tid, passer)
             else:
@@ -1646,6 +1588,9 @@ def build_turnover_explain_video_sequence(
                     frame, dets, ctx.turnover.interceptor_tid, opp, prominent=True, locked=False
                 )
                 frame = annotate_ball(frame, dets)
+            _draw_turnover_passer_interceptor_link(
+                frame, dets, t.passer_tid, t.interceptor_tid
+            )
             title = (
                 "OPPONENT CONTROL"
                 if is_control

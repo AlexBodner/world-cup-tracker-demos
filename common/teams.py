@@ -34,11 +34,14 @@ class TrackletTeamStabilizer:
         if dets.tracker_id is None or dets.data is None or len(dets) == 0:
             return dets
         team = np.array(dets.data.get("team", np.full(len(dets), TEAM_NONE)), dtype=int)
+        jersey_team = dets.data.get("team_jersey")
+        if jersey_team is not None:
+            jersey_team = np.asarray(jersey_team, dtype=int)
         for i, tid in enumerate(dets.tracker_id):
             tid = int(tid)
             if tid < 0 or dets.class_id[i] != ROLE_PLAYER:
                 continue
-            raw = int(team[i])
+            raw = int(jersey_team[i]) if jersey_team is not None else int(team[i])
             if raw not in (0, 1):
                 continue
             if tid not in self._stable:
@@ -64,6 +67,122 @@ def stabilize_teams_by_tracklet(
     """Run :class:`TrackletTeamStabilizer` across a clip (works on cached detections too)."""
     stabilizer = TrackletTeamStabilizer(flip_after=flip_after)
     return [(int(fi), stabilizer.apply(dets)) for fi, dets in frames]
+
+
+def _goalkeeper_group_key(
+    dets: sv.Detections,
+    index: int,
+    *,
+    frame_width: float | None,
+) -> int:
+    """Bucket a goalkeeper row by team id, else by broadcast left/right half."""
+    team_arr = dets.data.get("team") if dets.data else None
+    team = int(team_arr[index]) if team_arr is not None else TEAM_NONE
+    if team in (0, 1):
+        return team
+    cx = float((dets.xyxy[index, 0] + dets.xyxy[index, 2]) * 0.5)
+    mid = (frame_width * 0.5) if frame_width and frame_width > 0 else 960.0
+    return 0 if cx < mid else 1
+
+
+def _goalkeeper_rank(dets: sv.Detections, index: int) -> tuple[float, float]:
+    """Sort key: detector confidence, then bbox height as tie-break."""
+    conf = 0.0
+    if dets.confidence is not None:
+        conf = float(dets.confidence[index])
+    height = float(dets.xyxy[index, 3] - dets.xyxy[index, 1])
+    return (conf, height)
+
+
+def enforce_one_goalkeeper_per_team(
+    dets: sv.Detections,
+    *,
+    frame_width: float | None = None,
+) -> sv.Detections:
+    """Keep at most one goalkeeper per team; drop lower-confidence duplicate GK rows."""
+    if len(dets) == 0:
+        return dets
+    gk_indices = [
+        i for i in range(len(dets)) if int(dets.class_id[i]) == ROLE_GOALKEEPER
+    ]
+    if len(gk_indices) <= 1:
+        return dets
+
+    by_group: dict[int, list[int]] = {}
+    for i in gk_indices:
+        key = _goalkeeper_group_key(dets, i, frame_width=frame_width)
+        by_group.setdefault(key, []).append(i)
+
+    drop = np.zeros(len(dets), dtype=bool)
+    for group_indices in by_group.values():
+        if len(group_indices) <= 1:
+            continue
+        best = max(group_indices, key=lambda i: _goalkeeper_rank(dets, i))
+        for i in group_indices:
+            if i != best:
+                drop[i] = True
+    return dets[~drop]
+
+
+def enforce_one_goalkeeper_per_team_frames(
+    frames: list[tuple[int, sv.Detections]],
+    *,
+    frame_width: float | None = None,
+) -> list[tuple[int, sv.Detections]]:
+    """Apply :func:`enforce_one_goalkeeper_per_team` on every frame."""
+    return [
+        (fi, enforce_one_goalkeeper_per_team(dets, frame_width=frame_width))
+        for fi, dets in frames
+    ]
+
+
+def _raw_outfield_team(dets: sv.Detections, index: int) -> int | None:
+    """Per-frame classifier team for an outfield row (``team_jersey`` when cached)."""
+    team = np.array(dets.data.get("team", np.full(len(dets), TEAM_NONE)), dtype=int)
+    raw_arr = dets.data.get("team_jersey") if dets.data else None
+    raw = int(raw_arr[index]) if raw_arr is not None else int(team[index])
+    return raw if raw in (0, 1) else None
+
+
+def lock_teams_by_tracklet_majority(
+    frames: Iterable[tuple[int, sv.Detections]],
+) -> list[tuple[int, sv.Detections]]:
+    """Lock one team per ``tracker_id`` for the whole clip (majority shirt-color vote).
+
+    Unlike hysteresis, the locked team never changes mid-tracklet — only brief classifier
+    noise can flip a player after 16 consecutive disagrees; majority vote avoids that.
+    """
+    frame_items = [(int(fi), dets) for fi, dets in frames]
+    votes: dict[int, list[int]] = {}
+    for _, dets in frame_items:
+        if dets.tracker_id is None or dets.data is None:
+            continue
+        for i, tid in enumerate(dets.tracker_id):
+            tid = int(tid)
+            if tid < 0 or dets.class_id[i] != ROLE_PLAYER:
+                continue
+            raw = _raw_outfield_team(dets, i)
+            if raw is not None:
+                votes.setdefault(tid, []).append(raw)
+
+    locked: dict[int, int] = {}
+    for tid, vals in votes.items():
+        counts = np.bincount(np.asarray(vals, dtype=int), minlength=2)
+        locked[tid] = int(np.argmax(counts))
+
+    locked_frames: list[tuple[int, sv.Detections]] = []
+    for fi, dets in frame_items:
+        if dets.tracker_id is None or dets.data is None or not locked:
+            locked_frames.append((fi, dets))
+            continue
+        team = np.array(dets.data.get("team", np.full(len(dets), TEAM_NONE)), dtype=int)
+        for i, tid in enumerate(dets.tracker_id):
+            tid = int(tid)
+            if tid in locked and dets.class_id[i] == ROLE_PLAYER:
+                team[i] = locked[tid]
+        dets.data["team"] = team
+        locked_frames.append((fi, dets))
+    return locked_frames
 
 
 def resolve_goalkeepers_team_by_goal(
@@ -250,6 +369,8 @@ def stabilize_goalkeeper_teams(
     *,
     keypoints_by_frame: dict[int, object] | None = None,
     pitch_confidence: float = 0.9,
+    frame_width: float | None = None,
+    min_gk_frames: int = 10,
 ) -> None:
     """Mutate frames so GKs keep a stable defending team (sports-radar pitch space).
 
@@ -271,6 +392,7 @@ def stabilize_goalkeeper_teams(
 
     track_positions: dict[int, list[float]] = {}
     gk_track_ids: set[int] = set()
+    gk_frame_counts: dict[int, int] = {}
 
     for frame_idx, dets in frames:
         if dets.tracker_id is None:
@@ -297,6 +419,7 @@ def stabilize_goalkeeper_teams(
                 continue
             if dets.class_id[i] == ROLE_GOALKEEPER:
                 gk_track_ids.add(tid)
+                gk_frame_counts[tid] = gk_frame_counts.get(tid, 0) + 1
 
             if np.isfinite(feet_cm[i]).all():
                 track_positions.setdefault(tid, []).append(float(feet_cm[i, 0]))
@@ -305,6 +428,8 @@ def stabilize_goalkeeper_teams(
     pitch_mid_cm = 12000.0 / 2.0
 
     for tid in gk_track_ids:
+        if gk_frame_counts.get(tid, 0) < min_gk_frames:
+            continue
         positions = track_positions.get(tid)
         if not positions:
             continue
@@ -323,3 +448,4 @@ def stabilize_goalkeeper_teams(
             if tid in stable_assignments:
                 dets.class_id[i] = ROLE_GOALKEEPER
                 team_array[i] = stable_assignments[tid]
+        enforce_one_goalkeeper_per_team(dets, frame_width=frame_width)

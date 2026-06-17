@@ -5,10 +5,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import pickle
 from collections import Counter
 from pathlib import Path
 
 _GT_DIR = Path(__file__).resolve().parent / "passes"
+_CACHE_DET = Path(".cache/detections")
+_CACHE_PITCH = Path(".cache/pitch")
 
 
 def _pair(passer: int, receiver: int) -> tuple[int, int]:
@@ -24,6 +27,77 @@ def load_ground_truth(sequence: str) -> dict:
 
 def load_detection(path: Path) -> dict:
     return json.loads(path.read_text())
+
+
+def _pick_cache(paths: list[Path], *, prefer_substr: str = "__football__") -> Path:
+    """Pick the canonical full-sequence cache (prefer football over inference)."""
+    preferred = [p for p in paths if prefer_substr in p.name and "inference" not in p.name]
+    if preferred:
+        return preferred[-1]
+    return paths[-1]
+
+
+def scan_live(sequence: str, *, fps: float = 25.0) -> dict:
+    """Run pass detection on cached detections + pitch homography."""
+    from world_cup_projects.common.detection_cache import load_cached_detections
+    from world_cup_projects.common.pitch import warmup_goal_defenders_radar
+    from world_cup_projects.common.teams import (
+        enforce_one_goalkeeper_per_team_frames,
+        stabilize_goalkeeper_teams,
+        stabilize_teams_by_tracklet,
+    )
+    from world_cup_projects.player_stats.pass_events import (
+        PassDetectionConfig,
+        PassQualityScorer,
+        scan_possession_events,
+    )
+
+    det_paths = sorted(_CACHE_DET.glob(f"{sequence}*device=mps*end=750*botsort.pkl"))
+    pitch_paths = sorted(_CACHE_PITCH.glob(f"{sequence}*mps*750*.pkl"))
+    if not det_paths:
+        det_paths = sorted(_CACHE_DET.glob(f"{sequence}*device=cpu*end=750*botsort.pkl"))
+    if not pitch_paths:
+        pitch_paths = sorted(_CACHE_PITCH.glob(f"{sequence}*cpu*750*.pkl"))
+    if not det_paths or not pitch_paths:
+        raise FileNotFoundError(
+            f"No mps cache for {sequence} under {_CACHE_DET} / {_CACHE_PITCH}"
+        )
+    det_path = _pick_cache(det_paths)
+    pitch_path = pitch_paths[-1]
+    pitch_data = pickle.load(pitch_path.open("rb"))
+    transformers = pitch_data["transforms"]
+    keypoints = pitch_data.get("keypoints")
+    _, frames = load_cached_detections(det_path)
+    frames = stabilize_teams_by_tracklet(frames)
+    frames = enforce_one_goalkeeper_per_team_frames(frames, frame_width=1920)
+    if keypoints is not None:
+        locked = warmup_goal_defenders_radar(frames, keypoints, confidence=0.9)
+        stabilize_goalkeeper_teams(
+            frames,
+            locked_goal_defenders=locked,
+            keypoints_by_frame=keypoints,
+            pitch_confidence=0.9,
+            frame_width=1920,
+        )
+    scan = scan_possession_events(
+        iter(frames),
+        scorer=PassQualityScorer(),
+        config=PassDetectionConfig(),
+        metric=True,
+        transformers=transformers,
+        fps=fps,
+    )
+    return {
+        "sequence": sequence,
+        "passes": [
+            {"passer_tid": p.passer_tid, "receiver_tid": p.receiver_tid}
+            for p in scan.passes
+        ],
+        "turnovers": [
+            {"passer_tid": t.passer_tid, "interceptor_tid": t.interceptor_tid}
+            for t in scan.turnovers
+        ],
+    }
 
 
 def compare(gt: dict, detected: dict) -> dict:
@@ -103,13 +177,21 @@ def main() -> None:
         type=Path,
         help="Path to pass_network JSON (default: assets/pass_network_football_metric_<seq>.json)",
     )
+    parser.add_argument(
+        "--live",
+        action="store_true",
+        help="Scan cached detections with current pass_events logic (ignores --detected)",
+    )
     args = parser.parse_args()
 
-    detected_path = args.detected or (
-        Path("assets") / f"pass_network_football_metric_{args.sequence}.json"
-    )
     gt = load_ground_truth(args.sequence)
-    detected = load_detection(detected_path)
+    if args.live:
+        detected = scan_live(args.sequence)
+    else:
+        detected_path = args.detected or (
+            Path("assets") / f"pass_network_football_metric_{args.sequence}.json"
+        )
+        detected = load_detection(detected_path)
     report = compare(gt, detected)
     _print_report(report)
 
