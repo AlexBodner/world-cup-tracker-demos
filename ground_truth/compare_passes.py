@@ -9,9 +9,11 @@ import pickle
 from collections import Counter
 from pathlib import Path
 
+from world_cup_projects import PACKAGE_ROOT
+
 _GT_DIR = Path(__file__).resolve().parent / "passes"
-_CACHE_DET = Path(".cache/detections")
-_CACHE_PITCH = Path(".cache/pitch")
+_CACHE_DET = PACKAGE_ROOT / ".cache/detections"
+_CACHE_PITCH = PACKAGE_ROOT / ".cache/pitch"
 
 
 def _pair(passer: int, receiver: int) -> tuple[int, int]:
@@ -40,12 +42,9 @@ def _pick_cache(paths: list[Path], *, prefer_substr: str = "__football__") -> Pa
 def scan_live(sequence: str, *, fps: float = 25.0) -> dict:
     """Run pass detection on cached detections + pitch homography."""
     from world_cup_projects.common.detection_cache import load_cached_detections
+    from world_cup_projects.common.pipeline import prepare_model_frames
     from world_cup_projects.common.pitch import warmup_goal_defenders_radar
-    from world_cup_projects.common.teams import (
-        enforce_one_goalkeeper_per_team_frames,
-        stabilize_goalkeeper_teams,
-        stabilize_teams_by_tracklet,
-    )
+    from world_cup_projects.common.teams import stabilize_goalkeeper_teams
     from world_cup_projects.player_stats.pass_events import (
         PassDetectionConfig,
         PassQualityScorer,
@@ -68,8 +67,7 @@ def scan_live(sequence: str, *, fps: float = 25.0) -> dict:
     transformers = pitch_data["transforms"]
     keypoints = pitch_data.get("keypoints")
     _, frames = load_cached_detections(det_path)
-    frames = stabilize_teams_by_tracklet(frames)
-    frames = enforce_one_goalkeeper_per_team_frames(frames, frame_width=1920)
+    frames = prepare_model_frames(frames, frame_width=1920)
     if keypoints is not None:
         locked = warmup_goal_defenders_radar(frames, keypoints, confidence=0.9)
         stabilize_goalkeeper_teams(

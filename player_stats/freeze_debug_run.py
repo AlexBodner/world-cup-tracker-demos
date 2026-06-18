@@ -21,6 +21,10 @@ if (_repo_root / "world_cup_projects" / "__init__.py").is_file():
         sys.path.insert(0, str(_repo_root))
 
 from world_cup_projects import DEFAULT_ASSETS_DIR
+from world_cup_projects.common.pipeline import (
+    load_detections_source,
+    load_metric_context,
+)
 from world_cup_projects.common.video import load_video_sequence, read_sequence_frame
 from world_cup_projects.pass_alternatives.pass_options import PassWeights
 from world_cup_projects.player_stats.freeze_debug import (
@@ -32,88 +36,6 @@ from world_cup_projects.player_stats.pass_events import (
     PassQualityScorer,
     scan_possession_events,
 )
-from world_cup_projects.player_stats.pass_network_run import (
-    _load_detections_source,
-    analyze_pass_network,
-)
-
-
-def _load_pitch_maps(sequence, frames, *, device, end, pitch_confidence, refresh: bool):
-    from world_cup_projects.common.pitch import iter_pitch_transformers, warmup_goal_defenders_radar
-    from world_cup_projects.common.teams import stabilize_goalkeeper_teams
-
-    cache_dir = Path(".cache/pitch")
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    cache_path = cache_dir / f"{sequence.name}_{device}_{end}_{pitch_confidence}.pkl"
-    detections_by_frame = {int(fi): d for fi, d in frames}
-
-    frame_transforms: dict = {}
-    frame_radar_transforms: dict = {}
-    frame_keypoints: dict = {}
-    locked_goals = None
-
-    cache_ok = False
-    cache_candidates = [cache_path]
-    if not refresh:
-        cache_candidates.extend(
-            sorted(
-                cache_dir.glob(f"{sequence.name}_*_{end}_{pitch_confidence}.pkl"),
-                key=lambda p: p.stat().st_mtime,
-                reverse=True,
-            )
-        )
-    import pickle
-
-    for candidate in cache_candidates:
-        if not candidate.is_file():
-            continue
-        with candidate.open("rb") as f:
-            cached = pickle.load(f)
-        if {"transforms", "radar_transforms", "keypoints"} <= cached.keys():
-            frame_transforms = cached["transforms"]
-            frame_radar_transforms = cached["radar_transforms"]
-            frame_keypoints = cached["keypoints"]
-            cache_ok = True
-            print(f"Loaded cached pitch homography: {candidate.name}")
-            break
-
-    if not cache_ok:
-        print(f"Running pitch homography (cache → {cache_path.name})...")
-        for frame_idx, speed_t, radar_t, kps, _trk in iter_pitch_transformers(
-            sequence,
-            device=device,
-            end=end,
-            confidence=pitch_confidence,
-            yield_keypoints=True,
-            yield_tracker=True,
-            detections_by_frame=detections_by_frame,
-        ):
-            frame_transforms[frame_idx] = speed_t
-            frame_radar_transforms[frame_idx] = radar_t
-            frame_keypoints[frame_idx] = kps
-        with cache_path.open("wb") as f:
-            pickle.dump(
-                {
-                    "transforms": frame_transforms,
-                    "radar_transforms": frame_radar_transforms,
-                    "keypoints": frame_keypoints,
-                },
-                f,
-            )
-
-    if frame_keypoints:
-        locked_goals = warmup_goal_defenders_radar(
-            frames, frame_keypoints, confidence=pitch_confidence
-        )
-        stabilize_goalkeeper_teams(
-            frames,
-            locked_goal_defenders=locked_goals,
-            keypoints_by_frame=frame_keypoints,
-            pitch_confidence=pitch_confidence,
-        )
-
-    return frame_transforms, frame_radar_transforms, frame_keypoints, locked_goals
-
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Freeze gate debug video per detected pass")
@@ -139,7 +61,7 @@ def main() -> None:
         tracker = args.tracker
         refresh_detections_cache = args.refresh_detections_cache
 
-    detections_source = _load_detections_source(_Args, sequence)
+    detections_source = load_detections_source(_Args, sequence)
     frames = list(detections_source(sequence, start=1, end=end))
 
     from world_cup_projects.common.teams import stabilize_teams_by_tracklet
@@ -149,14 +71,17 @@ def main() -> None:
     frame_transforms: dict = {}
     frame_keypoints: dict = {}
     if args.metric:
-        frame_transforms, _radar, frame_keypoints, _goals = _load_pitch_maps(
+        ctx = load_metric_context(
             sequence,
             frames,
             device=args.device,
-            end=end,
             pitch_confidence=args.pitch_confidence,
+            end=end,
+            source="football",
             refresh=args.refresh_pitch_cache,
         )
+        frame_transforms = ctx.transforms
+        frame_keypoints = ctx.keypoints
 
     config = PassDetectionConfig().for_frame_rate(sequence.frame_rate)
     weights = PassWeights.metric() if args.metric else PassWeights()

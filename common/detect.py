@@ -56,29 +56,27 @@ _FP_TO_ROLE = {
     _FP_REFEREE: ROLE_REFEREE,
 }
 
+from world_cup_projects.common.model_ids import (
+    BEST_FOOTBALL_PLAYERS_YOLO_MODEL_ID,
+    CANONICAL_FOOTBALL_BALL_MODEL_ID,
+    CANONICAL_FOOTBALL_PLAYERS_MODEL_ID,
+    DEFAULT_FOOTBALL_BALL_MODEL_ID,
+    DEFAULT_FOOTBALL_PLAYERS_MODEL_ID,
+    FOOTBALL_PLAYERS_INFERENCE_RFDETR,
+    FOOTBALL_PLAYERS_INFERENCE_V11,
+    FOOTBALL_PLAYERS_INFERENCE_V19,
+    FOOTBALL_PLAYERS_INFERENCE_V20,
+    KNOWN_FOOTBALL_PLAYER_MODELS,
+)
+
 _MODEL_DIR = Path(__file__).resolve().parent.parent / ".cache" / "models"
 _FOOTBALL_PLAYERS_MODEL_PATH = _MODEL_DIR / "football-player-detection.pt"
 _FOOTBALL_PLAYERS_MODEL_GDRIVE_ID = "17PXFNlx-jI7VjVo_vQnB1sONjRyvoB-q"
 _FOOTBALL_BALL_MODEL_PATH = _MODEL_DIR / "football-ball-detection.pt"
 _FOOTBALL_BALL_MODEL_GDRIVE_ID = "1isw4wx-MK9h9LMr36VvIWlJD6ppUvw7V"
-DEFAULT_FOOTBALL_PLAYERS_MODEL_ID = "football-players-detection-3zvbc/11"
-FOOTBALL_PLAYERS_INFERENCE_V11 = "football-players-detection-3zvbc/11"
-# Latest YOLO on Universe (yolo11m, Aug 2025) — use via --detector-backend inference.
-FOOTBALL_PLAYERS_INFERENCE_V19 = "football-players-detection-3zvbc/19"
-FOOTBALL_PLAYERS_INFERENCE_V20 = "football-players-detection-3zvbc/20"
-FOOTBALL_PLAYERS_INFERENCE_RFDETR = "football-players-detection-3zvbc/18"
-BEST_FOOTBALL_PLAYERS_YOLO_MODEL_ID = FOOTBALL_PLAYERS_INFERENCE_V19
 DEFAULT_BALL_DETECTION_THRESHOLD = 0.20
-# Dedicated ball-only YOLOv8x (DFL / Bundesliga ball dataset).
-DEFAULT_FOOTBALL_BALL_MODEL_ID = "football-ball-detection-rejhg/4"
 BallEnsembleMode = Literal["fallback", "merge"]
 DEFAULT_BALL_ENSEMBLE_MODE: BallEnsembleMode = "fallback"
-KNOWN_FOOTBALL_PLAYER_MODELS = (
-    FOOTBALL_PLAYERS_INFERENCE_V11,
-    FOOTBALL_PLAYERS_INFERENCE_V19,
-    FOOTBALL_PLAYERS_INFERENCE_V20,
-    FOOTBALL_PLAYERS_INFERENCE_RFDETR,
-)
 
 _FP_CLASS_NAME_TO_ROLE = {
     "ball": ROLE_BALL,
@@ -251,7 +249,7 @@ def iter_model_detections(
 
 
 def ensure_football_players_model() -> Path:
-    """Download football-player-detection.pt (DFL / football-players-detection-3zvbc)."""
+    f"""Download football-player-detection.pt (DFL / {CANONICAL_FOOTBALL_PLAYERS_MODEL_ID})."""
     _MODEL_DIR.mkdir(parents=True, exist_ok=True)
     if _FOOTBALL_PLAYERS_MODEL_PATH.is_file():
         return _FOOTBALL_PLAYERS_MODEL_PATH
@@ -267,7 +265,7 @@ def ensure_football_players_model() -> Path:
 
 
 def ensure_football_ball_model() -> Path:
-    """Download football-ball-detection.pt (Universe football-ball-detection-rejhg)."""
+    f"""Download football-ball-detection.pt (Universe {CANONICAL_FOOTBALL_BALL_MODEL_ID})."""
     _MODEL_DIR.mkdir(parents=True, exist_ok=True)
     if _FOOTBALL_BALL_MODEL_PATH.is_file():
         return _FOOTBALL_BALL_MODEL_PATH
@@ -777,7 +775,7 @@ def wrap_football_detections_cache(args, *, refresh: bool | None = None):
 
 
 class FootballPlayersDetector:
-    """YOLO weights from roboflow/sports (football-players-detection-3zvbc)."""
+    f"""YOLO weights from roboflow/sports ({CANONICAL_FOOTBALL_PLAYERS_MODEL_ID})."""
 
     def __init__(
         self,

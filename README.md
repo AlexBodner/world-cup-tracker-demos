@@ -61,7 +61,8 @@ PYTHONPATH=. python -m world_cup_projects.pass_alternatives.run \
 | `--debug-pitch-keypoints`                               | Keypoints on main video (indices); radar shows kp whenever `--metric`   |
 | `--device mps` / `cpu`                                  | Torch device for the football player YOLO                               |
 | `--detector-backend inference`                          | Run player/ball model via Roboflow Inference (needs `ROBOFLOW_API_KEY`) |
-| `--player-model-id football-players-detection-3zvbc/20` | Universe model version (Inference or future export)                     |
+| `--player-model-id` (default `football-players-detection-3zvbc/11`) | Universe model version when `--detector-backend inference` (local YOLO .pt is v11) |
+| `--ball-model-id` (default `football-ball-detection-rejhg/4`)       | Dedicated ball model when `--ball-detector-backend inference`                        |
 | `--detection-threshold 0.5`                             | Detection confidence threshold                                          |
 
 
@@ -155,8 +156,10 @@ confirm a **passer** or **receiver** (see Pass detection).
 
 - **Missing ball boxes** — short gaps do not reset pass state (see missing-ball bridge).
 - **Aerial fly-bys** — when the ball passes in the air near a player, 2D “closest to ball”
-lies. We veto metric distance when `|ball.y − feet.y| > 20px` and stretch vertical offset
-in pixel space so fly-bys do not look like control at the feet.
+  lies. We veto metric distance when `|ball.y − feet.y| > 20px` and stretch vertical offset
+  in pixel space so fly-bys do not look like control at the feet. This catches *one frame*;
+  long aerial passes that drift over several players are filtered later by the ball-dynamics
+  gates in **Valid touch** (speed, release distance, path redirect).
 
 **Limits:** carrier assignment only runs when the detector returns a ball box (and players to
 compare against). Broadcast occlusion — the carrier’s body between ball and camera — motion
@@ -221,14 +224,94 @@ Plus touch-kind vetoes:
 | **reception** | `ball.y - feet.y > 40px` (fly-by under feet; chest height OK) |
 
 
+#### Ball dynamics: telling a touch from a fly-by
+
+**Intuition:** the proximity gates above answer *“is the ball near a player?”* — but during
+aerial passes the ball is *near* lots of players it never touches. A long ball sails over
+midfield and, for one frame, the nearest player to it is whoever happens to stand under its
+arc. Geometry alone then invents a whole chain of ground passes between players who never
+touched the ball. The fix is to also look at **how the ball is moving** at the moment of the
+candidate touch: a real touch *changes the ball’s motion* (it speeds up, slows, or bends);
+a fly-by leaves the ball on the same line at the same speed.
+
+So on top of “nearest + on the ground” we add three motion gates. The default thresholds
+below come from `TouchValidationConfig` (derived from `PassDetectionConfig`) at 25 fps.
+
+**1. Transit fly-by — the ball is just passing through.** If the ball is moving fast through
+a player’s zone instead of settling at the feet, it isn’t possession.
+
+```
+fast inbound transit if EITHER:
+  speed ≥ 10 px/frame
+  OR  9 m/s ≤ metric speed ≤ 35 m/s         # cap rejects teleport noise
+(only gated when the ball is ≥ 30 px from the feet — a ball at the feet is control)
+```
+
+**2. Release-inbound fly-by — far from the kick, arriving slow.** Anchored to the frame the
+ball was *released*, a touch candidate that the ball reached by travelling a long way but
+arriving slowly is the ball **dropping through a zone** under gravity, not a player meeting
+it.
+
+```
+release fly-by if:
+  release gap ≥ 50 frames
+  AND travel-from-release ≥ 450 px
+  AND inbound speed < 8 px/frame
+```
+
+**3. Redirect vs gravity arc — did this touch bend the path?** Around the candidate frame we
+fit the inbound and outbound ball vectors and compare them.
+
+```
+metrics over ±5 frames (need ≥ 4 ball samples, ≥ 10 px segments):
+  angle_deg   = turn between inbound and outbound vectors
+  speed_ratio = outbound_len / inbound_len
+
+redirect (real touch)  : speed_ratio ≥ 1.35  OR  28° ≤ angle ≤ 135°
+gravity arc (fly-by)   : angle < 28°  AND  speed_ratio < 1.35
+```
+
+**How they combine** (`is_valid_possession_touch`): a transit fly-by is rejected **unless**
+the path was genuinely redirected at that frame (`redirect_overrides_transit_flyby`). During
+a long in-flight release we apply the redirect test *more strictly* — it must show a real
+turn (`28° ≤ angle ≤ 135°`, or angle **and** ratio together), a `speed_ratio > 4` is treated
+as noise and rejected, and an aerial contact (`|dy| > 20px`) on a release fly-by is vetoed
+even if the numbers look like a redirect. A release fly-by always loses; a clean gravity arc
+through the player is vetoed outright.
+
+**Ball teleport filter.** Tracking sometimes snaps the ball box onto a wrong object for a
+single frame and back — a few-hundred-pixel jump that fakes a huge angle + speed change and
+reads as a “redirect.” Before fitting redirect metrics during an in-flight release we drop
+any sample that jumps more than **180 px/frame** from its neighbour
+(`_ball_path_samples`, `max_ball_teleport_px_per_frame = 180`).
+
+**Problems we patched:**
+
+- **Aerial passes counted as ground passes** — a long ball `#31 → #1` was being scored as
+  `#31 → #5 → #1` because `#5` was momentarily nearest the airborne ball. The release-inbound
+  and gravity-arc gates now reject those mid-air “touches.”
+- **Fly-by credited as a one-touch return** — `#18` kicks, `#14` one-touches, the ball flies
+  *past* `#5`, and `#5` was credited with receiving and returning it. `#5` never changed the
+  ball’s motion, so the redirect test now rejects the touch.
+- **A single teleported ball box faking a redirect** — one bad ball detection (`~600 px`
+  jump) produced an absurd `speed_ratio ≈ 30` and a false redirect; the teleport filter and
+  `speed_ratio > 4` cap remove it.
+
+Turnover logic adds a **second layer** on top of these gates: even a touch that passes
+`is_valid_possession_touch` may still be ignored for `last_possession` when it is a
+reception during the opponent’s in-flight release (see **Turnover detection → Possession
+epochs**).
+
 ---
 
 ### Pass detection
 
 **Intuition:** a pass is a story in three beats — someone *had* the ball, *released* it, and a
-teammate *received* it — with no opponent taking control in between. We don’t look for ball
-speed or trajectory directly; we watch carrier handoffs frame by frame. Each team keeps its
-own memory of who last released the ball so one team’s possession doesn’t block the other’s.
+teammate *received* it — with no opponent taking control in between. The backbone is carrier
+handoffs watched frame by frame; each candidate touch is then validated against the ball’s
+motion (see **Valid touch → Ball dynamics**) so fly-bys don’t masquerade as handoffs. Each
+team keeps its own memory of who last released the ball so one team’s possession doesn’t
+block the other’s.
 
 Rough flow:
 
@@ -245,7 +328,10 @@ bridge below for short in-flight gaps.
 
 **On screen:** from the release frame through reception, a **small arrow** follows the pass
 (path from passer feet toward ball/receiver, ~35% opacity). Ellipses pulse at passer and
-receiver feet; on reception the arrow is removed and the receiver **twinkles** twice.
+receiver feet; on reception the arrow is removed and the receiver **twinkles** twice. Passes
+carry **no text label** — the arrows and feet highlights are enough, and the old
+`#passer → #receiver` chip popped in only for long passes, which read as a flicker. (Only
+**turnovers** still show a centered `TURNOVER #a → #b` chip.)
 
 #### Passer (who released the ball)
 
@@ -342,32 +428,138 @@ NOT opponent_touch_between(release_frame, arrival_frame)
 
 On success → append pass; score `quality_score` at **release frame** via lane model.
 
+#### Intermediate hops (relays inside one move)
+
+**Intuition:** not every move is one clean pass. A ball can be released, glance off a
+teammate who genuinely controls it, and move on — a real two-link relay, not one long pass.
+We want to credit *both* links without re-anchoring to every player the ball drifts near in
+flight (the fly-by trap from the section above).
+
+**In code** (`_try_emit_intermediate_hop`): while a release is still in flight, if a
+**different teammate** reaches a full control streak (`min_control_frames`, default 2), we
+emit the in-flight release → this player as a pass and **re-anchor** the release to them, so
+the next link is measured from where the ball actually is now.
+
+```
+emit a hop only if:
+  touch_kind == "control"            # a settle, not a drift-by
+  AND new tid != release tid
+  AND it does not steal an arrival streak already building for another teammate
+  → emit pass(release_player → new controller); release ← new controller
+```
+
+Because the hop requires real **control** (which itself passes the ball-dynamics gates
+above), an airborne ball drifting over a teammate no longer splits a single long pass into
+bogus short ones.
+
 ---
 
 ### Turnover detection
 
-**Intuition:** a turnover is “you tried to play forward and they got it first.” We snapshot
-the moment an opponent first touches after your release, then attribute the steal when that
-opponent later completes a pass — not when they eventually shoot or dribble in isolation.
+**Intuition:** a turnover is one story — **team A lost the ball, team B took it first and
+kept it.** It is not the same moment as a teammate pass on team B. If `#23` intercepts and
+later plays `#12`, that reception is `#23 → #12` (a pass), not “`#13` lost it to `#12`”
+(turnover) just because an opponent happened to be nearest the ball mid-flight.
 
-**In code** (`_try_emit_turnover`):
+Each team keeps a **possession epoch**: who last genuinely had the ball, and (while the ball
+is in flight) who released it. Turnover attribution reads those epochs — it does not re-label
+every cross-team touch as a steal.
 
-When team A has `release` and an opponent gets `valid_touch`:
+**In code** (`player_stats/pass_events.py`):
+
+Three emit paths share the same rules:
+
+| Path | When it fires |
+| ---- | ------------- |
+| **Redirect** | Opponent redirect touch during your in-flight release → queue, flush after recovery window |
+| **Deferred queue** | Opponent secures `min_control_frames` while your `turnover_snapshot` is set |
+| **Snapshot on pass** | Opponent completes a pass to a teammate after your snapshot was taken |
+
+Core emit (`_try_emit_turnover`) still requires:
 
 ```
-turnover_snapshot = (release_frame, passer_tid)   # first opponent touch only
+gap between release and intercept: min_turnover_gap_frames ≤ gap ≤ max_pass_gap_frames
+passer had committed possession at release
+interceptor secured control (or redirect follow-through)
+no recent duplicate(passer, interceptor)
+```
+
+#### Possession epochs — what updates `last_possession`
+
+**Intuition:** `last_possession_frame` / `last_possessor_tid` anchor who the other team
+“lost it from.” That anchor must reflect **real possession**, not a one-frame nearest-player
+blip while someone else’s pass is in the air.
+
+**In code** (`_should_credit_team_possession`): on each valid touch, we may update
+`last_possession` **only if**:
+
+```
+normal play (opponent not in-flight)
+  → credit
+
+OR opponent has in-flight release:
+  → credit only on redirect_touch
+  OR touch_kind == "control" AND _touch_valid_or_redirect with release context
+
+reception-only during opponent in-flight
+  → do NOT credit
+```
+
+So on `08fd33_8`, `#13`’s reception at f552–553 while `#23`’s long ball is in flight never
+becomes team 0’s possession epoch — it cannot poison `turnover_snapshot`.
+
+#### Same-team arrival — one reception, one story
+
+**Intuition:** when team B already has an in-flight release and a teammate is building an
+**arrival streak**, the receiver securing control is finishing **that pass**, not stealing
+from team A’s stale snapshot.
+
+**In code** (`_same_team_pass_arrival_in_progress`):
+
+```
+release is set AND release_tid ≠ receiver_tid
+AND arrival_candidate_tid == receiver_tid
+AND arrival_streak > 0
+  → same-team pass arrival in progress
+```
+
+While true we **skip**:
+
+- updating the other team’s `turnover_snapshot` on this frame
+- `_queue_turnover_emit` for this receiver
+
+Deferred snapshot emit on pass complete (`_try_emit_snapshot_turnover`) still attributes the
+**original** intercept (e.g. `#18 → #23`) when the interceptor later plays a teammate — but
+not a second turnover on the receiver of that same move.
+
+#### Classic snapshot flow (unchanged)
+
+When team A has `release` and an opponent gets a **real** intercept touch:
+
+```
+turnover_snapshot = (release_frame, passer_tid)   # losing team's last committed release
 ```
 
 When that opponent later **emits a pass** to a teammate:
 
 ```
-intercept_frame = first valid_touch frame by interceptor after snapshot
+intercept_frame = first valid_touch by interceptor after snapshot
 AND opponent_control_between(A.release_frame, intercept_frame)
   → emit turnover(passer=A, interceptor=B, frame=intercept_frame)
 ```
 
 If opponent had control between A’s release and a would-be teammate arrival, **skip** A’s
 arrival streak (no fake pass credit).
+
+**Problems we patched:**
+
+- **Same reception counted as pass and turnover** (`08fd33_8`) — after turnover `#18 → #23`,
+  pass `#23 → #12` was also emitted as turnover `#13 → #12`. Opponent `#13` was briefly
+  nearest during `#23`’s in-flight ball (valid reception in proximity gates, not real
+  possession). Possession-epoch gating + same-team arrival skip now keep a single attribution.
+- **Fly-by poisons turnover anchor** — any cross-team touch used to refresh
+  `turnover_snapshot`; opponent receptions during your in-flight release no longer update
+  `last_possession`, so deferred queues don’t pair a stale passer with the wrong receiver.
 
 ---
 
@@ -664,10 +856,20 @@ Without homography: meters/px from bbox height ≈ 1.8 m.
 
 ## Models
 
+Pinned Universe ids (single source of truth: `common/model_ids.py`):
+
+
+| Piece           | Pinned id                              | Backend                                                                 |
+| --------------- | -------------------------------------- | ----------------------------------------------------------------------- |
+| Players         | `football-players-detection-3zvbc/11`  | **Default:** local YOLO `.pt` (`--detector-backend yolo`). Inference optional. |
+| Ball (stacked)  | `football-ball-detection-rejhg/4`      | **Default:** local YOLO `.pt` (`--ball-detector-backend yolo`). Inference optional. |
+| Pitch keypoints | `football-field-detection-f07vi/15`    | **Inference only** via `common/pitch.py` — needs `ROBOFLOW_API_KEY`. Not the legacy `football-pitch-detection.pt` from `roboflow/sports`. |
+
 
 | Piece           | Source                                                                                                                                                                                                                                                                                                                                                                                                                |
 | --------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Players + ball  | [football-players-detection](https://universe.roboflow.com/roboflow-jvuqo/football-players-detection-3zvbc) — **default: local YOLO `.pt` (v11)** with `--ball-threshold 0.20`. Optional Inference (`--detector-backend inference`) for Universe `/11` YOLO or `/18` `/20` RF-DETR — RF-DETR had higher ball recall on sampled frames but worse pass-network results on `08fd33_0`, so **stick with YOLO for demos**. |
+| Dedicated ball  | [football-ball-detection](https://universe.roboflow.com/roboflow-jvuqo/football-ball-detection-rejhg) — local `.pt` v4, stacked on the player detector by default. |
 | Pitch keypoints | Inference `football-field-detection-f07vi/15` — needs `ROBOFLOW_API_KEY`                                                                                                                                                                                                                                                                                                                                              |
 | Tracking        | [trackers](https://github.com/roboflow/trackers) ByteTrack / BoTSORT                                                                                                                                                                                                                                                                                                                                                  |
 

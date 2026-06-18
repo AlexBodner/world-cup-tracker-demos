@@ -766,16 +766,9 @@ def _valid_pitch_cm(
     xy: np.ndarray, config=PITCH_CONFIG, *, margin_cm: float = 200.0
 ) -> np.ndarray:
     """Mask for points that lie on the pitch (homography outliers are dropped)."""
-    if xy is None or len(xy) == 0:
-        return np.zeros(0, dtype=bool)
-    finite = np.isfinite(xy).all(axis=1)
-    return (
-        finite
-        & (xy[:, 0] >= margin_cm)
-        & (xy[:, 0] <= config.length - margin_cm)
-        & (xy[:, 1] >= margin_cm)
-        & (xy[:, 1] <= config.width - margin_cm)
-    )
+    from world_cup_projects.common.pitch import valid_pitch_cm
+
+    return valid_pitch_cm(xy, config, margin_cm=margin_cm)
 
 
 def draw_radar_minimap(

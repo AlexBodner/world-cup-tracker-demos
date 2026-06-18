@@ -35,7 +35,15 @@ import json
 from pathlib import Path
 
 from world_cup_projects import DEFAULT_ASSETS_DIR
-from world_cup_projects.common.pitch import iter_pitch_transformers
+from world_cup_projects.common.cli import (
+    FootballDetectionDefaults,
+    add_football_detection_args,
+)
+from world_cup_projects.common.pipeline import (
+    load_detections_source,
+    load_metric_context,
+    prepare_model_frames,
+)
 from world_cup_projects.common.soccernet import (
     DEFAULT_TRACKING_ROOT,
     find_sequences,
@@ -53,25 +61,12 @@ from world_cup_projects.player_stats.pass_network import PassNetwork, build_pass
 from world_cup_projects.player_stats.pass_network_render import render_pass_network_demo
 
 
-def _load_detections_source(args, sequence):
-    if args.source == "football":
-        from world_cup_projects.common.detect import wrap_football_detections_cache
-
-        return wrap_football_detections_cache(args)
-    if args.source == "rfdetr":
-        from world_cup_projects.common.detect import iter_model_detections
-        from world_cup_projects.common.detection_cache import wrap_detections_cache
-
-        return wrap_detections_cache(
-            iter_model_detections,
-            source_name="rfdetr",
-            refresh=args.refresh_detections_cache,
-            device=args.device,
-        )
-    return iter_gt_detections
+_load_detections_source = load_detections_source
 
 
 def _pitch_transformers(sequence, *, max_frames, device, pitch_confidence):
+    from world_cup_projects.common.pitch import iter_pitch_transformers
+
     end = max_frames if max_frames is not None else sequence.length
     return {
         frame_idx: speed_t
@@ -110,68 +105,18 @@ def analyze_pass_network(
 
 
 def main() -> None:
+    from world_cup_projects.common.model_ids import (
+        DEFAULT_FOOTBALL_BALL_MODEL_ID,
+        DEFAULT_FOOTBALL_PLAYERS_MODEL_ID,
+    )
+
     parser = argparse.ArgumentParser(description="Pass network v1: inferred passes + collaborator links")
     parser.add_argument("--data", default=DEFAULT_TRACKING_ROOT)
     parser.add_argument("--split", default="test")
-    parser.add_argument("--sequence", default=None)
-    parser.add_argument("--video", default=None, help="MP4 path (implies --source football).")
     parser.add_argument("--out", default=str(DEFAULT_ASSETS_DIR))
-    parser.add_argument("--max-frames", type=int, default=None)
-    parser.add_argument("--source", choices=("gt", "football", "rfdetr"), default="gt")
-    parser.add_argument("--tracker", choices=("bytetrack", "botsort", "botsort_nocmc"), default="botsort")
-    parser.add_argument("--metric", action="store_true")
-    parser.add_argument("--device", default="cpu")
-    parser.add_argument("--pitch-confidence", type=float, default=0.9)
-    parser.add_argument("--refresh-detections-cache", action="store_true")
-    parser.add_argument(
-        "--detector-backend",
-        choices=("yolo", "inference"),
-        default="yolo",
-        help="football source: local Ultralytics .pt (yolo) or Roboflow Inference (needs ROBOFLOW_API_KEY)",
-    )
-    parser.add_argument(
-        "--player-model-id",
-        default=None,
-        help="Universe model id for --detector-backend inference (default football-players-detection-3zvbc/11)",
-    )
-    parser.add_argument(
-        "--detection-threshold",
-        type=float,
-        default=0.5,
-        help="Player / GK / referee detection confidence threshold",
-    )
-    parser.add_argument(
-        "--ball-threshold",
-        type=float,
-        default=None,
-        help="Ball class confidence threshold (default 0.20; lower catches blur / air balls)",
-    )
-    parser.add_argument(
-        "--ball-detector-backend",
-        choices=("none", "yolo", "inference"),
-        default="yolo",
-        help=(
-            "Dedicated ball model stacked on the player detector (default: yolo). "
-            "'yolo' uses local football-ball-detection weights; "
-            "'inference' uses Roboflow Inference (needs ROBOFLOW_API_KEY); "
-            "'none' uses only the player model ball head."
-        ),
-    )
-    parser.add_argument(
-        "--ball-ensemble",
-        choices=("fallback", "merge"),
-        default="fallback",
-        dest="ball_ensemble_mode",
-        help=(
-            "How to combine player-model ball with --ball-detector-backend: "
-            "'fallback' runs the secondary model only when the primary missed; "
-            "'merge' always runs both and picks the ball nearest the action."
-        ),
-    )
-    parser.add_argument(
-        "--ball-model-id",
-        default=None,
-        help="Universe ball model id (default football-ball-detection-rejhg/1)",
+    add_football_detection_args(
+        parser,
+        defaults=FootballDetectionDefaults(tracker="botsort"),
     )
     parser.add_argument(
         "--control-max-m",
@@ -220,11 +165,6 @@ def main() -> None:
         help="Duration of the stats end-card.",
     )
     parser.add_argument(
-        "--debug-pitch-keypoints",
-        action="store_true",
-        help="Draw pitch keypoints on main video (indices + skeleton). Radar always shows kp in --metric.",
-    )
-    parser.add_argument(
         "--show-predictions",
         action="store_true",
         help="Overlay real-time pass alternatives (predictions) alongside the pass network.",
@@ -262,11 +202,6 @@ def main() -> None:
         "--tag-suffix",
         default=None,
         help="Extra tag in output filenames (e.g. inference_v20). Auto-set for --detector-backend inference.",
-    )
-    parser.add_argument(
-        "--legacy-detections-cache",
-        action="store_true",
-        help="Use YOLO v11 detection cache without ball_threshold in the cache key.",
     )
     args = parser.parse_args()
 
@@ -307,7 +242,7 @@ def main() -> None:
         min_control_frames=args.min_control_frames,
         missing_ball_tolerance=args.missing_ball_tolerance,
     ).for_frame_rate(sequence.frame_rate)
-    detections_source = _load_detections_source(args, sequence)
+    detections_source = load_detections_source(args, sequence)
     end = args.max_frames if args.max_frames is not None else sequence.length
     frames = list(detections_source(sequence, start=1, end=end))
     print(
@@ -315,95 +250,26 @@ def main() -> None:
         f"tracker={args.tracker} device={args.device} frames={len(frames)}"
     )
     if args.source in ("football", "rfdetr"):
-        from world_cup_projects.common.teams import (
-            enforce_one_goalkeeper_per_team_frames,
-            stabilize_teams_by_tracklet,
-        )
+        frames = prepare_model_frames(frames, frame_width=float(sequence.width))
 
-        frames = stabilize_teams_by_tracklet(frames)
-        frames = enforce_one_goalkeeper_per_team_frames(
-            frames, frame_width=float(sequence.width)
-        )
-
-    # Perform pitch transformation and goalkeeper stabilization early
     frame_transforms: dict = {}
     frame_radar_transforms: dict = {}
     frame_keypoints: dict = {}
-    pitch_tracker = None
+    locked_goals = None
     if args.metric:
-        from world_cup_projects.common.pitch import (
-            iter_pitch_transformers,
-            warmup_goal_defenders,
+        ctx = load_metric_context(
+            sequence,
+            frames,
+            device=args.device,
+            pitch_confidence=args.pitch_confidence,
+            end=end,
+            source=args.source,
+            frame_width=float(sequence.width),
         )
-        from world_cup_projects.common.teams import stabilize_goalkeeper_teams
-
-        # Check for cached pitch data
-        cache_dir = Path(".cache/pitch")
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        cache_name = f"{sequence.name}_{args.device}_{end}_{args.pitch_confidence}.pkl"
-        cache_path = cache_dir / cache_name
-
-        detections_by_frame = {int(fi): d for fi, d in frames}
-
-        locked_goals = None
-        cache_ok = False
-        if cache_path.exists():
-            import pickle
-            with open(cache_path, "rb") as f:
-                cached_data = pickle.load(f)
-            if {"transforms", "radar_transforms", "keypoints"} <= cached_data.keys():
-                frame_transforms = cached_data["transforms"]
-                frame_radar_transforms = cached_data["radar_transforms"]
-                frame_keypoints = cached_data["keypoints"]
-                cache_ok = True
-                print(f"Loaded cached pitch homography: {cache_path.name}")
-            else:
-                print(
-                    f"Pitch cache incomplete ({cache_path.name}); rebuilding transforms..."
-                )
-        if not cache_ok:
-            print(f"Running pitch homography model (will cache to {cache_path.name})...")
-            for frame_idx, speed_t, radar_t, kps, tracker in iter_pitch_transformers(
-                sequence,
-                device=args.device,
-                end=end,
-                confidence=args.pitch_confidence,
-                yield_keypoints=True,
-                yield_tracker=True,
-                detections_by_frame=detections_by_frame,
-            ):
-                frame_transforms[frame_idx] = speed_t
-                frame_radar_transforms[frame_idx] = radar_t
-                frame_keypoints[frame_idx] = kps
-                pitch_tracker = tracker
-
-            import pickle
-            with open(cache_path, "wb") as f:
-                pickle.dump(
-                    {
-                        "transforms": frame_transforms,
-                        "radar_transforms": frame_radar_transforms,
-                        "keypoints": frame_keypoints,
-                    },
-                    f,
-                )
-            print(f"Wrote pitch cache: {cache_path}")
-
-        if args.source in ("football", "rfdetr") and frame_keypoints:
-            from world_cup_projects.common.pitch import warmup_goal_defenders_radar
-
-            locked_goals = warmup_goal_defenders_radar(
-                frames,
-                frame_keypoints,
-                confidence=args.pitch_confidence,
-            )
-            stabilize_goalkeeper_teams(
-                frames,
-                locked_goal_defenders=locked_goals,
-                keypoints_by_frame=frame_keypoints,
-                pitch_confidence=args.pitch_confidence,
-                frame_width=float(sequence.width),
-            )
+        frame_transforms = ctx.transforms
+        frame_radar_transforms = ctx.radar_transforms
+        frame_keypoints = ctx.keypoints
+        locked_goals = ctx.locked_goals
 
     weights = PassWeights.metric() if args.metric else PassWeights()
     scorer = PassQualityScorer(weights=weights, metric=args.metric, transformers=frame_transforms)

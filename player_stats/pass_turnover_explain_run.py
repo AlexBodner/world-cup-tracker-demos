@@ -24,6 +24,7 @@ if (_repo_root / "world_cup_projects" / "__init__.py").is_file():
 from world_cup_projects import DEFAULT_ASSETS_DIR
 from world_cup_projects.common.detect import (
     DEFAULT_BALL_DETECTION_THRESHOLD,
+    DEFAULT_FOOTBALL_BALL_MODEL_ID,
     DEFAULT_FOOTBALL_PLAYERS_MODEL_ID,
 )
 from world_cup_projects.common.video import load_video_sequence, read_sequence_frame
@@ -35,7 +36,7 @@ from world_cup_projects.player_stats.pass_events import (
     build_pass_carrier_timeline,
     scan_possession_events,
 )
-from world_cup_projects.player_stats.pass_network_run import _load_detections_source
+from world_cup_projects.common.pipeline import load_detections_source
 from world_cup_projects.player_stats.pass_explain_visual import (
     PassExplainVideoTiming,
     frames_needed_for_explain,
@@ -169,9 +170,9 @@ def main() -> None:
         detection_threshold = 0.5
         ball_threshold = args.ball_threshold
         ball_detector_backend = args.ball_detector_backend
-        ball_model_id = "football-ball-detection-rejhg/4"
+        ball_model_id = DEFAULT_FOOTBALL_BALL_MODEL_ID
 
-    detections_source = _load_detections_source(_Args, sequence)
+    detections_source = load_detections_source(_Args, sequence)
     frames = list(detections_source(sequence, start=1, end=end))
 
     from world_cup_projects.common.teams import stabilize_teams_by_tracklet

@@ -2600,6 +2600,63 @@ def _losing_team_pass_still_pending(state: _TeamPossessionState) -> bool:
     )
 
 
+def _same_team_pass_arrival_in_progress(
+    possessing_state: _TeamPossessionState,
+    receiver_tid: int,
+) -> bool:
+    """True when ``receiver_tid`` is receiving from a teammate's active release."""
+    release = possessing_state.release
+    if release is None:
+        return False
+    if release[3] == receiver_tid:
+        return False
+    return (
+        possessing_state.arrival_candidate_tid == receiver_tid
+        and possessing_state.arrival_streak > 0
+    )
+
+
+def _should_credit_team_possession(
+    *,
+    other_state: _TeamPossessionState,
+    touch_kind: str,
+    redirect_touch: bool,
+    dets: sv.Detections,
+    carrier: Carrier,
+    frames_by_idx: dict[int, sv.Detections],
+    frame_idx: int,
+    config: PassDetectionConfig,
+    transformers: dict[int, object],
+    metric: bool,
+    fps: float,
+) -> bool:
+    """Whether a touch updates last-possession during the opponent's in-flight release.
+
+    Fly-by receptions while the other team is playing a long ball must not anchor
+    turnover snapshots — only redirects or real control at the feet count.
+    """
+    if not (other_state.in_flight and other_state.release is not None):
+        return True
+    if redirect_touch:
+        return True
+    if touch_kind != "control":
+        return False
+    release_frame, _, release_carrier, _ = other_state.release
+    return _touch_valid_or_redirect(
+        dets,
+        carrier,
+        touch_kind=touch_kind,
+        frames_by_idx=frames_by_idx,
+        frame_idx=frame_idx,
+        config=config,
+        transformers=transformers,
+        metric=metric,
+        fps=fps,
+        release_ball=release_carrier.ball,
+        release_frame=release_frame,
+    )
+
+
 def _teammate_recovered_after_intercept(
     frames_by_idx: dict[int, sv.Detections],
     *,
@@ -2727,6 +2784,7 @@ def _queue_turnover_emit(
     *,
     losing_team: int,
     losing_state: _TeamPossessionState,
+    possessing_state: _TeamPossessionState,
     interceptor_tid: int,
     interceptor_team: int,
     interception_frame: int,
@@ -2738,6 +2796,8 @@ def _queue_turnover_emit(
 ) -> None:
     snapshot = losing_state.turnover_snapshot
     if snapshot is None or _losing_team_pass_still_pending(losing_state):
+        return
+    if _same_team_pass_arrival_in_progress(possessing_state, interceptor_tid):
         return
     release_frame, passer_tid = snapshot
     if interception_frame - release_frame < config.adjacent_pass_max_gap_frames:
@@ -3051,11 +3111,25 @@ def scan_possession_events(
 
         state = team_states[team]
         other_state = team_states[1 - team]
-        state.last_possession_frame = frame_idx
-        state.last_possessor_tid = tid
         redirect_touch = _ball_redirected(
             frames_by_idx, frame_idx, config=config
         )
+        credit_possession = _should_credit_team_possession(
+            other_state=other_state,
+            touch_kind=touch_kind,
+            redirect_touch=redirect_touch,
+            dets=dets,
+            carrier=carrier,
+            frames_by_idx=frames_by_idx,
+            frame_idx=frame_idx,
+            config=config,
+            transformers=transformers,
+            metric=metric,
+            fps=fps,
+        )
+        if credit_possession:
+            state.last_possession_frame = frame_idx
+            state.last_possessor_tid = tid
         if redirect_touch:
             _promote_redirect_one_touch_release(
                 state, frame_idx, dets, carrier, tid
@@ -3066,7 +3140,9 @@ def scan_possession_events(
             losing_origin_frame = other_state.release[0]
             losing_origin_tid = other_state.release[3]
         if (
-            losing_origin_frame >= 0
+            credit_possession
+            and not _same_team_pass_arrival_in_progress(state, tid)
+            and losing_origin_frame >= 0
             and losing_origin_tid >= 0
             and frame_idx > losing_origin_frame
         ):
@@ -3130,6 +3206,7 @@ def scan_possession_events(
                         pending_turnovers,
                         losing_team=1 - team,
                         losing_state=other_state,
+                        possessing_state=state,
                         interceptor_tid=tid,
                         interceptor_team=team,
                         interception_frame=frame_idx,

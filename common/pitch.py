@@ -185,7 +185,7 @@ def draw_points_on_pitch(
 # --------------------------------------------------------------------------- #
 # Pitch keypoint model -> per-frame homography
 # --------------------------------------------------------------------------- #
-PITCH_INFERENCE_MODEL_ID = "football-field-detection-f07vi/15"
+from world_cup_projects.common.model_ids import PITCH_INFERENCE_MODEL_ID
 
 
 class PitchHomography:
@@ -243,6 +243,25 @@ class PitchHomography:
 
 
 PITCH_CONFIG = SoccerPitchConfiguration()
+
+
+def valid_pitch_cm(
+    xy: np.ndarray,
+    config: SoccerPitchConfiguration = PITCH_CONFIG,
+    *,
+    margin_cm: float = 200.0,
+) -> np.ndarray:
+    """Mask for points that lie on the pitch (homography outliers are dropped)."""
+    if xy is None or len(xy) == 0:
+        return np.zeros(0, dtype=bool)
+    finite = np.isfinite(xy).all(axis=1)
+    return (
+        finite
+        & (xy[:, 0] >= margin_cm)
+        & (xy[:, 0] <= config.length - margin_cm)
+        & (xy[:, 1] >= margin_cm)
+        & (xy[:, 1] <= config.width - margin_cm)
+    )
 
 
 def infer_goal_defenders(
@@ -606,9 +625,7 @@ def render_radar_simple(
         )
 
     if feet_cm is not None and teams is not None and outfield_mask.any():
-        from world_cup_projects.common.visual import _valid_pitch_cm
-
-        on_pitch = _valid_pitch_cm(feet_cm, config, margin_cm=80.0)
+        on_pitch = valid_pitch_cm(feet_cm, config, margin_cm=80.0)
         for team_id, color in enumerate(_SPORTS_RADAR_COLORS[:2]):
             team_mask = (teams == team_id) & on_pitch
             if not team_mask.any():
@@ -623,12 +640,10 @@ def render_radar_simple(
             )
 
     if gk_feet_cm is not None and gk_mask.any():
-        from world_cup_projects.common.visual import _valid_pitch_cm
-
         gk_teams = detections[gk_mask].data.get(
             "team", np.full(int(gk_mask.sum()), -1, dtype=int)
         )
-        on_pitch = _valid_pitch_cm(gk_feet_cm, config, margin_cm=80.0)
+        on_pitch = valid_pitch_cm(gk_feet_cm, config, margin_cm=80.0)
         for team_id, color in enumerate(_SPORTS_RADAR_COLORS[:2]):
             team_mask = (gk_teams == team_id) & on_pitch
             if not team_mask.any():
@@ -980,14 +995,12 @@ def _players_on_pitch_score(
 ) -> tuple[int, float]:
     """Count in-bounds players and team separation on the pitch (cm)."""
     from world_cup_projects.common.possession import feet_xy, player_mask
-    from world_cup_projects.common.visual import _valid_pitch_cm
-
     pmask = player_mask(detections)
     if not pmask.any():
         return 0, 0.0
     feet = feet_xy(detections)[pmask].astype(np.float32)
     cm = transformer.transform_points(feet)
-    in_bounds = int(_valid_pitch_cm(cm, config, margin_cm=80.0).sum())
+    in_bounds = int(valid_pitch_cm(cm, config, margin_cm=80.0).sum())
     teams = detections.data["team"][pmask]
     separation = 0.0
     if np.any(teams == 0) and np.any(teams == 1):
@@ -1597,15 +1610,15 @@ class PitchHomographyMaps:
 def _pitch_cache_roots(cache_dir: str | None = None) -> list:
     from pathlib import Path
 
+    from world_cup_projects import PACKAGE_ROOT
+
     roots: list[Path] = []
     if cache_dir:
         roots.append(Path(cache_dir))
-    pkg = Path(__file__).resolve().parents[1]
     roots.extend(
         [
-            pkg / ".cache" / "pitch",
-            pkg.parent / ".cache" / "pitch",
-            Path(".cache") / "pitch",
+            PACKAGE_ROOT / ".cache" / "pitch",
+            PACKAGE_ROOT.parent / ".cache" / "pitch",
         ]
     )
     seen: set[Path] = set()
@@ -1737,7 +1750,9 @@ def ensure_pitch_homography_maps(
     radar_transforms: dict[int, ViewTransformer | None] = {}
     keypoints: dict[int, sv.KeyPoints | None] = {}
     cache_roots = _pitch_cache_roots()
-    cache_root = cache_roots[0] if cache_roots else Path(".cache/pitch")
+    from world_cup_projects import PACKAGE_ROOT
+
+    cache_root = cache_roots[0] if cache_roots else PACKAGE_ROOT / ".cache" / "pitch"
     cache_path = cache_root / f"{sequence.name}_{device}_{clip_end}_{pitch_confidence}.pkl"
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     print(f"Running pitch homography (cache → {cache_path.name})...")

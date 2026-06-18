@@ -21,6 +21,11 @@ import json
 from dataclasses import replace
 from pathlib import Path
 
+from world_cup_projects import DEFAULT_ASSETS_DIR
+from world_cup_projects.common.cli import (
+    FootballDetectionDefaults,
+    add_football_detection_args,
+)
 from world_cup_projects.common.clips import (
     PITCH_HOMOGRAPHY_DEMO_CLIP,
     PITCH_KEYPOINT_AVOID,
@@ -29,7 +34,6 @@ from world_cup_projects.common.clips import (
     pitch_keypoints_unreliable,
     rank_clips,
 )
-from world_cup_projects import DEFAULT_ASSETS_DIR
 from world_cup_projects.common.soccernet import (
     DEFAULT_TRACKING_ROOT,
     find_sequences,
@@ -41,35 +45,30 @@ from world_cup_projects.pass_alternatives.render import render_demo
 
 
 def main() -> None:
+    from world_cup_projects.common.model_ids import (
+        DEFAULT_FOOTBALL_BALL_MODEL_ID,
+        DEFAULT_FOOTBALL_PLAYERS_MODEL_ID,
+    )
+
     parser = argparse.ArgumentParser(description="Pass-alternatives demo")
     parser.add_argument("--data", default=DEFAULT_TRACKING_ROOT)
     parser.add_argument("--split", default="test")
-    parser.add_argument("--sequence", default=None)
-    parser.add_argument(
-        "--video",
-        default=None,
-        help="MP4 path instead of SNMOT (implies --source football).",
-    )
     parser.add_argument("--out", default=str(DEFAULT_ASSETS_DIR))
-    parser.add_argument("--max-frames", type=int, default=None)
+    add_football_detection_args(
+        parser,
+        defaults=FootballDetectionDefaults(
+            tracker="bytetrack",
+            ball_detector_backend="none",
+        ),
+        ball_detector_choices=("none", "inference"),
+        include_ball_ensemble=False,
+    )
     parser.add_argument(
         "--max-events",
         type=int,
         default=0,
         help="Cap freeze count; 0 = auto-detect all good moments (default).",
     )
-    parser.add_argument(
-        "--source",
-        choices=("gt", "football", "rfdetr"),
-        default="gt",
-        help="Detection source. gt = SoccerNet GT; football = DFL player detector; rfdetr = COCO.",
-    )
-    parser.add_argument(
-        "--metric",
-        action="store_true",
-        help="Score in pitch meters via the pitch-keypoint homography.",
-    )
-    parser.add_argument("--device", default="cpu", help="Pitch keypoint model device.")
     parser.add_argument(
         "--carrier-max-px",
         type=float,
@@ -88,71 +87,10 @@ def main() -> None:
         help="Just print the clip ranking and exit (no render).",
     )
     parser.add_argument(
-        "--debug-pitch-keypoints",
-        action="store_true",
-        help="Draw pitch keypoints on the video + radar (green=used, blue=rejected).",
-    )
-    parser.add_argument(
-        "--pitch-confidence",
-        type=float,
-        default=0.9,
-        help="Keypoint confidence threshold (overlay legend + homography filter).",
-    )
-    parser.add_argument(
         "--facing-mode",
         choices=("motion", "kalman", "both"),
         default="kalman",
         help="Player facing arrows: kalman (default), displacement motion, or both.",
-    )
-    parser.add_argument(
-        "--tracker",
-        choices=("bytetrack", "botsort", "botsort_nocmc"),
-        default="bytetrack",
-        help="Player tracker for --source football/rfdetr. botsort = BoT-SORT + CMC.",
-    )
-    parser.add_argument(
-        "--refresh-detections-cache",
-        action="store_true",
-        help="Re-run YOLO/RF-DETR instead of loading .cache/detections/.",
-    )
-    parser.add_argument(
-        "--legacy-detections-cache",
-        action="store_true",
-        help="Use pre-ball_threshold YOLO cache (ignore inference / RF-DETR caches).",
-    )
-    parser.add_argument(
-        "--detector-backend",
-        choices=("yolo", "inference"),
-        default="yolo",
-        help="football source: local Ultralytics .pt (yolo) or Roboflow Inference (needs ROBOFLOW_API_KEY)",
-    )
-    parser.add_argument(
-        "--player-model-id",
-        default=None,
-        help="Universe model id for --detector-backend inference (default football-players-detection-3zvbc/11)",
-    )
-    parser.add_argument(
-        "--detection-threshold",
-        type=float,
-        default=0.5,
-        help="Player / GK / referee detection confidence threshold",
-    )
-    parser.add_argument(
-        "--ball-threshold",
-        type=float,
-        default=None,
-        help="Ball class confidence threshold (default 0.20; lower catches blur / air balls)",
-    )
-    parser.add_argument(
-        "--ball-detector-backend",
-        choices=("none", "inference"),
-        default="none",
-        help="Optional dedicated ball model via Inference (needs ROBOFLOW_API_KEY)",
-    )
-    parser.add_argument(
-        "--ball-model-id",
-        default=None,
-        help="Universe ball model id (default football-ball-detection-rejhg/1)",
     )
     parser.add_argument(
         "--freeze-min-pick-score",

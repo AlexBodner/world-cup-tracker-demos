@@ -340,3 +340,254 @@ def draw_pass_lane_legend(frame: np.ndarray) -> np.ndarray:
         )
         y += 18
     return frame
+
+
+from dataclasses import dataclass
+
+from world_cup_projects.common.pitch import (
+    ViewTransformer,
+    homography_from_keypoints_radar,
+    image_to_pitch_cm,
+    image_to_pitch_m,
+    pitch_attack_direction,
+    render_radar_simple,
+)
+from world_cup_projects.common.possession import (
+    Carrier,
+    bbox_center_xy,
+    feet_xy,
+    player_mask,
+)
+from world_cup_projects.common.visual import (
+    ROBOFLOW_PURPLE_BGR,
+    annotate_ball,
+    annotate_players,
+    draw_branding_tag,
+    draw_carrier_pulse,
+    draw_carrier_spotlight,
+    draw_glow_arrow,
+    draw_hud_bar,
+    draw_pass_analysis_panel,
+    draw_pitch_keypoints_debug,
+    draw_radar_minimap,
+    draw_score_chip,
+    draw_text_shadow,
+    ease_out_cubic,
+)
+from world_cup_projects.pass_alternatives.pass_options import (
+    PassOption,
+    PassWeights,
+    remap_lane_debug_to_pitch_cm,
+    top_pass_options,
+)
+
+RANK_COLORS_BGR = [(80, 220, 60), (0, 215, 255), (40, 140, 255)]
+
+
+@dataclass(frozen=True)
+class PassEvent:
+    frame_idx: int
+    carrier: Carrier
+    options: list[PassOption]
+    top_score: float
+
+
+def _options_with_lane_debug(
+    dets: sv.Detections,
+    event: PassEvent,
+    *,
+    weights: PassWeights,
+    transformer: ViewTransformer,
+    pitch_cm: np.ndarray | None = None,
+) -> list[PassOption]:
+    """Re-score if needed so freeze frames always carry pitch corridor geometry."""
+    if event.options and all(o.lane_debug is not None for o in event.options):
+        return event.options
+    pitch_feet = image_to_pitch_m(feet_xy(dets), transformer)
+    if pitch_cm is None:
+        pitch_cm = image_to_pitch_cm(feet_xy(dets), transformer)
+    body_pitch_m = image_to_pitch_m(bbox_center_xy(dets), transformer)
+    if pitch_feet is None or pitch_cm is None:
+        return event.options
+    attack_dir = pitch_attack_direction(
+        dets,
+        event.carrier.team,
+        transformer,
+        player_mask_fn=player_mask,
+        feet_fn=feet_xy,
+    )
+    return top_pass_options(
+        dets,
+        event.carrier,
+        k=3,
+        weights=weights,
+        attack_dir=attack_dir,
+        positions=pitch_feet,
+        pitch_cm=pitch_cm,
+        body_pitch_m=body_pitch_m,
+    )
+
+
+def draw_pass_overlay(
+    frame: np.ndarray,
+    dets: sv.Detections,
+    event: PassEvent,
+    *,
+    weights: PassWeights = PassWeights(),
+    metric: bool = False,
+    keypoints: sv.KeyPoints | None = None,
+    pitch_confidence: float = 0.9,
+    transformer: ViewTransformer | None = None,
+    show_lane_debug: bool = True,
+    show_radar: bool = True,
+    locked_goal_defenders: tuple[int, int] | None = None,
+    debug_pitch_keypoints: bool = False,
+    revealed_options: int | None = None,
+    reveal_progress: float = 1.0,
+    facing: np.ndarray | None = None,
+    facing_motion: np.ndarray | None = None,
+    facing_kalman: np.ndarray | None = None,
+) -> np.ndarray:
+    """Dim the frame and draw ranked pass arrows from the carrier.
+
+    ``revealed_options``: how many top options to show (0 = carrier only, None = all).
+    ``reveal_progress``: 0–1 animation within the current reveal phase.
+    """
+    dim = (frame.astype(np.float32) * 0.32).astype(np.uint8)
+    if debug_pitch_keypoints and keypoints is not None:
+        dim = draw_pitch_keypoints_debug(
+            dim, keypoints, confidence_threshold=pitch_confidence
+        )
+
+    options = event.options
+    feet_img = feet_xy(dets)
+    if show_lane_debug and transformer is not None:
+        pitch_cm_vis = image_to_pitch_cm(feet_img, transformer)
+        options = _options_with_lane_debug(
+            dets,
+            event,
+            weights=weights,
+            transformer=transformer,
+            pitch_cm=pitch_cm_vis,
+        )
+
+    visible = options
+    if revealed_options is not None:
+        visible = options[: max(0, revealed_options)]
+
+    if show_lane_debug and transformer is not None and visible:
+        dim = apply_pass_lane_geometry(dim, visible, transformer, feet_img)
+
+    dim = annotate_players(
+        dim,
+        dets,
+        facing=facing,
+        facing_motion=facing_motion,
+        facing_kalman=facing_kalman,
+        show_tracker_ids=True,
+    )
+    dim = annotate_ball(dim, dets)
+
+    feet = feet_xy(dets)
+    carrier_xy = feet[event.carrier.index]
+    cx, cy = int(carrier_xy[0]), int(carrier_xy[1])
+    dim = draw_carrier_spotlight(dim, frame, (cx, cy))
+
+    n_total = min(3, len(options))
+    phase_revealed = 0 if revealed_options == 0 else revealed_options
+
+    if revealed_options == 0:
+        draw_carrier_pulse(dim, (cx, cy), reveal_progress)
+        draw_score_chip(dim, "ON BALL", (cx, cy - 42), bg_bgr=ROBOFLOW_PURPLE_BGR)
+        dim = draw_pass_analysis_panel(
+            dim,
+            progress=reveal_progress,
+            revealed=0,
+            total=n_total,
+        )
+        dim = draw_hud_bar(dim, "PASS ALTERNATIVES")
+        return draw_branding_tag(dim)
+
+    draw_carrier_pulse(dim, (cx, cy), min(1.0, reveal_progress * 0.35 + 0.65))
+
+    for rank, option in enumerate(visible):
+        color = RANK_COLORS_BGR[rank]
+        recv_xy = feet[option.receiver_index]
+        rx, ry = int(recv_xy[0]), int(recv_xy[1])
+        is_new = rank == len(visible) - 1
+        alpha = ease_out_cubic(reveal_progress) if is_new else 1.0
+        draw_glow_arrow(dim, (cx, cy), (rx, ry), color, thickness=5, alpha=alpha)
+        if alpha > 0.2:
+            draw_receiver_highlight(dim, (rx, ry), rank, color, alpha=alpha)
+        if alpha < 0.85:
+            continue
+        midx, midy = (cx + rx) // 2, (cy + ry) // 2
+        chip = f"{RANK_LABELS[rank]}  {option.score:.2f}"
+        if metric:
+            chip += f"  {option.length:.1f} m"
+        if option.rivals_in_lane:
+            chip += f"  ({option.rivals_in_lane} riv)"
+        if option.teammates_in_lane:
+            chip += f"  ({option.teammates_in_lane} tm)"
+        if option.lane_debug and option.lane_debug.blocking_rival_indices:
+            chip += f"  !{len(option.lane_debug.blocking_rival_indices)}"
+        draw_score_chip(dim, chip, (midx, midy), bg_bgr=color)
+        if metric:
+            lx, ly = pass_line_label_xy((cx, cy), (rx, ry))
+            draw_text_shadow(
+                dim,
+                f"{option.length:.1f} m",
+                (lx - 18, ly - 6),
+                font_scale=0.58,
+                color_bgr=color,
+                thickness=2,
+            )
+
+    latest_rank = len(visible) - 1
+    dim = draw_pass_analysis_panel(
+        dim,
+        progress=reveal_progress,
+        revealed=phase_revealed,
+        total=n_total,
+        rank_label=RANK_LABELS[latest_rank] if visible else None,
+        rank_color=RANK_COLORS_BGR[latest_rank] if visible else None,
+    )
+
+    if show_radar and keypoints is not None:
+        radar_h = homography_from_keypoints_radar(
+            keypoints, confidence=pitch_confidence
+        )
+        radar = render_radar_simple(
+            dets,
+            keypoints,
+            confidence=pitch_confidence,
+            transformer=radar_h,
+            locked_goal_defenders=locked_goal_defenders,
+            debug_keypoints=True,
+        )
+        if radar is not None and show_lane_debug and visible and radar_h is not None:
+            pitch_cm_radar = image_to_pitch_cm(feet_img, radar_h)
+            if pitch_cm_radar is not None:
+                radar_visible = remap_lane_debug_to_pitch_cm(
+                    visible,
+                    event.carrier,
+                    pitch_cm_radar,
+                    feet_img,
+                    weights=weights,
+                )
+                radar = draw_pass_lanes_on_radar(
+                    radar, radar_visible, pitch_cm_radar
+                )
+            dim = draw_pass_lane_legend(dim)
+        if radar is not None:
+            dim = draw_radar_minimap(
+                dim,
+                dets,
+                keypoints,
+                pitch_confidence=pitch_confidence,
+                locked_goal_defenders=locked_goal_defenders,
+                prebuilt_radar=radar,
+            )
+
+    dim = draw_hud_bar(dim, "PASS ALTERNATIVES  -  top 3 open lanes")
+    return draw_branding_tag(dim)

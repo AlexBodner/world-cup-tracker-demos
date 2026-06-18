@@ -801,7 +801,10 @@ def render_pass_network_demo(
                 
                 if options:
                     # Cinematic Freeze & Reveal (using original Pass Alternatives styling)
-                    from world_cup_projects.pass_alternatives.render import _draw_pass_overlay, PassEvent
+                    from world_cup_projects.pass_alternatives.lane_visual import (
+                        PassEvent,
+                        draw_pass_overlay,
+                    )
                     
                     # Create a mock PassEvent for the renderer
                     freeze_event = PassEvent(
@@ -828,7 +831,7 @@ def render_pass_network_demo(
                         for step in range(phase_hold):
                             progress = (step + 1) / max(phase_hold, 1)
                             # We pass `image` because `_draw_pass_overlay` dims it internally
-                            overlay = _draw_pass_overlay(
+                            overlay = draw_pass_overlay(
                                 image,
                                 dets,
                                 freeze_event,

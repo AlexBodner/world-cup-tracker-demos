@@ -56,7 +56,7 @@ from world_cup_projects.player_stats.pass_explain_visual import (
     write_pass_explain_gif,
     write_pass_explain_video,
 )
-from world_cup_projects.player_stats.pass_network_run import _load_detections_source
+from world_cup_projects.common.pipeline import load_detections_source
 
 
 def _resolve_roboflow_api_key(cli_key: str | None) -> str | None:
@@ -133,7 +133,7 @@ def _load_dets_from_manifest_detector(
 
     from world_cup_projects.common.teams import stabilize_teams_by_tracklet
 
-    src = _load_detections_source(_RefArgs, sequence)
+    src = load_detections_source(_RefArgs, sequence)
     frames = stabilize_teams_by_tracklet(list(src(sequence, start=1, end=sequence.length)))
     return {int(fi): d for fi, d in frames}
 
@@ -249,6 +249,12 @@ def _load_pitch_maps(sequence, *, device: str, end: int, detections_by_frame):
 
 
 def main() -> None:
+    from world_cup_projects.common.model_ids import (
+        BEST_FOOTBALL_PLAYERS_YOLO_MODEL_ID,
+        DEFAULT_FOOTBALL_BALL_MODEL_ID,
+        DEFAULT_FOOTBALL_PLAYERS_MODEL_ID,
+    )
+
     parser = argparse.ArgumentParser(
         description="Render pass-detection filmstrip explanation PNGs"
     )
@@ -371,8 +377,8 @@ def main() -> None:
         "--universe-best",
         action="store_true",
         help=(
-            "Use best Universe YOLO (football-players-detection/19 yolo11m) via Inference "
-            "+ dedicated ball model (football-ball-detection/4). Needs ROBOFLOW_API_KEY."
+            f"Use newer Universe YOLO ({BEST_FOOTBALL_PLAYERS_YOLO_MODEL_ID}) via Inference "
+            f"+ dedicated ball model ({DEFAULT_FOOTBALL_BALL_MODEL_ID}). Needs ROBOFLOW_API_KEY."
         ),
     )
     parser.add_argument(
@@ -385,8 +391,8 @@ def main() -> None:
         "--player-model-id",
         default=None,
         help=(
-            "Universe player model id (default: football-players-detection-3zvbc/11 local; "
-            "football-players-detection-3zvbc/19 with --universe-best)"
+            f"Universe player model id (default: {DEFAULT_FOOTBALL_PLAYERS_MODEL_ID} local; "
+            f"{BEST_FOOTBALL_PLAYERS_YOLO_MODEL_ID} with --universe-best)"
         ),
     )
     parser.add_argument(
@@ -410,7 +416,7 @@ def main() -> None:
     parser.add_argument(
         "--ball-model-id",
         default=None,
-        help="Universe ball model id (default football-ball-detection-rejhg/4)",
+        help=f"Universe ball model id (default {DEFAULT_FOOTBALL_BALL_MODEL_ID})",
     )
     parser.add_argument(
         "--roboflow-api-key",
@@ -491,7 +497,7 @@ def main() -> None:
         f"ball_model={args.ball_model_id if args.ball_detector_backend == 'inference' else '—'}"
     )
 
-    detections_source = _load_detections_source(_Args, sequence)
+    detections_source = load_detections_source(_Args, sequence)
     frames = list(detections_source(sequence, start=1, end=end))
 
     from world_cup_projects.common.teams import stabilize_teams_by_tracklet
