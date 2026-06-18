@@ -720,7 +720,7 @@ Common reasons a pass happens but **no lane viz** appears:
 Per-pass gate report + hold video for `--show-predictions` freezes:
 
 ```bash
-PYTHONPATH=. python -m world_cup_projects.player_stats.freeze_debug_run \
+PYTHONPATH=. python -m world_cup_projects.dev.freeze_debug_run \
     --video world_cup_projects/bundesliga_videos/08fd33_0.mp4 \
     --metric --device cpu
 ```
@@ -733,7 +733,7 @@ pass with a checklist) and `.json` with `blockers` / `gates` per pass.
 ```bash
 export ROBOFLOW_API_KEY=your_key
 
-PYTHONPATH=. python -m world_cup_projects.player_stats.compare_player_detectors \\
+PYTHONPATH=. python -m world_cup_projects.dev.compare_player_detectors \\
     --video world_cup_projects/bundesliga_videos/08fd33_0.mp4 \\
     --metric --configs yolo:11,inference:11,inference:20
 ```
@@ -889,8 +889,8 @@ a NumPy / scikit-image error, run `pip install --force-reinstall scikit-image in
 common/              possession, pitch, teams, detect, visual, pipeline
 explain/             filmstrip/video explain assets (pass, turnover, lane, alternatives)
 pass_alternatives/   lane scoring, freeze render
-player_stats/        passes, network, speed/distance, tracking/kalman demos
-dev/                 ad-hoc debug scripts (pass window trace, hosted pitch shim, …)
+player_stats/        passes, network, speed/distance, tracking/kalman demos (production only)
+dev/                 debug/analysis scripts (freeze debug, ball speed, detector compare, …)
 scripts/             shell helpers (explain batch renders)
 bundesliga_videos/   test MP4s (not in git)
 assets/              outputs (gitignored)

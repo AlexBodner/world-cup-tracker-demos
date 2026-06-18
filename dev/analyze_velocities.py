@@ -6,7 +6,7 @@ for comparison. Writes JSON under the package ``assets/`` directory by default.
 
 Example::
 
-    PYTHONPATH=. python -m world_cup_projects.player_stats.analyze_velocities \\
+    PYTHONPATH=. python -m world_cup_projects.dev.analyze_velocities \\
         --sequence SNMOT-197
 """
 

@@ -7,7 +7,7 @@ Example::
 
     export ROBOFLOW_API_KEY=your_key
 
-    PYTHONPATH=. python -m world_cup_projects.player_stats.compare_player_detectors \\
+    PYTHONPATH=. python -m world_cup_projects.dev.compare_player_detectors \\
         --video world_cup_projects/bundesliga_videos/08fd33_0.mp4 \\
         --metric --device cpu \\
         --configs yolo:11,inference:11,inference:20
@@ -42,7 +42,7 @@ from world_cup_projects.common.soccernet import ROLE_BALL
 from world_cup_projects.common.teams import stabilize_teams_by_tracklet
 from world_cup_projects.common.video import load_video_sequence
 from world_cup_projects.pass_alternatives.pass_options import PassWeights
-from world_cup_projects.player_stats.freeze_debug import diagnose_all_passes
+from world_cup_projects.dev.freeze_debug import diagnose_all_passes
 from world_cup_projects.player_stats.pass_events import (
     PassDetectionConfig,
     PassQualityScorer,

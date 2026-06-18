@@ -2,7 +2,7 @@
 
 Example::
 
-    PYTHONPATH=. python -m world_cup_projects.player_stats.freeze_debug_run \\
+    PYTHONPATH=. python -m world_cup_projects.dev.freeze_debug_run \\
         --video world_cup_projects/bundesliga_videos/08fd33_0.mp4 \\
         --metric --device cpu
 """
@@ -27,7 +27,7 @@ from world_cup_projects.common.pipeline import (
 )
 from world_cup_projects.common.video import load_video_sequence, read_sequence_frame
 from world_cup_projects.pass_alternatives.pass_options import PassWeights
-from world_cup_projects.player_stats.freeze_debug import (
+from world_cup_projects.dev.freeze_debug import (
     diagnose_all_passes,
     render_freeze_debug_video,
 )

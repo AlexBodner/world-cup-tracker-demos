@@ -5,7 +5,7 @@ Counts carrier frames, pass-scoring candidates, and final freeze events for each
 
 Example::
 
-    MPLCONFIGDIR=/tmp/mpl PYTHONPATH=. python -m world_cup_projects.pass_alternatives.compare_thresholds \\
+    MPLCONFIGDIR=/tmp/mpl PYTHONPATH=. python -m world_cup_projects.dev.compare_thresholds \\
         --top 5 --thresholds 0.6,0.7,0.8,1.0,1.2,2.0
 
 Optional short MP4s for one sequence::

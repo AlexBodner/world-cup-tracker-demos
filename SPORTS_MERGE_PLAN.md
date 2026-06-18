@@ -114,9 +114,10 @@ examples/soccer/
 | `explain/pass_alternatives_explain.py` | `explain/pass_alternatives_*` | Slim 4-step explain reusing `annotations.py`. |
 
 ### Left behind in this repo (pure dev/debug tooling — NOT ported)
-`freeze_debug*`, `compare_ball_detection`, `benchmark_ball_detection`, `compare_player_detectors`,
-`pass_alternatives/compare_thresholds`, `analyze_velocities`, `ball_speed_debug_*`, `ground_truth/`
-(+ `compare_passes`), `debug_*.py`, the notebook.
+`dev/` (`freeze_debug*`, `compare_ball_detection`, `benchmark_ball_detection`,
+`compare_player_detectors`, `compare_thresholds`, `analyze_velocities`, `ball_speed_debug_*`,
+`debug_*.py`, `find_cross_team_pass_overlaps.py`), `ground_truth/`
+(+ `compare_passes`), the notebook.
 
 ### Replaced infra (functionality kept, implementation swapped)
 - `common/detect.py` RF-DETR/local-YOLO paths → Inference-only `detection.py` (kept: player/ball/ref handling, team fit).

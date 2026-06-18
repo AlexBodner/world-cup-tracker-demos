@@ -2,7 +2,7 @@
 
 Example::
 
-    PYTHONPATH=. python -m world_cup_projects.player_stats.compare_ball_detection \\
+    PYTHONPATH=. python -m world_cup_projects.dev.compare_ball_detection \\
         --video world_cup_projects/bundesliga_videos/08fd33_0.mp4 \\
         --ball-thresholds 0.5,0.35,0.25,0.20,0.15
 """

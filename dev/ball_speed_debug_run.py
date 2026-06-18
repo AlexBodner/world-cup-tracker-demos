@@ -5,7 +5,7 @@ Players still show tracker ids; their Kalman joystick demo is separate.
 
 From ``world_cup_projects/``::
 
-    PYTHONPATH=.. python -m player_stats.ball_speed_debug_run \\
+    PYTHONPATH=. python -m world_cup_projects.dev.ball_speed_debug_run \\
         --video bundesliga_videos/08fd33_0.mp4 --start 350 --end 500
 """
 
@@ -24,7 +24,7 @@ if str(_repo_root) not in sys.path:
 from world_cup_projects import DEFAULT_ASSETS_DIR
 from world_cup_projects.common.pipeline import load_football_detections_cached
 from world_cup_projects.common.video import load_video_sequence
-from world_cup_projects.player_stats.ball_speed_debug_render import render_ball_speed_debug_video
+from world_cup_projects.dev.ball_speed_debug_render import render_ball_speed_debug_video
 
 
 def main() -> None:

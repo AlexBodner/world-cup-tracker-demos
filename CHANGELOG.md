@@ -9,6 +9,12 @@ Historical export of the internal `world_cup_projects` package (Roboflow monorep
   `explain/` (`pass_explain_*`, `pass_turnover_explain_*`, `pass_lane_detect_*`,
   `pass_alternatives_*`). Run via `python -m world_cup_projects.explain.*`; old shim paths removed.
 
+### Dev tooling consolidation
+- Moved debug/analysis scripts from `player_stats/` and `pass_alternatives/compare_thresholds.py`
+  into `dev/` (`freeze_debug*`, `ball_speed_debug_*`, `compare_player_detectors`,
+  `compare_ball_detection`, `benchmark_ball_detection`, `analyze_velocities`, `compare_thresholds`).
+  Run via `python -m world_cup_projects.dev.*`; `player_stats/` retains production demos + core library only.
+
 ### Pass alternatives render
 - Replaced default player **facing arrows** with **Kalman joystick dots** (team-colored
   direction circles on ellipses). `--facing-mode motion|kalman|both` remains for deprecated
