@@ -12,9 +12,11 @@ import numpy as np
 import supervision as sv
 
 from world_cup_projects.common.carrier_motion import BallPositionHistory, TrackPositionHistory
-from world_cup_projects.common.player_tracker import TrackerKind
+from world_cup_projects.common.player_tracker import TrackerKind, create_player_tracker
 from world_cup_projects.common.tracking_facing import (
+    JoystickDotSmoother,
     KalmanFacingReplay,
+    attach_kalman_velocity,
     carrier_kalman_direction,
     detections_have_kalman_velocity,
     facing_kalman_from_detections,
@@ -566,6 +568,8 @@ def _annotate_live(
     facing: np.ndarray | None = None,
     facing_motion: np.ndarray | None = None,
     facing_kalman: np.ndarray | None = None,
+    show_kalman_joystick: bool = False,
+    dot_smoother: JoystickDotSmoother | None = None,
 ) -> np.ndarray:
     frame = annotate_players(
         frame,
@@ -573,6 +577,8 @@ def _annotate_live(
         facing=facing,
         facing_motion=facing_motion,
         facing_kalman=facing_kalman,
+        show_kalman_joystick=show_kalman_joystick,
+        dot_smoother=dot_smoother,
         show_tracker_ids=True,
     )
     frame = annotate_ball(frame, dets)
@@ -634,7 +640,7 @@ def render_demo(
     debug_pitch_keypoints: bool = False,
     pitch_confidence: float = 0.9,
     show_radar: bool | None = None,
-    facing_mode: Literal["motion", "kalman", "both"] = "kalman",
+    facing_mode: Literal["joystick", "motion", "kalman", "both"] = "joystick",
     tracker_kind: TrackerKind = "bytetrack",
 ) -> dict:
     """Render the full demo MP4. Returns a small manifest dict."""
@@ -725,13 +731,24 @@ def render_demo(
     track_history = TrackPositionHistory()
     use_cached_kalman = False
     kalman_replay = None
-    if facing_mode in ("kalman", "both"):
+    player_tracker = None
+    needs_frame = False
+    dot_smoother: JoystickDotSmoother | None = None
+    use_joystick = facing_mode == "joystick"
+    use_deprecated_arrows = facing_mode in ("motion", "kalman", "both")
+    if use_joystick or facing_mode in ("kalman", "both"):
         sample = next(
             _iter_frames(sequence, detections_source, max_frames=max_frames),
             None,
         )
         if sample is not None and detections_have_kalman_velocity(sample[1]):
             use_cached_kalman = True
+        elif use_joystick:
+            needs_frame = tracker_kind == "botsort"
+            player_tracker = create_player_tracker(
+                sequence.frame_rate, kind=tracker_kind
+            )
+            dot_smoother = JoystickDotSmoother(alpha=0.32)
         else:
             kalman_replay = KalmanFacingReplay(
                 sequence.frame_rate, tracker_kind=tracker_kind
@@ -755,21 +772,33 @@ def render_demo(
                     if pitch_tracker.register_reliable_goal_vote(pitch_m, teams):
                         locked_goals = pitch_tracker.locked_goal_defenders
         track_history.record_frame(frame_idx, dets, feet_xy(dets))
-        facing_motion = (
-            track_history.player_facing(dets, frame_idx)
-            if facing_mode in ("motion", "both")
-            else None
-        )
-        if facing_mode in ("kalman", "both"):
-            if use_cached_kalman:
-                facing_kalman = facing_kalman_from_detections(dets)
-            else:
-                facing_kalman = kalman_replay.advance(dets, image) if kalman_replay else None
-        else:
-            facing_kalman = None
+        facing_motion = None
+        facing_kalman = None
+        render_dets = dets
+        if use_joystick:
+            if not use_cached_kalman and player_tracker is not None:
+                render_dets = attach_kalman_velocity(
+                    dets,
+                    player_tracker,
+                    needs_frame=needs_frame,
+                    image=image,
+                )
+        elif use_deprecated_arrows:
+            facing_motion = (
+                track_history.player_facing(dets, frame_idx)
+                if facing_mode in ("motion", "both")
+                else None
+            )
+            if facing_mode in ("kalman", "both"):
+                if use_cached_kalman:
+                    facing_kalman = facing_kalman_from_detections(dets)
+                else:
+                    facing_kalman = (
+                        kalman_replay.advance(dets, image) if kalman_replay else None
+                    )
         live = _annotate_live(
             image,
-            dets,
+            render_dets,
             keypoints=kps,
             pitch_confidence=pitch_confidence,
             metric=metric,
@@ -779,6 +808,8 @@ def render_demo(
             debug_pitch_keypoints=debug_pitch_keypoints,
             facing_motion=facing_motion,
             facing_kalman=facing_kalman,
+            show_kalman_joystick=use_joystick,
+            dot_smoother=dot_smoother,
         )
         frames_until = next(
             (ef - frame_idx for ef in event_frames if ef >= frame_idx),
@@ -819,12 +850,14 @@ def render_demo(
                     progress = (step + 1) / max(phase_hold, 1)
                     overlay = draw_pass_overlay(
                         image,
-                        dets,
+                        render_dets,
                         event,
                         revealed_options=revealed,
                         reveal_progress=progress,
                         facing_motion=facing_motion,
                         facing_kalman=facing_kalman,
+                        show_kalman_joystick=use_joystick,
+                        dot_smoother=dot_smoother,
                         **overlay_kwargs,
                     )
                     writer.write(overlay)

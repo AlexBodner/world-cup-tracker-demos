@@ -171,6 +171,39 @@ def detections_have_kalman_velocity(detections: sv.Detections) -> bool:
     )
 
 
+def attach_kalman_velocity(
+    dets: sv.Detections,
+    player_tracker,
+    *,
+    needs_frame: bool,
+    image: np.ndarray | None,
+) -> sv.Detections:
+    """Replay one tracker step and merge ``kf_vx`` / ``kf_vy`` onto full-frame detections."""
+    pmask = np.isin(dets.class_id, (ROLE_PLAYER, ROLE_GOALKEEPER))
+    n = len(dets)
+    kf_vx = np.full(n, np.nan, dtype=np.float32)
+    kf_vy = np.full(n, np.nan, dtype=np.float32)
+    if pmask.any():
+        trackable = dets[pmask]
+        player_tracker.update(
+            trackable,
+            frame=image if needs_frame else None,
+        )
+        vx_sub, vy_sub = kalman_velocity_arrays(trackable, player_tracker)
+        kf_vx[pmask] = vx_sub
+        kf_vy[pmask] = vy_sub
+    data = dict(dets.data) if dets.data else {}
+    data["kf_vx"] = kf_vx
+    data["kf_vy"] = kf_vy
+    return sv.Detections(
+        xyxy=dets.xyxy,
+        class_id=dets.class_id,
+        tracker_id=dets.tracker_id,
+        confidence=dets.confidence,
+        data=data,
+    )
+
+
 def kalman_feet_velocity_from_tracklet(tracklet) -> np.ndarray | None:
     """Feet-referenced velocity from the tracklet Kalman state."""
     est = tracklet.state_estimator

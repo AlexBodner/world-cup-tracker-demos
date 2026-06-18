@@ -64,6 +64,8 @@ PYTHONPATH=. python -m world_cup_projects.pass_alternatives.run \
 | `--player-model-id` (default `football-players-detection-3zvbc/11`) | Universe model version when `--detector-backend inference` (local YOLO .pt is v11) |
 | `--ball-model-id` (default `football-ball-detection-rejhg/4`)       | Dedicated ball model when `--ball-detector-backend inference`                        |
 | `--detection-threshold 0.5`                             | Detection confidence threshold                                          |
+| `--facing-mode joystick` (default)                      | Kalman direction dots on player ellipses (pass alternatives render)     |
+| `--facing-mode motion\|kalman\|both`                    | Deprecated small facing arrows instead of joystick dots                 |
 
 
 **Caches**

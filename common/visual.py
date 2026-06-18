@@ -653,6 +653,8 @@ def annotate_players(
     facing: np.ndarray | None = None,
     facing_motion: np.ndarray | None = None,
     facing_kalman: np.ndarray | None = None,
+    show_kalman_joystick: bool = False,
+    dot_smoother: JoystickDotSmoother | None = None,
     show_tracker_ids: bool = False,
 ) -> np.ndarray:
     outfield = dets[dets.class_id == ROLE_PLAYER]
@@ -702,17 +704,20 @@ def annotate_players(
                     frame, gk_vis, labels=_tracker_id_labels(gk_neutral)
                 )
 
-    if facing_motion is None and facing is not None:
-        facing_motion = facing
-    if facing_motion is not None:
-        frame = draw_player_facing_arrows(frame, dets, facing_motion, style="motion")
-    if facing_kalman is not None:
-        kalman_style = "kalman" if facing_motion is not None else "motion"
-        frame = draw_player_facing_arrows(
-            frame, dets, facing_kalman, style=kalman_style
-        )
-    if facing_motion is not None and facing_kalman is not None:
-        frame = draw_facing_legend(frame)
+    if show_kalman_joystick:
+        frame = draw_kalman_joystick_dots(frame, dets, dot_smoother=dot_smoother)
+    else:
+        if facing_motion is None and facing is not None:
+            facing_motion = facing
+        if facing_motion is not None:
+            frame = draw_player_facing_arrows(frame, dets, facing_motion, style="motion")
+        if facing_kalman is not None:
+            kalman_style = "kalman" if facing_motion is not None else "motion"
+            frame = draw_player_facing_arrows(
+                frame, dets, facing_kalman, style=kalman_style
+            )
+        if facing_motion is not None and facing_kalman is not None:
+            frame = draw_facing_legend(frame)
     return frame
 
 

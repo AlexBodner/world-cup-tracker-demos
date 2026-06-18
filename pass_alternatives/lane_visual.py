@@ -447,6 +447,8 @@ def draw_pass_overlay(
     facing: np.ndarray | None = None,
     facing_motion: np.ndarray | None = None,
     facing_kalman: np.ndarray | None = None,
+    show_kalman_joystick: bool = False,
+    dot_smoother=None,
 ) -> np.ndarray:
     """Dim the frame and draw ranked pass arrows from the carrier.
 
@@ -484,6 +486,8 @@ def draw_pass_overlay(
         facing=facing,
         facing_motion=facing_motion,
         facing_kalman=facing_kalman,
+        show_kalman_joystick=show_kalman_joystick,
+        dot_smoother=dot_smoother,
         show_tracker_ids=True,
     )
     dim = annotate_ball(dim, dets)

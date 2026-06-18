@@ -88,9 +88,12 @@ def main() -> None:
     )
     parser.add_argument(
         "--facing-mode",
-        choices=("motion", "kalman", "both"),
-        default="kalman",
-        help="Player facing arrows: kalman (default), displacement motion, or both.",
+        choices=("joystick", "motion", "kalman", "both"),
+        default="joystick",
+        help=(
+            "Player motion overlay: joystick (default, Kalman direction dots on ellipses). "
+            "Deprecated: motion/kalman/both draw small facing arrows instead."
+        ),
     )
     parser.add_argument(
         "--freeze-min-pick-score",
@@ -286,6 +289,12 @@ def main() -> None:
     tag += f"_facing_{args.facing_mode}"
     if args.debug_pitch_keypoints:
         tag += "_pitch_kp_debug"
+
+    if args.facing_mode in ("motion", "kalman", "both"):
+        print(
+            f"Warning: --facing-mode {args.facing_mode} uses deprecated player facing "
+            "arrows; default is joystick (Kalman direction dots)."
+        )
 
     out_path = out_dir / f"pass_alternatives_{tag}_{sequence.name}.mp4"
     manifest = render_demo(

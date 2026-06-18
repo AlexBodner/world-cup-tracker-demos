@@ -4,6 +4,11 @@ Historical export of the internal `world_cup_projects` package (Roboflow monorep
 
 ## [0.2.0] — 2026-06
 
+### Pass alternatives render
+- Replaced default player **facing arrows** with **Kalman joystick dots** (team-colored
+  direction circles on ellipses). `--facing-mode motion|kalman|both` remains for deprecated
+  arrow overlays; default is `--facing-mode joystick`.
+
 ### Model ids
 - Centralized pinned Universe ids in `common/model_ids.py` (players v11, ball v4, pitch f07vi/15).
 - CLI help and README aligned with defaults; removed stale `rejhg/1` and `/20` default references.
