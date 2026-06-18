@@ -1,4 +1,4 @@
-# sWorld Cup Tracker Demos
+# World Cup Tracker Demos
 
 Football analytics demos built on [trackers](https://github.com/roboflow/trackers),
 [supervision](https://github.com/roboflow/supervision), and pieces from

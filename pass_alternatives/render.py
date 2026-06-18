@@ -43,7 +43,6 @@ from world_cup_projects.pass_alternatives.lane_visual import (
     draw_receiver_highlight,
     pass_line_label_xy,
 )
-from world_cup_projects.pass_alternatives.pass_options import PassWeights, top_pass_options
 from world_cup_projects.common.possession import (
     Carrier,
     ball_xy,

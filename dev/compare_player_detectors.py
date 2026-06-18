@@ -93,7 +93,9 @@ def _load_pitch_transforms(sequence, frames, *, device, end, pitch_confidence):
     from world_cup_projects.common.pitch import iter_pitch_transformers, warmup_goal_defenders_radar
     from world_cup_projects.common.teams import stabilize_goalkeeper_teams
 
-    cache_dir = Path(".cache/pitch")
+    from world_cup_projects import PACKAGE_ROOT
+
+    cache_dir = PACKAGE_ROOT / ".cache" / "pitch"
     detections_by_frame = {int(fi): d for fi, d in frames}
     frame_transforms: dict = {}
     frame_keypoints: dict = {}
