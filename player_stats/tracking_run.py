@@ -21,27 +21,9 @@ if (_repo_root / "world_cup_projects" / "__init__.py").is_file():
 
 from world_cup_projects import DEFAULT_ASSETS_DIR
 from world_cup_projects.common.device import default_torch_device
-from world_cup_projects.common.detection_cache import wrap_detections_cache
-from world_cup_projects.common.detect import DEFAULT_BALL_DETECTION_THRESHOLD
-from world_cup_projects.common.player_tracker import tracker_cache_key_params
+from world_cup_projects.common.pipeline import load_football_detections_cached
 from world_cup_projects.common.video import load_video_sequence
 from world_cup_projects.player_stats.tracking_render import render_tracking_video
-
-
-def _load_detections(args, sequence):
-    from world_cup_projects.common.detect import iter_football_model_detections
-
-    ball_thr = getattr(args, "ball_threshold", DEFAULT_BALL_DETECTION_THRESHOLD)
-    return wrap_detections_cache(
-        iter_football_model_detections,
-        source_name="football",
-        refresh=args.refresh_detections_cache,
-        device=args.device,
-        threshold=0.5,
-        ball_threshold=ball_thr,
-        tracker=args.tracker,
-        **tracker_cache_key_params(),
-    )
 
 
 def main() -> None:
@@ -73,7 +55,7 @@ def main() -> None:
     args = parser.parse_args()
 
     sequence = load_video_sequence(args.video)
-    detections_source = _load_detections(args, sequence)
+    detections_source = load_football_detections_cached(args, sequence)
 
     out_dir = DEFAULT_ASSETS_DIR
     out_dir.mkdir(parents=True, exist_ok=True)

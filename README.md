@@ -886,10 +886,12 @@ a NumPy / scikit-image error, run `pip install --force-reinstall scikit-image in
 ## Repo layout
 
 ```
-common/              possession, pitch, teams, detect, visual
+common/              possession, pitch, teams, detect, visual, pipeline
 explain/             filmstrip/video explain assets (pass, turnover, lane, alternatives)
 pass_alternatives/   lane scoring, freeze render
-player_stats/        passes, network, speed/distance
+player_stats/        passes, network, speed/distance, tracking/kalman demos
+dev/                 ad-hoc debug scripts (pass window trace, hosted pitch shim, …)
+scripts/             shell helpers (explain batch renders)
 bundesliga_videos/   test MP4s (not in git)
 assets/              outputs (gitignored)
 ```

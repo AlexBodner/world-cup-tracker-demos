@@ -8,8 +8,9 @@ would break this venv. Instead we register a lightweight ``inference`` shim in
 repo already parses. Everything else (detection cache, homography fitting, caching,
 render) runs unchanged.
 
-Usage (cwd = world_cup_projects, PYTHONPATH includes repo root):
-    PYTHONPATH=.. python _pitch_hosted_shim.py -- <pass_network_run args...>
+Usage (from repo root)::
+
+    PYTHONPATH=. python -m world_cup_projects.dev._pitch_hosted_shim -- <pass_network_run args...>
 """
 
 from __future__ import annotations

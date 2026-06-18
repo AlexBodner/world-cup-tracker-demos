@@ -22,8 +22,7 @@ if str(_repo_root) not in sys.path:
     sys.path.insert(0, str(_repo_root))
 
 from world_cup_projects import DEFAULT_ASSETS_DIR
-from world_cup_projects.common.detection_cache import wrap_detections_cache
-from world_cup_projects.common.detect import DEFAULT_BALL_DETECTION_THRESHOLD
+from world_cup_projects.common.pipeline import load_football_detections_cached
 from world_cup_projects.common.video import load_video_sequence
 from world_cup_projects.player_stats.ball_speed_debug_render import render_ball_speed_debug_video
 
@@ -50,17 +49,7 @@ def main() -> None:
     sequence = load_video_sequence(args.video)
     end = args.end if args.end is not None else sequence.length
 
-    from world_cup_projects.common.detect import iter_football_model_detections
-
-    detections_source = wrap_detections_cache(
-        iter_football_model_detections,
-        source_name="football",
-        refresh=args.refresh_detections_cache,
-        device=args.device,
-        threshold=0.5,
-        ball_threshold=args.ball_threshold,
-        tracker=args.tracker,
-    )
+    detections_source = load_football_detections_cached(args, sequence)
 
     out_dir = DEFAULT_ASSETS_DIR
     out_dir.mkdir(parents=True, exist_ok=True)

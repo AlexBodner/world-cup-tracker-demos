@@ -22,6 +22,28 @@ class MetricContext:
     locked_goals: tuple[int, int] | None
 
 
+def load_football_detections_cached(args, sequence):
+    """Cached football model detections for demo CLIs (tracking, kalman, explain)."""
+    from world_cup_projects.common.detect import (
+        DEFAULT_BALL_DETECTION_THRESHOLD,
+        iter_football_model_detections,
+    )
+    from world_cup_projects.common.detection_cache import wrap_detections_cache
+    from world_cup_projects.common.player_tracker import tracker_cache_key_params
+
+    ball_thr = getattr(args, "ball_threshold", DEFAULT_BALL_DETECTION_THRESHOLD)
+    return wrap_detections_cache(
+        iter_football_model_detections,
+        source_name="football",
+        refresh=getattr(args, "refresh_detections_cache", False),
+        device=getattr(args, "device", "cpu"),
+        threshold=0.5,
+        ball_threshold=ball_thr,
+        tracker=getattr(args, "tracker", "botsort"),
+        **tracker_cache_key_params(),
+    )
+
+
 def load_detections_source(args, sequence):
     if args.source == "football":
         from world_cup_projects.common.detect import wrap_football_detections_cache

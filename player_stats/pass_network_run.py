@@ -61,24 +61,6 @@ from world_cup_projects.player_stats.pass_network import PassNetwork, build_pass
 from world_cup_projects.player_stats.pass_network_render import render_pass_network_demo
 
 
-_load_detections_source = load_detections_source
-
-
-def _pitch_transformers(sequence, *, max_frames, device, pitch_confidence):
-    from world_cup_projects.common.pitch import iter_pitch_transformers
-
-    end = max_frames if max_frames is not None else sequence.length
-    return {
-        frame_idx: speed_t
-        for frame_idx, speed_t, _radar_t in iter_pitch_transformers(
-            sequence,
-            device=device,
-            end=end,
-            confidence=pitch_confidence,
-        )
-    }
-
-
 def analyze_pass_network(
     sequence,
     frames: list[tuple[int, object]],
