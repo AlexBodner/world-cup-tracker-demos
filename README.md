@@ -753,12 +753,12 @@ SPACE plus TM / RUN / BACK penalties.
 ```bash
 export ROBOFLOW_API_KEY=your_key   # recommended: shaded pitch corridors + radar
 
-PYTHONPATH=. python -m world_cup_projects.pass_alternatives.explain_run \
+PYTHONPATH=. python -m world_cup_projects.explain.pass_alternatives_run \
     --video world_cup_projects/bundesliga_videos/08fd33_0.mp4 \
     --metric --layout talk --auto-frame
 
 # Square 1080×1080 crops for X / Instagram
-PYTHONPATH=. python -m world_cup_projects.pass_alternatives.explain_run \
+PYTHONPATH=. python -m world_cup_projects.explain.pass_alternatives_run \
     --video world_cup_projects/bundesliga_videos/08fd33_0.mp4 \
     --metric --layout social --frame 418 \
     --out-dir world_cup_projects/assets/explain_frames
@@ -796,12 +796,12 @@ sees *time*, not unrelated freeze frames.
 
 
 ```bash
-PYTHONPATH=. python -m world_cup_projects.player_stats.pass_explain_run \
+PYTHONPATH=. python -m world_cup_projects.explain.pass_explain_run \
     --video world_cup_projects/bundesliga_videos/08fd33_0.mp4 \
     --metric --layout talk
 
 # Pick a specific pass (0 = best quality, gap ≥ 10 frames)
-PYTHONPATH=. python -m world_cup_projects.player_stats.pass_explain_run \
+PYTHONPATH=. python -m world_cup_projects.explain.pass_explain_run \
     --video world_cup_projects/bundesliga_videos/08fd33_0.mp4 \
     --metric --pass-index 1
 ```
@@ -827,12 +827,12 @@ MP4 is re-encoded to h264 for playback. `--gif` exports from that MP4 via ffmpeg
 (default width 1280; `--gif-width 0` for full res). `--video-fps` / `--video-hold` tune pacing.
 
 ```bash
-PYTHONPATH=. python -m world_cup_projects.player_stats.pass_explain_run \
+PYTHONPATH=. python -m world_cup_projects.explain.pass_explain_run \
     --video world_cup_projects/bundesliga_videos/08fd33_0.mp4 \
     --metric --layout talk --explain-video --video-fps 8
 
 # GIF export (same annotated walkthrough, smaller)
-PYTHONPATH=. python -m world_cup_projects.player_stats.pass_explain_run \
+PYTHONPATH=. python -m world_cup_projects.explain.pass_explain_run \
     --video world_cup_projects/bundesliga_videos/08fd33_0.mp4 \
     --metric --layout talk --explain-video --gif
 ```
@@ -887,7 +887,8 @@ a NumPy / scikit-image error, run `pip install --force-reinstall scikit-image in
 
 ```
 common/              possession, pitch, teams, detect, visual
-pass_alternatives/   lane scoring, freeze render, explain frames
+explain/             filmstrip/video explain assets (pass, turnover, lane, alternatives)
+pass_alternatives/   lane scoring, freeze render
 player_stats/        passes, network, speed/distance
 bundesliga_videos/   test MP4s (not in git)
 assets/              outputs (gitignored)

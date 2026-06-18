@@ -4,6 +4,11 @@ Historical export of the internal `world_cup_projects` package (Roboflow monorep
 
 ## [0.2.0] — 2026-06
 
+### Explain video generation
+- Moved explain filmstrip/video scripts from `player_stats/` and `pass_alternatives/` into
+  `explain/` (`pass_explain_*`, `pass_turnover_explain_*`, `pass_lane_detect_*`,
+  `pass_alternatives_*`). Old module paths remain as thin re-export shims.
+
 ### Pass alternatives render
 - Replaced default player **facing arrows** with **Kalman joystick dots** (team-colored
   direction circles on ellipses). `--facing-mode motion|kalman|both` remains for deprecated

@@ -18,7 +18,7 @@ for spec in "${passes[@]}"; do
   passer=${spec%%:*}
   receiver=${spec##*:}
   echo "========== #${passer} → #${receiver} =========="
-  python -m world_cup_projects.player_stats.pass_explain_run \
+  python -m world_cup_projects.explain.pass_explain_run \
     --video "$VIDEO" \
     "${COMMON[@]}" \
     --passer-tid "$passer" --receiver-tid "$receiver" \
