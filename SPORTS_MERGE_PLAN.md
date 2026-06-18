@@ -110,8 +110,8 @@ examples/soccer/
 | `soccer_analytics/annotations.py` | slice of `common/visual.py` | Re-implement the pieces the kept modes need: ellipses, carrier glow, pass arrow, pulsing receiver, lane corridors, radar overlay, **speed badge/legend + kalman joystick dots + facing arrows**. Trim, don't dump the whole 1226-line file. |
 | `examples/soccer/main.py` `run_speed_distance` | `player_stats/run.py` + `player_stats/render.py` | Speed & distance demo as a mode. |
 | `examples/soccer/main.py` `run_kalman_motion` | `player_stats/kalman_motion_run.py` + `kalman_motion_render.py` | Kalman motion demo as a mode. |
-| `explain/pass_detection_explain.py` | `player_stats/pass_explain_*`, `pass_turnover_explain_*`, `pass_lane_detect_*` | Slim filmstrip/timeline/video generators reusing `annotations.py`. |
-| `explain/pass_alternatives_explain.py` | `pass_alternatives/explain_*` | Slim 4-step explain reusing `annotations.py`. |
+| `explain/pass_detection_explain.py` | `explain/pass_explain_*`, `pass_turnover_explain_*`, `pass_lane_detect_*` | Slim filmstrip/timeline/video generators reusing `annotations.py`. |
+| `explain/pass_alternatives_explain.py` | `explain/pass_alternatives_*` | Slim 4-step explain reusing `annotations.py`. |
 
 ### Left behind in this repo (pure dev/debug tooling — NOT ported)
 `freeze_debug*`, `compare_ball_detection`, `benchmark_ball_detection`, `compare_player_detectors`,
@@ -196,8 +196,8 @@ the cached frames/detections. No disk cache, no double inference.
 
 `examples/soccer/explain/` holds the talk/social generators. They reuse `soccer_analytics`
 for detection + events and `annotations.py` for drawing, then build filmstrips / timelines /
-slow-mo MP4s. These are slimmed versions of `pass_explain_visual.py` (2101 lines) and
-`pass_alternatives/explain_*` (~3500 lines) with the `visual.py`/`pitch.py` dependencies
+slow-mo MP4s. These are slimmed versions of `explain/pass_explain_visual.py` (2101 lines) and
+`explain/pass_alternatives_*` (~3500 lines) with the `visual.py`/`pitch.py` dependencies
 removed. Output via `cv2` + optional `ffmpeg` (h264 / GIF), no `common/video.py`.
 
 Lower priority than the three core modes; can land in a follow-up PR.

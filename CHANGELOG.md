@@ -7,7 +7,7 @@ Historical export of the internal `world_cup_projects` package (Roboflow monorep
 ### Explain video generation
 - Moved explain filmstrip/video scripts from `player_stats/` and `pass_alternatives/` into
   `explain/` (`pass_explain_*`, `pass_turnover_explain_*`, `pass_lane_detect_*`,
-  `pass_alternatives_*`). Old module paths remain as thin re-export shims.
+  `pass_alternatives_*`). Run via `python -m world_cup_projects.explain.*`; old shim paths removed.
 
 ### Pass alternatives render
 - Replaced default player **facing arrows** with **Kalman joystick dots** (team-colored
